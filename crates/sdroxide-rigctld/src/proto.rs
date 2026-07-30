@@ -145,9 +145,7 @@ fn split_format(line: &str) -> (Format, &str) {
     let mut chars = line.chars();
     match chars.next() {
         Some('+') => (Format { extended: true, sep: '\n' }, chars.as_str()),
-        Some(c)
-            if c.is_ascii_punctuation() && !matches!(c, '\\' | '_' | '#' | '(' | ')' | '?') =>
-        {
+        Some(c) if c.is_ascii_punctuation() && !matches!(c, '\\' | '_' | '#' | '(' | ')' | '?') => {
             (Format { extended: true, sep: c }, chars.as_str())
         }
         _ => (Format::PLAIN, line),
@@ -454,10 +452,7 @@ fn dispatch(
                     out.finish(OK, false)
                 }
                 ("AF", Some(v)) => {
-                    cmds.push(Command::SetVolume {
-                        rx: RxId::Main,
-                        v: v.clamp(0.0, 1.0) as f32,
-                    });
+                    cmds.push(Command::SetVolume { rx: RxId::Main, v: v.clamp(0.0, 1.0) as f32 });
                     out.finish(OK, false)
                 }
                 ("MICGAIN", Some(v)) => {
@@ -690,11 +685,8 @@ fn dump_state(st: &RigState, cfg: &RigctldConfig) -> String {
 
     // RX ranges. Falling back to full coverage rather than emitting an empty
     // list, because an empty one disables mode setting client-side.
-    let rx: Vec<(f64, f64)> = if st.rx_ranges.is_empty() {
-        vec![(0.0, 6_000_000_000.0)]
-    } else {
-        st.rx_ranges.clone()
-    };
+    let rx: Vec<(f64, f64)> =
+        if st.rx_ranges.is_empty() { vec![(0.0, 6_000_000_000.0)] } else { st.rx_ranges.clone() };
     for (lo, hi) in &rx {
         s.push_str(&range_line(*lo, *hi, false));
     }
@@ -808,10 +800,10 @@ mod tests {
     #[test]
     fn long_command_names_work_too() {
         assert_eq!(run("\\get_freq").0, "14074000\n");
-        assert_eq!(run("\\set_freq 7100000").1, vec![Command::SetVfo {
-            vfo: Vfo::A,
-            hz: 7_100_000.0
-        }]);
+        assert_eq!(
+            run("\\set_freq 7100000").1,
+            vec![Command::SetVfo { vfo: Vfo::A, hz: 7_100_000.0 }]
+        );
     }
 
     #[test]

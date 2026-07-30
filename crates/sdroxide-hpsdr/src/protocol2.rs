@@ -7,12 +7,13 @@
 //! trusting on-air behavior; see the notes on individual builders.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use rtrb::{Consumer, Producer};
 
-use crate::net::{hex_head, Ctrl, RxStats, ThreadCtx, WATCHDOG};
+use crate::net::{Ctrl, RxStats, SeqTracker, ThreadCtx, WATCHDOG, hex_head, push_iq};
 
 /// UDP ports. Host→radio use these as the *destination* port; radio→host DDC IQ
 /// arrives with a *source* port of [`port::DDC_IQ_BASE`]` + ddc_index`.
@@ -63,11 +64,7 @@ pub fn phase_word(freq_hz: f64, clock_hz: f64) -> u32 {
 /// Decode a 24-bit big-endian two's-complement sample.
 pub fn be24_to_i32(b: [u8; 3]) -> i32 {
     let u = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
-    if u & 0x0080_0000 != 0 {
-        (u | 0xFF00_0000) as i32
-    } else {
-        u as i32
-    }
+    if u & 0x0080_0000 != 0 { (u | 0xFF00_0000) as i32 } else { u as i32 }
 }
 
 /// Encode a 24-bit big-endian two's-complement sample.
@@ -221,6 +218,10 @@ pub(crate) fn run(ctx: ThreadCtx) {
     let mut t = P2Thread {
         socket: ctx.socket,
         radio: ctx.radio,
+        opened_at: ctx.opened_at,
+        last_rx_ms: ctx.last_rx_ms,
+        conn_id: ctx.conn_id,
+        invert_spectrum: ctx.invert_spectrum,
         rate_khz: (ctx.rate_hz / 1000.0) as u16,
         rx: ctx.rx,
         tx: ctx.tx,
@@ -236,6 +237,14 @@ pub(crate) fn run(ctx: ThreadCtx) {
 struct P2Thread {
     socket: UdpSocket,
     radio: IpAddr,
+    /// Epoch and slot for the liveness clock the handle reads (see
+    /// `HpsdrHandle::silent_for`).
+    opened_at: Instant,
+    last_rx_ms: crate::net::RxClock,
+    /// This connection's ownership ticket (see `net::owns_connection`).
+    conn_id: u64,
+    /// Conjugate I/Q both ways (see `HpsdrConfig::invert_spectrum`).
+    invert_spectrum: bool,
     rate_khz: u16,
     rx: Producer<f32>,
     tx: Consumer<f32>,
@@ -285,6 +294,20 @@ impl P2Thread {
         let _ = self.socket.send_to(&pkt, self.dest(port::DUC_COMMAND));
     }
 
+    /// See `protocol1::stop_stream`: a superseded connection leaves the radio
+    /// streaming to whichever connection replaced it.
+    fn stop_stream(&mut self, why: &str) {
+        if crate::net::owns_connection(self.radio, self.conn_id) {
+            tracing::info!("HPSDR P2: {why}; stopping the radio's stream");
+            self.send_general(false);
+        } else {
+            tracing::info!(
+                "HPSDR P2: {why}; another connection has taken over this radio, leaving its \
+                 stream running"
+            );
+        }
+    }
+
     fn send_general(&mut self, run: bool) {
         let seq = next_seq(&mut self.seq.general);
         let pkt = general_packet(seq, run);
@@ -316,7 +339,8 @@ impl P2Thread {
         let mut rx_scratch: Vec<f32> = Vec::with_capacity(512);
         let mut tx_scratch: Vec<f32> = Vec::with_capacity(DUC_SAMPLES_PER_PKT * 2);
         let mut buf = [0u8; 2048];
-        let mut stats = RxStats::new(2);
+        let mut stats = RxStats::new(2, self.rate_khz as f64 * 1000.0);
+        let mut seq_in = SeqTracker::new();
         let mut logged_first_rx = false;
         let mut logged_first_tx = false;
         let mut warned_no_rx = false;
@@ -331,6 +355,9 @@ impl P2Thread {
                         freq_changed = true;
                         tracing::debug!("HPSDR P2: RX NCO -> {hz:.0} Hz");
                     }
+                    // Protocol 2 boards have no front-end gain register this
+                    // crate drives; the DDC command carries no gain field.
+                    Ctrl::RxGain(_) => {}
                     Ctrl::TxOn(hz) => {
                         self.tx_freq = hz;
                         self.ptt = true;
@@ -344,8 +371,7 @@ impl P2Thread {
                         tracing::info!("HPSDR P2: MOX off");
                     }
                     Ctrl::Shutdown => {
-                        tracing::info!("HPSDR P2: shutdown requested; stopping stream");
-                        self.send_general(false);
+                        self.stop_stream("shutdown requested");
                         return;
                     }
                 }
@@ -360,7 +386,14 @@ impl P2Thread {
                     if (port::DDC_IQ_BASE..port::DDC_IQ_BASE + 8).contains(&p) {
                         rx_scratch.clear();
                         if let Some(pairs) = decode_ddc_iq(&buf[..n], &mut rx_scratch) {
+                            if self.invert_spectrum {
+                                crate::protocol1::conjugate(&mut rx_scratch);
+                            }
                             stats.on_iq(pairs);
+                            self.last_rx_ms.store(
+                                self.opened_at.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
                             if !logged_first_rx {
                                 logged_first_rx = true;
                                 let declared = if n >= 16 {
@@ -375,9 +408,15 @@ impl P2Thread {
                                     hex_head(&buf[..n], 16)
                                 );
                             }
-                            for &s in &rx_scratch {
-                                let _ = self.rx.push(s);
+                            // Only DDC0 is enabled, so one sequence counter
+                            // covers the whole stream. A datagram from another
+                            // DDC would carry its own counter — track just
+                            // DDC0's rather than report phantom gaps.
+                            if p == port::DDC_IQ_BASE && n >= 4 {
+                                let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                stats.on_lost(seq_in.observe(seq) as u64);
                             }
+                            push_iq(&mut self.rx, &rx_scratch, &mut stats);
                         } else {
                             stats.on_other();
                             tracing::trace!(
@@ -396,8 +435,7 @@ impl P2Thread {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
-                    tracing::warn!("HPSDR P2 recv error: {e}; stopping");
-                    self.send_general(false);
+                    self.stop_stream(&format!("recv error: {e}"));
                     return;
                 }
             }
@@ -419,6 +457,9 @@ impl P2Thread {
                 while let Ok(v) = self.tx.pop() {
                     tx_scratch.push(v);
                     if tx_scratch.len() >= DUC_SAMPLES_PER_PKT * 2 {
+                        if self.invert_spectrum {
+                            crate::protocol1::conjugate(&mut tx_scratch);
+                        }
                         let seq = next_seq(&mut self.seq.tx_iq);
                         let pkt = duc_iq_packet(seq, &tx_scratch);
                         if !logged_first_tx {

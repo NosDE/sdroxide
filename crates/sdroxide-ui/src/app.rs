@@ -4,9 +4,10 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, Slider};
 use sdroxide_types::{
     AgcMode, AudioDevices, Band, CallsignInfo, Command, Decode, DeviceCaps, DigiStatus, Direction,
-    LookupProvider, MemoryChannel, Meters, Mode, NetworkConfig, QsoRecord, RadioController,
-    RadioEvent, RadioState, RxId, SkimmerKind, SkimmerSpot, SpectrumConfig, SpectrumFrame, Spot,
-    SpotKind, SstvMode, SstvStatus, UploadResult, UploadTarget, Vfo,
+    GainElement, LookupProvider, MemoryChannel, Meters, Mode, NetworkConfig, QsoRecord,
+    RadioController, RadioEvent, RadioState, RifpEncoding, RifpMeta, RifpProfile, RifpSize,
+    RifpStatus, RxId, SkimmerKind, SkimmerSpot, SpectrumConfig, SpectrumFrame, Spot, SpotKind,
+    SstvMode, SstvStatus, UploadResult, UploadTarget, Vfo,
 };
 
 use crate::theme::ThemedScroll;
@@ -41,6 +42,42 @@ enum SettingsTab {
     FreeDv,
     Uploads,
     Servers,
+    Tle,
+}
+
+/// Transient state of the TLE tab — what is in the paste box, which rows are
+/// unfolded. Not persisted: none of it is a setting, it is where the operator
+/// happens to be in the dialog.
+#[derive(Default)]
+struct SatEditState {
+    /// The "paste element sets here" box.
+    paste: String,
+    /// Catalogue number and name for a new frequency entry.
+    new_freq_id: String,
+    new_freq_name: String,
+    /// Index of the pasted element set whose two lines are shown for editing.
+    open_tle: Option<usize>,
+    /// Index of the frequency entry whose links are shown for editing.
+    open_freq: Option<usize>,
+    /// What the last add attempt did, good or bad, so a paste that yielded
+    /// nothing says so instead of appearing to have been ignored.
+    note: String,
+}
+
+/// One subscription's fetch state, in a form both targets have.
+///
+/// The native type lives in `sdroxide-solar`, which the browser build does not
+/// compile the fetching half of; copying the three fields the dialog shows
+/// keeps the tab itself target-agnostic.
+#[derive(Clone, Default)]
+struct SubStatusView {
+    url: String,
+    fetched_unix: i64,
+    count: usize,
+    /// How many of the listing's satellites are in the built-in curated list.
+    /// Zero for everything that is not the amateur group.
+    curated: usize,
+    error: Option<String>,
 }
 
 /// Everything the settings dialog can change, collected in one place.
@@ -53,6 +90,9 @@ struct SettingsIo<'a> {
     radio_edit: &'a mut Option<sdroxide_types::RadioConfig>,
     audio_pick: &'a mut Option<(bool, Option<String>)>,
     hpsdr_discover: &'a mut bool,
+    /// Re-enumerate the USB bus for RTL-SDR dongles. Cheap and non-invasive —
+    /// no device is opened — so it cannot disturb a running stream.
+    rtlsdr_rescan: &'a mut bool,
     tci_test: &'a mut bool,
     flex_discover: &'a mut bool,
     flex_test: &'a mut bool,
@@ -82,6 +122,26 @@ struct SettingsIo<'a> {
     key_capture: &'a mut Option<usize>,
     midi_learn: &'a mut Option<crate::input::MidiLearn>,
     midi_rescan: &'a mut bool,
+    /// The operator's satellite additions, and the transient state of the
+    /// dialog that edits them. Persisted on change, like the input bindings:
+    /// there is no APPLY step to hang it off.
+    sat_edit: &'a mut sdroxide_types::SatConfig,
+    sat_ui: &'a mut SatEditState,
+    sat_subs: &'a [SubStatusView],
+    /// Fetch every subscription now. Blocking, so it is done after the window
+    /// closure the way the HPSDR scan is.
+    sat_sub_refresh: &'a mut bool,
+    /// How the 3D view draws its cloud deck: `Some(true)` marches the volume,
+    /// `Some(false)` stacks shells through it. `None` where there is no 3D view
+    /// to set it for — the browser client, whose solar view is a separate tab
+    /// with its own settings — because a switch that provably does nothing is
+    /// worse than no switch.
+    solar_cloud_march: Option<&'a mut bool>,
+    /// Reload the broadcast station list from disk, and restore the bundled one
+    /// over the top of it. Both act on a file rather than on an edit buffer, so
+    /// they are done after the window closure like the HPSDR scan.
+    bc_reload: &'a mut bool,
+    bc_restore: &'a mut bool,
     tab: &'a mut SettingsTab,
 }
 
@@ -147,7 +207,10 @@ fn configured_upload_targets(cfg: &NetworkConfig) -> Vec<UploadTarget> {
 
 /// Single-record ADIF + targets for auto-upload of a freshly logged QSO, or
 /// `None` when auto-upload is off or no target is enabled.
-fn auto_upload_adif(cfg: &NetworkConfig, rec: &QsoRecord) -> Option<(u64, String, Vec<UploadTarget>)> {
+fn auto_upload_adif(
+    cfg: &NetworkConfig,
+    rec: &QsoRecord,
+) -> Option<(u64, String, Vec<UploadTarget>)> {
     if !cfg.auto_upload {
         return None;
     }
@@ -158,7 +221,9 @@ fn auto_upload_adif(cfg: &NetworkConfig, rec: &QsoRecord) -> Option<(u64, String
     Some((rec.id, sdroxide_types::qso_log_to_adif(std::slice::from_ref(rec)), targets))
 }
 
-/// Index of a spot kind into the app's `spot_kinds_shown` filter array.
+/// Index of a spot kind into the app's `spot_kinds_shown` filter array. Must
+/// stay in lockstep with the chip order in [`App::spots_window`], which indexes
+/// the array positionally.
 fn spot_kind_index(kind: SpotKind) -> usize {
     match kind {
         SpotKind::DxCluster => 0,
@@ -166,8 +231,12 @@ fn spot_kind_index(kind: SpotKind) -> usize {
         SpotKind::Sota => 2,
         SpotKind::PskReporter => 3,
         SpotKind::FreeDv => 4,
+        SpotKind::Broadcast => 5,
     }
 }
+
+/// Number of spot-kind filter chips, i.e. the width of `spot_kinds_shown`.
+const SPOT_KINDS: usize = 6;
 
 /// How the FT8/FT4 decode list orders the stations within each turn.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -179,6 +248,21 @@ enum DecodeSort {
     Signal,
     /// Farthest (DX) first.
     Distance,
+}
+
+/// One decode as the list draws it: the entry itself, plus everything the row
+/// needs resolved once up front — how far away they are, whether this is a CQ
+/// *we* may answer, what working them would be worth against the log, and
+/// whether the message names our own station.
+#[derive(Clone, Copy)]
+struct DecodeRow<'a> {
+    /// Index into `digi_decodes`, so rows keep their identity after sorting.
+    idx: usize,
+    d: &'a Decode,
+    dist_km: Option<f64>,
+    cq: bool,
+    novelty: sdroxide_types::Novelty,
+    to_me: bool,
 }
 
 pub struct SdroxideApp {
@@ -230,6 +314,7 @@ pub struct SdroxideApp {
     serial_ports: Vec<String>,
     /// HPSDR devices found by the last "Discover" scan in the settings dialog.
     hpsdr_devices: Vec<sdroxide_types::HpsdrDevice>,
+    rtlsdr_devices: Vec<sdroxide_types::RtlSdrDevice>,
     /// FlexRadios found by the last discovery listen on the Radio tab.
     flex_devices: Vec<sdroxide_types::FlexDevice>,
     /// Result of the last TCI "Test connection" (Ok summary / Err message).
@@ -263,6 +348,11 @@ pub struct SdroxideApp {
     /// reports back how many characters have been sent so we colour them green).
     text_tx: String,
     qso_log: Vec<QsoRecord>,
+    /// QSOs worked since this run started, which is what the FT8 panel's
+    /// "Session" readout counts. Deliberately not derived from the logbook: the
+    /// log is persisted and grows for ever, so counting it would report every
+    /// contact ever made as if it had just been worked.
+    session_qsos: usize,
     show_digi_settings: bool,
     /// UI-owned editable copy of the operator config, so typing isn't fought
     /// by the round-tripped status echo. Seeded once from the first status.
@@ -272,8 +362,23 @@ pub struct SdroxideApp {
     sstv: SstvUi,
     /// RF Paint (Spectrum Painting) panel state (text/image + previews).
     rf_paint: RfPaintUi,
+    /// Hellschreiber receive raster (scrollback ring + texture).
+    hell: crate::hell::HellUi,
     /// FSQ directed-message target callsign ("" = broadcast/ALLCALL).
     fsq_target: String,
+    /// JS8: the `To:` callsign the composer addresses. Also what the globe
+    /// draws the QSO arc to, JS8 having no QSO sequencer to ask instead.
+    js8_target: String,
+    /// JS8: callsigns a locator has already been requested for this session,
+    /// successful or not. Every lookup is an HTTP round trip on its own thread,
+    /// and a busy band puts fifty stations in the heard list.
+    js8_looked_up: std::collections::HashSet<String>,
+    /// JS8: frame time of the last locator lookup, so they go out one at a time
+    /// rather than fifty at once the moment the panel opens.
+    js8_lookup_at: f64,
+    /// JS8: the last message we transmitted. What `AGN?` — "say again" — is
+    /// asking for, and the one reply the operator cannot retype from memory.
+    js8_last_sent: String,
     /// FSQ contacts (address book), native-persisted in `contacts.json`.
     fsq_contacts: Vec<sdroxide_types::FsqContact>,
     /// FSQ "add contact" input field.
@@ -320,10 +425,22 @@ pub struct SdroxideApp {
     /// Spots window open state.
     show_spots: bool,
     /// Which spot kinds are shown on the overlay/list (DX, POTA, SOTA, PSK,
-    /// FREEDV) — indexed by [`spot_kind_index`].
-    spot_kinds_shown: [bool; 5],
+    /// FREEDV, BC) — indexed by [`spot_kind_index`].
+    spot_kinds_shown: [bool; SPOT_KINDS],
     /// Show only spots that fall inside the current panadapter view span.
     spot_in_view_only: bool,
+    /// Fuzzy search query for the spot list. Narrows the list in the SPOTS
+    /// window only — the waterfall labels are positioned by frequency, so
+    /// reordering them by match quality would mean nothing.
+    spot_search: String,
+    /// The bundled/user broadcast station table, loaded once at startup.
+    broadcast: Vec<sdroxide_types::BroadcastStation>,
+    /// The subset of `broadcast` on air right now, as spots. Rebuilt when the
+    /// UTC minute rolls over — the finest granularity a schedule changes at —
+    /// rather than every frame.
+    broadcast_spots: Vec<Spot>,
+    /// The UTC minute `broadcast_spots` was built for.
+    broadcast_minute: i64,
     /// UI-owned editable copy of the network config (edited in the Settings
     /// dialog's Spots / FreeDV / Uploads tabs). Carries no operator identity —
     /// that comes from the digi config, edited on the General tab.
@@ -358,6 +475,11 @@ pub struct SdroxideApp {
     adif_import_inbox: Arc<Mutex<Option<String>>>,
     /// Callsigns queued for lookup, drained into commands each frame.
     pending_lookups: Vec<String>,
+    /// Everything callsign lookup has resolved this session, by callsign. Kept
+    /// because a JS8 station's locator usually never arrives on the air —
+    /// only heartbeats and CQs carry one — so the map has nothing else to
+    /// place the rest of the conversation by.
+    callsign_cache: std::collections::HashMap<String, CallsignInfo>,
     /// QSO uploads queued (id, single-record ADIF, targets), drained to commands.
     pending_uploads: Vec<(u64, String, Vec<UploadTarget>)>,
     /// Awards dashboard open state + band filter ("" = all bands).
@@ -365,6 +487,10 @@ pub struct SdroxideApp {
     awards_band: String,
     /// Cached award tally, keyed by (log length, band filter).
     awards_cache: Option<(usize, String, sdroxide_types::Awards)>,
+    /// The same tally placed on the globe for the 3D view's award layer, keyed
+    /// the same way. Shared rather than copied: it is three hundred entities
+    /// and the window republishes it every frame.
+    awards_heat: Option<(usize, String, Arc<Vec<sdroxide_types::EntitySlot>>)>,
     /// Cached set of worked DXCC entity names, keyed by log length (for the
     /// "new entity" spot badge).
     worked_entities_cache: Option<(usize, std::collections::HashSet<String>)>,
@@ -382,6 +508,22 @@ pub struct SdroxideApp {
     /// Solar-system 3D view, shown in its own OS window (native-only).
     #[cfg(not(target_arch = "wasm32"))]
     solar: crate::solar3d::Solar3d,
+    /// The operator's satellite additions: element sets they pasted in or
+    /// subscribed to, and their frequency corrections. Shared by `Arc` because
+    /// the solar window's render closure takes a handle it outlives any borrow
+    /// of; replaced wholesale on every edit rather than mutated in place.
+    sat_cfg: std::sync::Arc<sdroxide_types::SatConfig>,
+    /// The settings dialog's working copy, its transient state, and what each
+    /// subscription's last fetch did. All seeded when the dialog opens.
+    sat_cfg_edit: sdroxide_types::SatConfig,
+    sat_ui: SatEditState,
+    sat_sub_status: Vec<SubStatusView>,
+    /// Weather fax: the chart being painted and the gallery of saved ones.
+    wefax: crate::wefax::WefaxUi,
+    /// Whether the operator has dismissed the out-of-band transmit warning
+    /// this session. Never persisted: `--oob-tx` has to be passed again on the
+    /// next launch, so the warning has to be acknowledged again too.
+    oob_tx_ack: bool,
 }
 
 /// Editable text fields for a manual logbook entry (new or edit). Kept as
@@ -438,7 +580,11 @@ impl LogEditForm {
             base: r.clone(),
             call: r.call.clone(),
             grid: r.grid.clone().unwrap_or_default(),
-            freq_mhz: if r.freq_hz > 0.0 { format!("{:.4}", r.freq_hz / 1e6) } else { String::new() },
+            freq_mhz: if r.freq_hz > 0.0 {
+                format!("{:.4}", r.freq_hz / 1e6)
+            } else {
+                String::new()
+            },
             mode: r.mode.clone(),
             rst_sent: r.rst_sent.map(|v| v.to_string()).unwrap_or_default(),
             rst_rcvd: r.rst_rcvd.map(|v| v.to_string()).unwrap_or_default(),
@@ -464,8 +610,11 @@ impl LogEditForm {
             return None;
         }
         let freq_hz = self.freq_mhz.trim().parse::<f64>().ok().map(|m| m * 1e6).unwrap_or(0.0);
-        let band =
-            if freq_hz > 0.0 { sdroxide_types::adif_band(freq_hz).to_string() } else { String::new() };
+        let band = if freq_hz > 0.0 {
+            sdroxide_types::adif_band(freq_hz).to_string()
+        } else {
+            String::new()
+        };
         let start = parse_utc(&self.date, &self.time, self.seed_utc);
         let mode = {
             let m = self.mode.trim().to_uppercase();
@@ -506,10 +655,8 @@ impl SdroxideApp {
         if let Some(rs) = &cc.wgpu_render_state {
             waterfall_gpu::init(rs);
         }
-        let view: ViewState = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "view"))
-            .unwrap_or_default();
+        let view: ViewState =
+            cc.storage.and_then(|s| eframe::get_value(s, "view")).unwrap_or_default();
         // Copied out before `view` is moved into the struct below.
         #[cfg(not(target_arch = "wasm32"))]
         let solar3d_view = view.solar3d;
@@ -545,6 +692,7 @@ impl SdroxideApp {
             radio_cfg: None,
             serial_ports: Vec::new(),
             hpsdr_devices: Vec::new(),
+            rtlsdr_devices: Vec::new(),
             flex_devices: Vec::new(),
             tci_test_result: None,
             flex_test_result: None,
@@ -564,11 +712,17 @@ impl SdroxideApp {
             digi_status: None,
             text_tx: String::new(),
             qso_log: load_qso_log(cc.storage),
+            session_qsos: 0,
             show_digi_settings: false,
             digi_cfg_edit: sdroxide_types::DigiConfig::default(),
             sstv: SstvUi::default(),
             rf_paint: RfPaintUi::default(),
+            hell: Default::default(),
             fsq_target: String::new(),
+            js8_target: String::new(),
+            js8_looked_up: Default::default(),
+            js8_lookup_at: 0.0,
+            js8_last_sent: String::new(),
             fsq_contacts: fsq_load_contacts(),
             fsq_new_contact: String::new(),
             fsq_show_contacts: false,
@@ -590,8 +744,12 @@ impl SdroxideApp {
             spots: Vec::new(),
             net_status: None,
             show_spots: false,
-            spot_kinds_shown: [true; 5],
+            spot_kinds_shown: [true; SPOT_KINDS],
             spot_in_view_only: false,
+            spot_search: String::new(),
+            broadcast: load_broadcast_stations(),
+            broadcast_spots: Vec::new(),
+            broadcast_minute: -1,
             net_cfg_edit: net_cfg,
             rigctld_edit: sdroxide_types::RigctldConfig::default(),
             rigctld_seeded: false,
@@ -605,10 +763,12 @@ impl SdroxideApp {
             net_log: Vec::new(),
             adif_import_inbox: Arc::new(Mutex::new(None)),
             pending_lookups: Vec::new(),
+            callsign_cache: Default::default(),
             pending_uploads: Vec::new(),
             show_awards: false,
             awards_band: String::new(),
             awards_cache: None,
+            awards_heat: None,
             worked_entities_cache: None,
             log_index_cache: None,
             help: crate::help::Help::default(),
@@ -619,6 +779,12 @@ impl SdroxideApp {
             // sessions never open this window.
             #[cfg(not(target_arch = "wasm32"))]
             solar: crate::solar3d::Solar3d::new(cc.wgpu_render_state.clone(), solar3d_view),
+            sat_cfg: std::sync::Arc::new(load_sat_config()),
+            sat_cfg_edit: Default::default(),
+            sat_ui: Default::default(),
+            sat_sub_status: Vec::new(),
+            wefax: Default::default(),
+            oob_tx_ack: false,
         }
     }
 
@@ -631,18 +797,61 @@ impl SdroxideApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn digi_traffic(&self, now_t: f64) -> crate::solar3d::DigiTraffic {
         let status = self.digi_status.as_ref();
-        self.digi_stations.traffic(
+        let mut traffic = self.digi_stations.traffic(
             now_t,
             status.and_then(|s| s.dx_grid.as_deref()),
             self.digi_preview.as_ref().map(|(_, ll)| *ll),
             status.is_some_and(|s| s.transmitting),
-        )
+        );
+        // JS8 has no QSO sequencer to ask for `dx_grid`, because a chat has no
+        // Tx1–Tx6 to be part-way through. What an operator means by "in a QSO"
+        // there is the station the composer is aimed at, so that is what gets
+        // the arc — highlighted exactly as an FT8 contact in progress is.
+        if self.state.rx[0].mode.is_js8() {
+            let heard =
+                status.and_then(|s| s.js8.as_ref()).map(|j| j.heard.as_slice()).unwrap_or(&[]);
+            traffic.dx = self
+                .js8_grid_for(&self.js8_target, heard)
+                .as_deref()
+                .and_then(sdroxide_types::grid_to_latlon);
+        }
+        // Weather fax has no callsign and no grid to place a station by, but it
+        // does have a transmitter with a known location — so the chart being
+        // received gets the same path across the globe a QSO would, which turns
+        // an anonymous picture into "this came 900 km over the North Sea".
+        if self.state.rx[0].mode.is_wefax()
+            && let Some((st, _)) = sdroxide_types::WefaxStation::at_dial(self.state.rx_freq_hz())
+        {
+            traffic.dx = Some((st.lat, st.lon));
+            traffic.dx_label = Some(st.name.to_string());
+        }
+        // A broadcast station is the same case again: no callsign, but a known
+        // transmitter site, so tuning one draws the path the signal actually
+        // travelled. Only when nothing else has claimed the arc — a QSO in
+        // progress outranks whatever the dial happens to be sitting on — and
+        // deliberately not gated on AM, because plenty of shortwave listening is
+        // done in ECSS on one sideband.
+        if traffic.dx.is_none()
+            && let Some((st, lat, lon)) = sdroxide_types::broadcast::at_dial(
+                &self.broadcast,
+                self.state.rx_freq_hz(),
+                now_unix(),
+            )
+            .and_then(|st| Some((st, st.lat?, st.lon?)))
+        {
+            traffic.dx = Some((lat, lon));
+            traffic.dx_label = Some(if st.site.is_empty() {
+                st.name.clone()
+            } else {
+                format!("{} · {}", st.name, st.site)
+            });
+        }
+        traffic
     }
 
     /// The operator's grid square. Prefers the engine's copy but falls back to
     /// the UI's edit buffer: `digi_status` only arrives once the engine sends
     /// its first `DigiStatus`, and never at all in sessions with no digi engine.
-    #[cfg(not(target_arch = "wasm32"))]
     fn my_grid(&self) -> String {
         self.digi_status
             .as_ref()
@@ -706,7 +915,8 @@ impl SdroxideApp {
         let now = now_unix_f64();
         let rows_per_sec = self.ui_settings.waterfall_rows_per_sec();
         // Clamp dt so a hitch/tab-away can't dump a huge run of rows at once.
-        let dt = if self.wf_last_now > 0.0 { (now - self.wf_last_now).clamp(0.0, 0.3) } else { 0.0 };
+        let dt =
+            if self.wf_last_now > 0.0 { (now - self.wf_last_now).clamp(0.0, 0.3) } else { 0.0 };
         self.wf_last_now = now;
         let rows_to_write = if has_frame {
             self.wf_row_accum += dt as f32 * rows_per_sec;
@@ -775,20 +985,23 @@ impl SdroxideApp {
         // All controls are captioned (or bare) modules that reflow when the
         // window is narrow. The frequency box is always first, the S-meter
         // second; the rest follow and wrap to further rows.
-        ui.with_layout(
-            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-            |ui| {
-                self.freq_module(ui, cmds);
-                self.smeter_module(ui);
-                self.vfo_rit_module(ui, cmds);
-                self.rx_filter_module(ui, cmds);
-                if self.caps.as_ref().is_some_and(|c| c.is_transmit_capable()) {
-                    self.tx_module(ui, cmds);
-                }
-                self.display_module(ui, cmds);
-                self.windows_module(ui);
-            },
-        );
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true), |ui| {
+            self.freq_module(ui, cmds);
+            self.smeter_module(ui);
+            self.vfo_rit_module(ui, cmds);
+            self.rx_filter_module(ui, cmds);
+            // Only while the sub is running: the module appearing is itself the
+            // confirmation that SUB took effect, and it costs a wrapped row of
+            // top bar that operators who never use it should not have to pay.
+            if self.state.sub_rx_enabled {
+                self.sub_rx_module(ui, cmds);
+            }
+            if self.caps.as_ref().is_some_and(|c| c.is_transmit_capable()) {
+                self.tx_module(ui, cmds);
+            }
+            self.display_module(ui, cmds);
+            self.windows_module(ui);
+        });
     }
 
     /// The VFO frequency controls (A/B select + big readout + the inactive
@@ -799,15 +1012,9 @@ impl SdroxideApp {
         // right column against the box edge (no empty space) and lets the readout
         // be centred vertically by exact geometry rather than a fragile layout hint.
         let font40 = egui::FontId::monospace(40.0);
-        let digit = ui
-            .painter()
-            .layout_no_wrap("0".to_owned(), font40.clone(), Color32::WHITE)
-            .size();
-        let dot_w = ui
-            .painter()
-            .layout_no_wrap(".".to_owned(), font40, Color32::WHITE)
-            .size()
-            .x;
+        let digit =
+            ui.painter().layout_no_wrap("0".to_owned(), font40.clone(), Color32::WHITE).size();
+        let dot_w = ui.painter().layout_no_wrap(".".to_owned(), font40, Color32::WHITE).size().x;
         let hz_w = ui
             .painter()
             .layout_no_wrap(" Hz".to_owned(), egui::FontId::proportional(12.0), Color32::WHITE)
@@ -893,13 +1100,13 @@ impl SdroxideApp {
     }
 
     /// The S-meter in a label-less box, always pinned top-right. Clicking it
-    /// toggles between the bar and analog-needle styles.
+    /// cycles the needle / bar / trace faces.
     fn smeter_module(&mut self, ui: &mut egui::Ui) {
         crate::chrome::module_bare_flush_h(ui, 250.0, crate::chrome::MODULE_TALL_H, |ui| {
-            let resp = smeter::show(ui, self.meters.as_ref(), self.view.smeter_analog)
-                .on_hover_text("Click to switch bar / analog meter");
+            let resp = smeter::show(ui, self.meters.as_ref(), self.view.smeter_style)
+                .on_hover_text("Click to cycle meter face: needle / bar / trace");
             if resp.clicked() {
-                self.view.smeter_analog = !self.view.smeter_analog;
+                self.view.smeter_style = self.view.smeter_style.next();
             }
         });
     }
@@ -934,6 +1141,9 @@ impl SdroxideApp {
         self.digi_decodes.clear();
         self.digi_stations = Default::default();
         self.digi_preview = None;
+        // The Hell raster is a continuous strip with no frame boundary, so
+        // leaving it up across a mode change would splice unrelated text.
+        self.hell.clear();
     }
 
     /// Reuse the skimmer overlay to mark FT8/FT4 stations: one box per decoded
@@ -978,28 +1188,80 @@ impl SdroxideApp {
         (spots, alpha)
     }
 
+    /// Whether a spot passes the operator's filters.
+    ///
+    /// The single place that decides this. The waterfall overlay, the SPOTS list
+    /// and the world-map dots all go through here, so switching a category off
+    /// cannot take effect in one view and be forgotten in another.
+    ///
+    /// The search query is deliberately *not* part of this: it narrows the list
+    /// in the SPOTS window only. See [`App::spot_search`].
+    fn spot_visible(&self, s: &Spot) -> bool {
+        if !self.spot_kinds_shown[spot_kind_index(s.kind)] {
+            return false;
+        }
+        if self.spot_in_view_only
+            && !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&s.freq_hz)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Rebuild the on-air broadcast station list if the UTC minute has rolled
+    /// over since it was last built. Cheap enough to call every frame.
+    fn refresh_broadcast_spots(&mut self, now_utc: i64) {
+        let minute = now_utc.div_euclid(60);
+        if minute == self.broadcast_minute {
+            return;
+        }
+        self.broadcast_minute = minute;
+        self.broadcast_spots = sdroxide_types::broadcast::on_air(&self.broadcast, now_utc);
+    }
+
+    /// Live network spots and the on-air broadcast stations, unfiltered.
+    fn all_spots(&self) -> impl Iterator<Item = &Spot> {
+        self.spots.iter().chain(self.broadcast_spots.iter())
+    }
+
+    /// The same two sets as one owned list in frequency order, for the SPOTS
+    /// window. `self.spots` arrives sorted from the feed manager, but the
+    /// broadcast stations have to be merged into that order.
+    fn merged_spots(&self) -> Vec<Spot> {
+        let mut all: Vec<Spot> = self.all_spots().cloned().collect();
+        all.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
+        all
+    }
+
     /// The network-spot overlay: the currently-shown spots (filtered by kind and,
     /// optionally, to the panadapter view span) plus a parallel age-fade alpha.
     /// Newest spots are solid; they dim over the last quarter of their lifetime.
+    ///
+    /// Runs every frame, so it clones only what survives the filters rather than
+    /// building a merged list first — the layout pass sorts by screen position
+    /// itself, so the output need not be in frequency order.
     fn net_overlay(&self, now_utc: i64) -> (Vec<Spot>, Vec<f32>) {
         let max_age = self.net_cfg_edit.spot_max_age_secs.max(60) as i64;
-        let (lo, hi) = (self.view.view_lo_hz, self.view.view_hi_hz);
         let mut spots = Vec::new();
         let mut alpha = Vec::new();
-        for s in &self.spots {
-            if !self.spot_kinds_shown[spot_kind_index(s.kind)] {
+        for s in self.all_spots() {
+            if !self.spot_visible(s) {
                 continue;
             }
-            if self.spot_in_view_only && !(lo..=hi).contains(&s.freq_hz) {
-                continue;
-            }
-            let age = (now_utc - s.when_utc).max(0);
-            let a = if age > max_age {
-                continue;
-            } else if age as f64 > max_age as f64 * 0.75 {
-                (1.0 - (age as f64 - max_age as f64 * 0.75) / (max_age as f64 * 0.25)) as f32
-            } else {
+            // A scheduled broadcast station has no age: the fade and the
+            // max-age cut are both about how stale a *report* is, and a
+            // transmitter that is on the air now is not a stale report.
+            let a = if s.kind == SpotKind::Broadcast {
                 1.0
+            } else {
+                let age = (now_utc - s.when_utc).max(0);
+                if age > max_age {
+                    continue;
+                } else if age as f64 > max_age as f64 * 0.75 {
+                    (1.0 - (age as f64 - max_age as f64 * 0.75) / (max_age as f64 * 0.25)) as f32
+                } else {
+                    1.0
+                }
             };
             spots.push(s.clone());
             alpha.push(a.clamp(0.15, 1.0));
@@ -1009,7 +1271,14 @@ impl SdroxideApp {
 
     /// Open a fresh log entry pre-filled from a clicked spot, and kick a
     /// callsign lookup if auto-lookup is on.
+    ///
+    /// Broadcast stations are exempt: "BBC World Service" is not a callsign to
+    /// log or look up on QRZ, so clicking one only tunes. Guarding here rather
+    /// than at each call site covers both the SPOTS list and the panadapter.
     fn prefill_from_spot(&mut self, spot: &Spot) {
+        if spot.kind == SpotKind::Broadcast {
+            return;
+        }
         let mut form = LogEditForm::new_entry(now_unix(), spot.freq_hz, &spot.mode);
         form.call = spot.call.clone();
         if let Some(g) = &spot.grid {
@@ -1024,15 +1293,20 @@ impl SdroxideApp {
     }
 
     /// Queue an auto-lookup if a provider + auto-lookup are configured.
-    fn queue_lookup(&mut self, call: String) {
+    ///
+    /// Returns whether one was actually queued, so a caller that rations
+    /// lookups can tell "asked" from "lookup is switched off" and not burn its
+    /// one-per-interval budget on a request that never left.
+    fn queue_lookup(&mut self, call: String) -> bool {
         let call = call.trim().to_string();
         if call.is_empty()
             || !self.net_cfg_edit.auto_lookup
             || self.net_cfg_edit.lookup_provider == LookupProvider::None
         {
-            return;
+            return false;
         }
         self.pending_lookups.push(call);
+        true
     }
 
     /// Merge a callsign-lookup result into the open log entry and, if none
@@ -1050,6 +1324,9 @@ impl SdroxideApp {
             summary.push_str(&format!(" ({c})"));
         }
         self.push_net_log(summary);
+        // Keep the whole record: the JS8 map places stations by the grid in it,
+        // and that station may never have a log entry to merge into.
+        self.callsign_cache.insert(info.call.to_ascii_uppercase(), info.clone());
 
         // 1) The open entry form, if it's for this call.
         if let Some(f) = self.log_edit.as_mut() {
@@ -1094,6 +1371,7 @@ impl SdroxideApp {
             }
             if changed {
                 persist_qso_log(&self.qso_log);
+                self.log_content_changed();
             }
         }
     }
@@ -1142,11 +1420,27 @@ impl SdroxideApp {
         }
         if changed {
             persist_qso_log(&self.qso_log);
+            self.log_content_changed();
         }
         self.push_net_log(format!(
             "Confirmations: {} downloaded, {matched} newly confirmed",
             recs.len()
         ));
+    }
+
+    /// Drop everything derived from the logbook.
+    ///
+    /// The caches below key on the log's *length*, which catches a QSO being
+    /// added or deleted but not one being edited in place — and a confirmation
+    /// arriving, or a lookup filling in a grid, is exactly that. Without this
+    /// the awards tally (and the globe's heat layer, which is the same tally
+    /// placed on the Earth) would keep showing yesterday's answer until the
+    /// next QSO happened to change the length.
+    fn log_content_changed(&mut self) {
+        self.awards_cache = None;
+        self.awards_heat = None;
+        self.worked_entities_cache = None;
+        self.log_index_cache = None;
     }
 
     fn push_net_log(&mut self, line: String) {
@@ -1185,11 +1479,8 @@ impl SdroxideApp {
     fn ensure_awards(&mut self) {
         let len = self.qso_log.len();
         let band = self.awards_band.clone();
-        let stale = self
-            .awards_cache
-            .as_ref()
-            .map(|(l, b, _)| *l != len || *b != band)
-            .unwrap_or(true);
+        let stale =
+            self.awards_cache.as_ref().map(|(l, b, _)| *l != len || *b != band).unwrap_or(true);
         if stale {
             let filter = (!band.is_empty()).then_some(band.as_str());
             let awards = sdroxide_types::compute_awards(&self.qso_log, filter, None);
@@ -1197,8 +1488,100 @@ impl SdroxideApp {
         }
     }
 
+    /// Award coverage placed on the globe, for the 3D view's award layer. Built
+    /// from the same tally the dashboard shows and cached the same way, so the
+    /// two can never tell different stories about the same log.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn award_heat(&mut self) -> Arc<Vec<sdroxide_types::EntitySlot>> {
+        let len = self.qso_log.len();
+        let band = self.awards_band.clone();
+        let stale =
+            self.awards_heat.as_ref().map(|(l, b, _)| *l != len || *b != band).unwrap_or(true);
+        if stale {
+            self.ensure_awards();
+            let slots = self
+                .awards_cache
+                .as_ref()
+                .map(|(_, _, a)| sdroxide_types::entity_coverage(a))
+                .unwrap_or_default();
+            self.awards_heat = Some((len, band, Arc::new(slots)));
+        }
+        Arc::clone(&self.awards_heat.as_ref().expect("just filled").2)
+    }
+
     /// The awards dashboard: DXCC / WAS / WAZ / grid counts (worked vs
     /// confirmed) with a band filter, plus the WAS state grid and WAZ zone grid.
+    /// The out-of-band transmit warning.
+    ///
+    /// Modal and dismissed by hand, because the band-edge lockout is the last
+    /// thing between a mistyped frequency and an out-of-band transmission, and
+    /// an operator who does not know it is off is exactly the operator who will
+    /// find out the expensive way. Dismissing it is a one-shot acknowledgement,
+    /// not a preference: it comes back next launch, because the flag has to be
+    /// passed again next launch.
+    ///
+    /// Driven off the *engine's* state rather than off this process's arguments
+    /// so a remote client is warned too — the licence at risk belongs to
+    /// whoever is at the controls, who need not be whoever started the engine.
+    fn oob_tx_window(&mut self, ctx: &egui::Context) {
+        if !self.state.oob_tx || self.oob_tx_ack {
+            return;
+        }
+        let mut dismissed = false;
+        let resp = egui::Window::new("⚠  TRANSMIT LOCKOUT DISABLED")
+            .frame(crate::chrome::window_frame())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(
+                    RichText::new(
+                        "This engine was started with --oob-tx. The amateur-band lockout is \
+                         off: it will key the transmitter on any frequency the hardware \
+                         supports.",
+                    )
+                    .color(crate::theme::TEXT_STRONG)
+                    .size(13.0),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Transmitting outside your licence is an offence in every country that \
+                         issues one. Only continue if you are authorised to use the frequencies \
+                         you are about to key on — a MARS/CAP or commercial licence, an \
+                         experimental permit, or a dummy load.",
+                    )
+                    .color(crate::theme::TEXT),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if crate::chrome::chip_accent(
+                        ui,
+                        false,
+                        RichText::new("  I UNDERSTAND  ").strong(),
+                        crate::theme::PINK,
+                        crate::theme::TEXT_STRONG,
+                    )
+                    .clicked()
+                    {
+                        dismissed = true;
+                    }
+                    ui.label(
+                        RichText::new("Restart without --oob-tx to put the lockout back.")
+                            .color(crate::theme::LINE_LIT)
+                            .size(10.5),
+                    );
+                });
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_window_border(ctx, &r.response);
+        }
+        if dismissed {
+            self.oob_tx_ack = true;
+        }
+    }
+
     fn awards_window(&mut self, ctx: &egui::Context) {
         if !self.show_awards {
             return;
@@ -1237,7 +1620,12 @@ impl SdroxideApp {
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show_themed(ui, |ui| {
                     // WAS state grid.
-                    ui.label(RichText::new("Worked All States").size(12.0).strong().color(crate::theme::CYAN));
+                    ui.label(
+                        RichText::new("Worked All States")
+                            .size(12.0)
+                            .strong()
+                            .color(crate::theme::CYAN),
+                    );
                     award_cell_grid(
                         ui,
                         sdroxide_types::US_STATES.iter().map(|s| {
@@ -1247,7 +1635,12 @@ impl SdroxideApp {
                     );
                     ui.add_space(8.0);
                     // WAZ zone grid (1..40).
-                    ui.label(RichText::new("CQ Zones (WAZ)").size(12.0).strong().color(crate::theme::CYAN));
+                    ui.label(
+                        RichText::new("CQ Zones (WAZ)")
+                            .size(12.0)
+                            .strong()
+                            .color(crate::theme::CYAN),
+                    );
                     award_cell_grid(
                         ui,
                         (1u8..=40).map(|z| {
@@ -1257,17 +1650,22 @@ impl SdroxideApp {
                     );
                     ui.add_space(8.0);
                     // DXCC worked list (confirmed marked).
-                    ui.label(RichText::new("DXCC entities").size(12.0).strong().color(crate::theme::CYAN));
+                    ui.label(
+                        RichText::new("DXCC entities")
+                            .size(12.0)
+                            .strong()
+                            .color(crate::theme::CYAN),
+                    );
                     for (name, st) in &awards.dxcc {
-                        let col = if st.confirmed {
-                            crate::theme::GREEN
-                        } else {
-                            crate::theme::YELLOW
-                        };
+                        let col =
+                            if st.confirmed { crate::theme::GREEN } else { crate::theme::YELLOW };
                         ui.label(
-                            RichText::new(format!("{} {name}", if st.confirmed { "✓" } else { "•" }))
-                                .size(11.5)
-                                .color(col),
+                            RichText::new(format!(
+                                "{} {name}",
+                                if st.confirmed { "✓" } else { "•" }
+                            ))
+                            .size(11.5)
+                            .color(col),
                         );
                     }
                 });
@@ -1324,17 +1722,23 @@ impl SdroxideApp {
                 ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
                 // VFO utility chips.
                 ui.horizontal(|ui| {
-                    if crate::chrome::chip(ui, false, "A↔B").on_hover_text("Swap VFOs").clicked() {
+                    if crate::chrome::chip(ui, false, "A↔B").on_hover_text("Swap VFOs").clicked()
+                    {
                         cmds.push(Command::SwapVfos);
                     }
-                    if crate::chrome::chip(ui, false, "A→B").on_hover_text("Copy A to B").clicked() {
+                    if crate::chrome::chip(ui, false, "A→B").on_hover_text("Copy A to B").clicked()
+                    {
                         cmds.push(Command::CopyAtoB);
                     }
                     if crate::chrome::chip(ui, self.state.split, "SPLIT").clicked() {
                         cmds.push(Command::SetSplit(!self.state.split));
                     }
                     if crate::chrome::chip(ui, self.state.sub_rx_enabled, "SUB")
-                        .on_hover_text("Sub receiver on the inactive VFO (right ear)")
+                        .on_hover_text(
+                            "Second receiver, in the right ear. It tunes independently of \
+                             A/B — its controls appear in the SUB module, and its passband \
+                             on the waterfall.",
+                        )
                         .clicked()
                     {
                         cmds.push(Command::SetSubRx(!self.state.sub_rx_enabled));
@@ -1392,79 +1796,89 @@ impl SdroxideApp {
         let alpha =
             crate::chrome::popup_fade_alpha(ui.ctx(), popup_id, now, &mut self.mode_popup_since);
         let resp = egui::Popup::from_toggle_button_response(&btn)
-                .frame(crate::chrome::window_frame_alpha(alpha))
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show(|ui| {
-                    ui.set_opacity(alpha);
-                    ui.set_max_width(430.0);
-                    ui.label(RichText::new("BAND").color(crate::theme::CYAN_DIM).size(9.5).strong());
-                    let digital = mode.is_digital();
-                    ui.horizontal_wrapped(|ui| {
-                        for b in Band::ALL {
-                            // In a digital mode, a band button tunes to that
-                            // band's FT8/FT4 dial frequency (SetVfo keeps the
-                            // mode); otherwise it's a normal band change. Bands
-                            // with no standard digital frequency are disabled.
-                            // RF Paint has no calling frequency, so its band
-                            // buttons jump to the band's default frequency while
-                            // staying in RF Paint — every band the radio can
-                            // reach is available.
-                            let digi_hz = if mode.is_rf_paint() {
-                                Some(b.default_entry().0)
-                            } else if digital {
-                                digi_freq_for_band(mode, b)
-                            } else {
-                                None
-                            };
-                            let cap_ok = self.caps.as_ref().is_none_or(|c| {
-                                b.edges().is_none_or(|(lo, hi)| c.can_rx_hz(lo) || c.can_rx_hz(hi))
-                            });
-                            let enabled = cap_ok && (!digital || digi_hz.is_some());
-                            let active = if mode.is_rf_paint() {
-                                self.state.band == b
-                            } else {
-                                match digi_hz {
-                                    Some(hz) => (self.state.active_freq_hz() - hz).abs() < 500.0,
-                                    None => !digital && self.state.band == b,
+            .frame(crate::chrome::window_frame_alpha(alpha))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_opacity(alpha);
+                ui.set_max_width(430.0);
+                ui.label(RichText::new("BAND").color(crate::theme::CYAN_DIM).size(9.5).strong());
+                let digital = mode.is_digital();
+                ui.horizontal_wrapped(|ui| {
+                    for b in Band::ALL {
+                        // In a digital mode, a band button tunes to that
+                        // band's FT8/FT4 dial frequency (SetVfo keeps the
+                        // mode); otherwise it's a normal band change. Bands
+                        // with no standard digital frequency are disabled.
+                        // RF Paint has no calling frequency, so its band
+                        // buttons jump to the band's default frequency while
+                        // staying in RF Paint — every band the radio can
+                        // reach is available.
+                        let digi_hz = if mode.is_rf_paint() {
+                            Some(b.default_entry().0)
+                        } else if digital {
+                            digi_freq_for_band(mode, b)
+                        } else {
+                            None
+                        };
+                        let cap_ok = self.caps.as_ref().is_none_or(|c| {
+                            b.edges().is_none_or(|(lo, hi)| c.can_rx_hz(lo) || c.can_rx_hz(hi))
+                        });
+                        let enabled = cap_ok && (!digital || digi_hz.is_some());
+                        let active = if mode.is_rf_paint() {
+                            self.state.band == b
+                        } else {
+                            match digi_hz {
+                                Some(hz) => (self.state.active_freq_hz() - hz).abs() < 500.0,
+                                None => !digital && self.state.band == b,
+                            }
+                        };
+                        let clicked = ui
+                            .add_enabled_ui(enabled, |ui| {
+                                crate::chrome::chip(ui, active, b.label())
+                            })
+                            .inner
+                            .clicked();
+                        if clicked {
+                            match digi_hz {
+                                Some(hz) => {
+                                    cmds.push(Command::SetVfo { vfo: self.state.active_vfo, hz })
                                 }
-                            };
-                            let clicked = ui
-                                .add_enabled_ui(enabled, |ui| {
-                                    crate::chrome::chip(ui, active, b.label())
-                                })
-                                .inner
-                                .clicked();
-                            if clicked {
-                                match digi_hz {
-                                    Some(hz) => cmds.push(Command::SetVfo {
-                                        vfo: self.state.active_vfo,
-                                        hz,
-                                    }),
-                                    None => cmds.push(Command::SetBand(b)),
-                                }
+                                None => cmds.push(Command::SetBand(b)),
                             }
                         }
-                    });
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("MODE").color(crate::theme::CYAN_DIM).size(9.5).strong());
-                    ui.horizontal_wrapped(|ui| {
-                        for m in [Mode::Lsb, Mode::Usb, Mode::Cw, Mode::Am, Mode::Sam,
-                                  Mode::Nfm, Mode::Wfm, Mode::Digu, Mode::Digl, Mode::Dsb, Mode::Spec] {
-                            if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
-                                cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("DIGITAL").color(crate::theme::CYAN_DIM).size(9.5).strong());
-                    ui.horizontal_wrapped(|ui| {
-                        for m in Mode::DIGITAL {
-                            if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
-                                cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
-                            }
-                        }
-                    });
+                    }
                 });
+                ui.add_space(6.0);
+                ui.label(RichText::new("MODE").color(crate::theme::CYAN_DIM).size(9.5).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for m in [
+                        Mode::Lsb,
+                        Mode::Usb,
+                        Mode::Cw,
+                        Mode::Am,
+                        Mode::Sam,
+                        Mode::Nfm,
+                        Mode::Wfm,
+                        Mode::Digu,
+                        Mode::Digl,
+                        Mode::Dsb,
+                        Mode::Spec,
+                    ] {
+                        if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
+                            cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("DIGITAL").color(crate::theme::CYAN_DIM).size(9.5).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for m in Mode::DIGITAL {
+                        if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
+                            cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
+                        }
+                    }
+                });
+            });
         if let Some(r) = &resp {
             crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, alpha);
             if r.response.contains_pointer() {
@@ -1478,10 +1892,21 @@ impl SdroxideApp {
     /// underneath. Bare and tall, like the VFO/RIT box — replaces the separate
     /// Receiver and Filter boxes.
     fn rx_filter_module(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        crate::chrome::module_bare_h(ui, 356.0, crate::chrome::MODULE_TALL_H, |ui| {
+        // The device's front-end RX gain, if it has one the software can set —
+        // the Hermes-Lite 2's LNA, a SoapySDR device's first RX stage. A rig
+        // with none (a CAT radio on a sound card) gets no slider and no extra
+        // module width, so nothing moves for the people who can't use it.
+        let rx_gains: Vec<GainElement> = self
+            .caps
+            .as_ref()
+            .map(|c| c.gains.iter().filter(|g| g.direction == Direction::Rx).cloned().collect())
+            .unwrap_or_default();
+        let rx_gain = rx_gains.first().cloned();
+        let width = if rx_gain.is_some() { 506.0 } else { 356.0 };
+        crate::chrome::module_bare_h(ui, width, crate::chrome::MODULE_TALL_H, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
-                // Receiver: volume, AGC, mute.
+                // Receiver: volume, RF gain, AGC, mute.
                 ui.horizontal(|ui| {
                     let mut vol = self.state.rx[0].volume;
                     ui.label("Vol");
@@ -1490,6 +1915,56 @@ impl SdroxideApp {
                     {
                         self.state.rx[0].volume = vol; // optimistic echo
                         cmds.push(Command::SetVolume { rx: RxId::Main, v: vol });
+                    }
+                    if let Some(g) = &rx_gain {
+                        let mut hint = format!(
+                            "Front-end RX gain ({}). Too much clips the receiver's ADC and \
+                             smears spurious signals across the band; too little and it goes deaf.",
+                            g.name
+                        );
+                        if rx_gains.len() > 1 {
+                            hint.push_str(&format!(
+                                "\n\nThis rig has {} RX gain stages — the rest are in \
+                                 Settings → Device.",
+                                rx_gains.len()
+                            ));
+                        }
+                        ui.label("Gain").on_hover_text(&hint);
+                        let mut db = self
+                            .state
+                            .gains
+                            .iter()
+                            .find(|(n, _)| *n == g.name)
+                            .map(|(_, d)| *d)
+                            .unwrap_or(g.min_db);
+                        let step = if g.step_db > 0.0 { g.step_db } else { 1.0 };
+                        // Narrower rail than Vol: this one carries a dB readout,
+                        // and the module has to stay inside one wrapped row.
+                        let resp = ui
+                            .scope(|ui| {
+                                ui.spacing_mut().slider_width = 76.0;
+                                crate::chrome::slider(
+                                    ui,
+                                    Slider::new(&mut db, g.min_db..=g.max_db)
+                                        .step_by(step)
+                                        .suffix(" dB"),
+                                )
+                            })
+                            .inner
+                            .on_hover_text(&hint);
+                        if resp.changed() {
+                            // Optimistic echo so the knob tracks the drag instead
+                            // of snapping back until the engine answers.
+                            match self.state.gains.iter_mut().find(|(n, _)| *n == g.name) {
+                                Some((_, d)) => *d = db,
+                                None => self.state.gains.push((g.name.clone(), db)),
+                            }
+                            cmds.push(Command::SetGain {
+                                dir: Direction::Rx,
+                                element: g.name.clone(),
+                                db,
+                            });
+                        }
                     }
                     let agc = self.state.rx[0].agc;
                     ComboBox::from_id_salt("agc")
@@ -1600,6 +2075,175 @@ impl SdroxideApp {
                         self.state.rx[0].noise_reduction = next; // optimistic echo
                         cmds.push(Command::SetNoiseReduction { rx: RxId::Main, level: next });
                     }
+                    // WFM broadcast stereo: lit while a 19 kHz pilot is locked,
+                    // click to force mono. Only WFM has a pilot to find.
+                    if self.state.rx[0].mode == Mode::Wfm {
+                        let want = self.state.rx[0].wfm_stereo;
+                        let locked = self.meters.as_ref().is_some_and(|m| m.stereo);
+                        let hover = if !want {
+                            "WFM stereo forced off — click for automatic stereo"
+                        } else if locked {
+                            "WFM stereo: pilot locked. Click to force mono"
+                        } else {
+                            "WFM stereo: automatic, no pilot on this station"
+                        };
+                        if crate::chrome::chip(ui, want && locked, "ST")
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            self.state.rx[0].wfm_stereo = !want; // optimistic echo
+                            cmds.push(Command::SetWfmStereo { rx: RxId::Main, on: !want });
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    /// The sub receiver's own controls, shown only while it is running. The sub
+    /// has a frequency, a mode and a filter of its own — none of which the main
+    /// receiver's controls can reach — so without this module it is a second
+    /// receiver that can only be switched on and off.
+    fn sub_rx_module(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        // The sub tunes anywhere inside the device passband and nowhere outside
+        // it: both receivers are DDCs on the same IQ stream.
+        let half = self.state.sample_rate / 2.0;
+        let (dev_lo, dev_hi) = (self.state.center_hz - half, self.state.center_hz + half);
+        // Field height, and the height every row is told to be. egui sizes a
+        // horizontal row from `interact_size.y` and then grows it as taller
+        // widgets land in it — which drops everything added after the first
+        // chip a few pixels below everything added before it. Starting the row
+        // at the height its tallest widget will be leaves nothing to grow.
+        const FIELD_H: f32 = 22.0;
+        crate::chrome::module_bare_h(ui, 404.0, crate::chrome::MODULE_TALL_H, |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                ui.spacing_mut().interact_size.y = FIELD_H;
+                // Frequency, mode, and the two moves worth a single click:
+                // send the sub to the dial, or bring the dial to the sub.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("SUB")
+                            .color(crate::widgets::spectrum_view::SUB_COLOR)
+                            .size(11.0)
+                            .strong(),
+                    );
+                    let mut hz = self.state.sub_rx_hz;
+                    let resp = ui
+                        .add_sized(
+                            [116.0, FIELD_H],
+                            DragValue::new(&mut hz)
+                                .speed(10.0)
+                                .range(dev_lo..=dev_hi)
+                                // Typed and shown in MHz — the unit the operator
+                                // reads a frequency in — while the drag step
+                                // stays in Hz so it tunes like a dial.
+                                .custom_formatter(|v, _| format!("{:.6}", v / 1e6))
+                                .custom_parser(|s| s.trim().parse::<f64>().ok().map(|m| m * 1e6))
+                                .suffix(" MHz"),
+                        )
+                        .on_hover_text(
+                            "Where the sub receiver listens. Shift-click the waterfall, or \
+                             drag inside the sub's passband, to move it.",
+                        );
+                    if resp.changed() {
+                        self.state.sub_rx_hz = hz; // optimistic echo
+                        cmds.push(Command::SetSubRxFreq(hz));
+                    }
+                    let mode = self.state.rx[1].mode;
+                    ComboBox::from_id_salt("sub-mode")
+                        .selected_text(mode.label())
+                        .width(74.0)
+                        .show_ui(ui, |ui| {
+                            // Audio modes only. The digital modes are wired to
+                            // the main receiver alone (one decoder, one TX), and
+                            // SPEC produces no audio at all — a sub receiver you
+                            // cannot hear is a trap, not a setting.
+                            for m in [
+                                Mode::Lsb,
+                                Mode::Usb,
+                                Mode::Cw,
+                                Mode::Am,
+                                Mode::Sam,
+                                Mode::Nfm,
+                                Mode::Wfm,
+                                Mode::Digu,
+                                Mode::Digl,
+                                Mode::Dsb,
+                            ] {
+                                if ui.selectable_label(mode == m, m.label()).clicked() {
+                                    cmds.push(Command::SetMode { rx: RxId::Sub, mode: m });
+                                }
+                            }
+                        });
+                    if crate::chrome::chip(ui, false, "←DIAL")
+                        .on_hover_text("Move the sub receiver to the main dial")
+                        .clicked()
+                    {
+                        cmds.push(Command::SetSubRxFreq(self.state.rx_freq_hz()));
+                    }
+                    if crate::chrome::chip(ui, false, "DIAL←")
+                        .on_hover_text("Move the main dial to the sub receiver")
+                        .clicked()
+                    {
+                        cmds.push(Command::SetVfo {
+                            vfo: self.state.active_vfo,
+                            hz: self.state.sub_rx_hz,
+                        });
+                    }
+                });
+                // Filter, level, mute.
+                ui.horizontal(|ui| {
+                    let rx1 = self.state.rx[1];
+                    let max = rx1.mode.max_filter_hz();
+                    ui.label("Filter").on_hover_text("Sub receiver passband edges, in Hz");
+                    let mut lo = rx1.filter_lo;
+                    let mut hi = rx1.filter_hi;
+                    let changed = ui
+                        .add_sized(
+                            [70.0, FIELD_H],
+                            DragValue::new(&mut lo).speed(10).range(-max..=max),
+                        )
+                        .changed()
+                        | ui.add_sized(
+                            [70.0, FIELD_H],
+                            DragValue::new(&mut hi).speed(10).range(-max..=max),
+                        )
+                        .changed();
+                    if changed {
+                        // Same 50 Hz floor the waterfall grips enforce, so the
+                        // passband can't be dragged shut from either route.
+                        let (lo, hi) = (lo.min(hi - 50.0), hi.max(lo + 50.0));
+                        (self.state.rx[1].filter_lo, self.state.rx[1].filter_hi) = (lo, hi);
+                        cmds.push(Command::SetFilter { rx: RxId::Sub, lo, hi });
+                    }
+                    let mut vol = rx1.volume;
+                    ui.label("Vol").on_hover_text("Sub receiver level (it plays in the right ear)");
+                    if ui
+                        .scope(|ui| {
+                            ui.spacing_mut().slider_width = 64.0;
+                            crate::chrome::slider(
+                                ui,
+                                Slider::new(&mut vol, 0.0..=1.0).show_value(false),
+                            )
+                        })
+                        .inner
+                        .changed()
+                    {
+                        self.state.rx[1].volume = vol; // optimistic echo
+                        cmds.push(Command::SetVolume { rx: RxId::Sub, v: vol });
+                    }
+                    if crate::chrome::chip_accent(
+                        ui,
+                        rx1.muted,
+                        "MUTE",
+                        crate::theme::PINK,
+                        Color32::WHITE,
+                    )
+                    .clicked()
+                    {
+                        cmds.push(Command::SetMute { rx: RxId::Sub, muted: !rx1.muted });
+                    }
                 });
             });
         });
@@ -1684,10 +2328,7 @@ impl SdroxideApp {
                 let hover = match self.voice.playing {
                     Some(i) => format!(
                         "Transmitting {} — click to open the voice keyer",
-                        sdroxide_types::slot_label(
-                            i as usize,
-                            &self.voice.slot(i as usize).name
-                        )
+                        sdroxide_types::slot_label(i as usize, &self.voice.slot(i as usize).name)
                     ),
                     None => "Voice keyer: record and transmit stored messages".to_string(),
                 };
@@ -1784,35 +2425,45 @@ impl SdroxideApp {
             .show(|ui| {
                 ui.set_opacity(alpha);
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                ui.label(RichText::new("SKIMMERS").color(crate::theme::CYAN_DIM).size(9.5).strong());
+                ui.label(
+                    RichText::new("SKIMMERS").color(crate::theme::CYAN_DIM).size(9.5).strong(),
+                );
                 // Edit a copy and send the whole struct on any change; the
                 // engine echoes it back in the next RadioState.
                 let mut cfg = self.state.skimmer;
                 // A grid so the squelch fields line up under each other despite
                 // the kind chips having different widths.
-                egui::Grid::new("skimmer-kinds").num_columns(3).spacing([6.0, 5.0]).show(ui, |ui| {
-                    if !wideband {
-                        ui.disable();
-                    }
-                    for kind in SkimmerKind::ALL {
-                        if crate::chrome::chip(ui, cfg.enabled(kind), kind.label())
-                            .on_hover_text("Run this skimmer")
-                            .clicked()
-                        {
-                            cfg.set_enabled(kind, !cfg.enabled(kind));
+                egui::Grid::new("skimmer-kinds").num_columns(3).spacing([6.0, 5.0]).show(
+                    ui,
+                    |ui| {
+                        if !wideband {
+                            ui.disable();
                         }
-                        ui.label(RichText::new("sql").size(10.0).color(crate::theme::CYAN_DIM));
-                        let mut sql = cfg.squelch_db(kind);
-                        if ui
-                            .add(DragValue::new(&mut sql).speed(0.25).range(0..=40).suffix(" dB"))
-                            .on_hover_text("Minimum SNR a decoded signal needs to be spotted")
-                            .changed()
-                        {
-                            cfg.set_squelch_db(kind, sql);
+                        for kind in SkimmerKind::ALL {
+                            if crate::chrome::chip(ui, cfg.enabled(kind), kind.label())
+                                .on_hover_text("Run this skimmer")
+                                .clicked()
+                            {
+                                cfg.set_enabled(kind, !cfg.enabled(kind));
+                            }
+                            ui.label(RichText::new("sql").size(10.0).color(crate::theme::CYAN_DIM));
+                            let mut sql = cfg.squelch_db(kind);
+                            if ui
+                                .add(
+                                    DragValue::new(&mut sql)
+                                        .speed(0.25)
+                                        .range(0..=40)
+                                        .suffix(" dB"),
+                                )
+                                .on_hover_text("Minimum SNR a decoded signal needs to be spotted")
+                                .changed()
+                            {
+                                cfg.set_squelch_db(kind, sql);
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                    }
-                });
+                    },
+                );
                 if !wideband {
                     ui.label(
                         RichText::new("needs a wideband IQ source")
@@ -1937,6 +2588,17 @@ impl SdroxideApp {
                             }
                         }
                     });
+                    ui.label(
+                        RichText::new("WATERFALL").color(crate::theme::CYAN_DIM).size(9.5).strong(),
+                    );
+                    if crate::chrome::chip(ui, self.view.waterfall_flip, "FLIP")
+                        .on_hover_text(
+                            "Scroll the waterfall upwards — newest row at the bottom (V)",
+                        )
+                        .clicked()
+                    {
+                        self.view.waterfall_flip = !self.view.waterfall_flip;
+                    }
                 });
             if let Some(r) = &fft_resp {
                 crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, alpha);
@@ -2092,31 +2754,102 @@ impl SdroxideApp {
                 },
             );
             // Draggable vertical divider between the decode table and the QSO area.
-            let (hrect, hresp) =
-                ui.allocate_exact_size(egui::vec2(handle_w, avail.y), egui::Sense::click_and_drag());
-            if hresp.hovered() || hresp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
+            let hresp = crate::chrome::split_handle(ui, egui::vec2(handle_w, avail.y), None);
             if hresp.dragged() {
                 let d = hresp.drag_delta().x / avail.x.max(1.0);
-                self.view.digi_split_fraction = (self.view.digi_split_fraction + d).clamp(0.28, 0.72);
-            }
-            {
-                let p = ui.painter_at(hrect);
-                let hot = hresp.hovered() || hresp.dragged();
-                let col = if hot { crate::theme::CYAN } else { Color32::from_gray(70) };
-                let (cx, cy) = (hrect.center().x, hrect.center().y);
-                for dy in [-16.0f32, 0.0, 16.0] {
-                    p.line_segment(
-                        [egui::pos2(cx, cy + dy - 6.0), egui::pos2(cx, cy + dy + 6.0)],
-                        egui::Stroke::new(2.0, col),
-                    );
-                }
+                self.view.digi_split_fraction =
+                    (self.view.digi_split_fraction + d).clamp(0.28, 0.72);
             }
             ui.vertical(|ui| {
                 self.qso_area(ui, cmds);
             });
         });
+    }
+
+    /// The band's other conventional frequencies for this mode, as a chip that
+    /// opens a picker.
+    ///
+    /// Only appears where there is actually a choice. Most modes have one
+    /// agreed frequency per band and the chip would be a button that does
+    /// nothing; the ones that have several — FT8's DXpedition window, PSK and
+    /// RTTY's region split, SSTV's move-up-when-busy convention — are exactly
+    /// the ones where an operator otherwise has to go and look the number up.
+    ///
+    /// The dial is what moves. These are dial frequencies, and the audio
+    /// offset within the passband is a separate control that must not be
+    /// disturbed by changing band segment.
+    fn digi_freq_chip(&self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let mode = self.state.rx[0].mode;
+        let dial = self.state.active_freq_hz();
+        let band = sdroxide_types::Band::containing(dial);
+        let channels = sdroxide_types::digi_channels_in(mode, band);
+        if channels.len() < 2 {
+            return;
+        }
+        // "On" when the dial is already sitting on one of them, so the chip
+        // doubles as a readout of whether you are where the mode expects.
+        let here = channels.iter().find(|c| (c.dial_hz - dial).abs() < 1.0);
+        let face = match here {
+            Some(c) => format!("⇵ {:.3}", c.dial_hz / 1e6),
+            None => "⇵ FREQ".to_string(),
+        };
+        let btn = crate::chrome::chip(ui, here.is_some(), RichText::new(face).size(11.0))
+            .on_hover_text(format!(
+                "The {} frequencies agreed for {} on {}",
+                channels.len(),
+                mode.label(),
+                band.label()
+            ));
+
+        let mut pick = None;
+        let resp = egui::Popup::from_toggle_button_response(&btn)
+            .frame(crate::chrome::window_frame())
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                ui.set_max_width(300.0);
+                ui.label(
+                    RichText::new(format!("{} · {}", mode.label(), band.label()))
+                        .color(crate::theme::CYAN_DIM)
+                        .size(9.5)
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                for c in &channels {
+                    let on = here.map(|h| h.dial_hz) == Some(c.dial_hz);
+                    let mut text = format!("{:.3} MHz", c.dial_hz / 1e6);
+                    if !c.note.is_empty() {
+                        text.push_str(&format!("   {}", c.note));
+                    }
+                    let mut rich = RichText::new(text).size(12.0);
+                    if c.outside_r1_data_segment(mode) {
+                        rich = rich.color(crate::theme::YELLOW);
+                    }
+                    let row = ui.selectable_label(on, rich);
+                    if c.outside_r1_data_segment(mode) {
+                        row.clone().on_hover_text(
+                            "A global convention that the IARU Region 1 band plan does not put \
+                             narrow data on — check your own band plan before transmitting here.",
+                        );
+                    }
+                    if row.clicked() {
+                        pick = Some(c.dial_hz);
+                    }
+                }
+                if channels.iter().any(|c| c.outside_r1_data_segment(mode)) {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Amber: outside the Region 1 data segment.")
+                            .color(crate::theme::LINE_LIT)
+                            .size(10.0),
+                    );
+                }
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, 1.0);
+        }
+        if let Some(hz) = pick {
+            cmds.push(Command::SetVfo { vfo: self.state.active_vfo, hz });
+        }
     }
 
     /// Touch-friendly decode list with a per-row REPLY button. Clicking a
@@ -2136,9 +2869,11 @@ impl SdroxideApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new("Sort").size(9.5).color(crate::theme::CYAN_DIM));
-            for (m, base) in
-                [(DecodeSort::None, "None"), (DecodeSort::Signal, "SNR"), (DecodeSort::Distance, "Dist")]
-            {
+            for (m, base) in [
+                (DecodeSort::None, "None"),
+                (DecodeSort::Signal, "SNR"),
+                (DecodeSort::Distance, "Dist"),
+            ] {
                 let active = self.digi_sort == m;
                 // Active mode shows its direction; re-pressing it flips direction.
                 let lbl = if active && m != DecodeSort::None {
@@ -2156,7 +2891,14 @@ impl SdroxideApp {
                 }
             }
             ui.add_space(8.0);
-            if crate::chrome::chip(ui, self.digi_cq_only, "CQ only").clicked() {
+            if crate::chrome::chip(ui, self.digi_cq_only, "CQ only")
+                .on_hover_text(
+                    "Only stations calling CQ — and only the calls you may answer: a directed \
+                     CQ (DX, EU, JA, POTA, TEST …) is listed when it names you and hidden when \
+                     it names someone else.",
+                )
+                .clicked()
+            {
                 self.digi_cq_only = !self.digi_cq_only;
             }
             if crate::chrome::chip(ui, self.digi_new_only, "New only")
@@ -2165,15 +2907,41 @@ impl SdroxideApp {
             {
                 self.digi_new_only = !self.digi_new_only;
             }
+            // Whether the engine chooses our transmit frequency. Here rather
+            // than in the setup window because it decides what clicking a
+            // decode in this list does.
+            if self.digi_cfg_seeded {
+                let auto = self.digi_cfg_edit.auto_tx_freq;
+                if crate::chrome::chip(ui, auto, "Auto TX FRQ")
+                    .on_hover_text(
+                        "Pick our transmit frequency automatically: the quietest spot in the \
+                         period we transmit in, rather than the frequency of whoever we are \
+                         answering — they transmit in the other period, so theirs says nothing \
+                         about who is there when we key. Off holds the frequency you set.",
+                    )
+                    .clicked()
+                {
+                    self.digi_cfg_edit.auto_tx_freq = !auto;
+                    cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                }
+            }
         });
         ui.add_space(2.0);
         // Call of the currently previewed decode (cloned so the scroll closure
         // doesn't hold a borrow of `self` we need to write back afterwards).
         let preview_call = self.digi_preview.as_ref().map(|(c, _)| c.clone());
         // Own grid, for the per-decode great-circle distance column.
-        let my_grid = self.digi_status.as_ref().map(|s| s.config.my_grid.clone()).unwrap_or_default();
+        let my_grid =
+            self.digi_status.as_ref().map(|s| s.config.my_grid.clone()).unwrap_or_default();
         // Own callsign, to spotlight decodes addressed to us.
-        let my_call = self.digi_status.as_ref().map(|s| s.config.my_call.clone()).unwrap_or_default();
+        let my_call =
+            self.digi_status.as_ref().map(|s| s.config.my_call.clone()).unwrap_or_default();
+        // Stations already marked to work, so their queue button reads as set.
+        let queued_calls: Vec<String> = self
+            .digi_status
+            .as_ref()
+            .map(|s| s.call_queue.iter().map(|q| q.call.clone()).collect())
+            .unwrap_or_default();
         // Staged preview change: `None` = no click this frame; `Some(v)` =
         // replace the preview with `v` (`Some(None)` clears it).
         let mut new_preview: Option<Option<(String, (f64, f64))>> = None;
@@ -2181,10 +2949,13 @@ impl SdroxideApp {
         let mut hover_ll: Option<(f64, f64)> = None;
         let cq_only = self.digi_cq_only;
         let new_only = self.digi_new_only;
+        let auto_tx_freq = self.digi_status.as_ref().map(|s| s.config.auto_tx_freq).unwrap_or(true);
         let sort = self.digi_sort;
         let desc = self.digi_sort_desc;
-        // Turn parity needs the mode's slot length (FT8 15 s, FT4 7.5 s).
-        let period = if self.state.rx[0].mode == Mode::Ft4 { 7.5 } else { 15.0 };
+        // Turn parity needs the mode's slot length (FT8 15 s, FT4 7.5 s). JS8's
+        // is an operator setting rather than implied by the mode, so it comes
+        // from the status — otherwise Turbo draws one turn header per 2.5 turns.
+        let period = self.slot_period_s();
         // The band we'd log a contact on, for the "is this one new?" judgement.
         let dial_hz = self.state.active_freq_hz();
         let band = if dial_hz > 0.0 { sdroxide_types::adif_band(dial_hz) } else { "" };
@@ -2197,49 +2968,56 @@ impl SdroxideApp {
         // contiguous in the list. A "CQ DX" from a station we're local to is not
         // a CQ *we* can answer: it neither passes the filter nor gets the CQ
         // highlight.
-        let mut items: Vec<(usize, &Decode, Option<f64>, bool, sdroxide_types::Novelty)> = self
+        let mut items: Vec<DecodeRow> = self
             .digi_decodes
             .iter()
             .enumerate()
             .filter_map(|(i, d)| {
+                // A message addressed to our own station survives every filter.
+                // It is the one decode in the list we owe an answer to, and
+                // hiding it behind "CQ only" — a station calling us back is not
+                // calling CQ — leaves no REPLY button anywhere to answer from.
+                let to_me = !my_call.is_empty() && d.to.as_deref() == Some(my_call.as_str());
                 let cq = sdroxide_types::cq_is_for_us(d, &my_call, &my_grid);
-                if cq_only && !cq {
+                if cq_only && !cq && !to_me {
                     return None;
                 }
                 let novelty =
                     log_ix.novelty(d.from.as_deref().unwrap_or(""), d.grid.as_deref(), band);
-                if new_only && !novelty.is_new() {
+                if new_only && !novelty.is_new() && !to_me {
                     return None;
                 }
-                let dist = (!my_grid.is_empty())
+                let dist_km = (!my_grid.is_empty())
                     .then(|| {
-                        d.grid.as_deref().and_then(|g| sdroxide_types::grid_distance_km(&my_grid, g))
+                        d.grid
+                            .as_deref()
+                            .and_then(|g| sdroxide_types::grid_distance_km(&my_grid, g))
                     })
                     .flatten();
-                Some((i, d, dist, cq, novelty))
+                Some(DecodeRow { idx: i, d, dist_km, cq, novelty, to_me })
             })
             .collect();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_themed(ui, |ui| {
             let mut gi = 0;
             while gi < items.len() {
                 // A turn is one slot: group the contiguous same-slot decodes.
-                let slot = items[gi].1.slot_utc;
+                let slot = items[gi].d.slot_utc;
                 let mut end = gi;
-                while end < items.len() && items[end].1.slot_utc == slot {
+                while end < items.len() && items[end].d.slot_utc == slot {
                     end += 1;
                 }
                 match sort {
                     DecodeSort::None => {}
                     DecodeSort::Signal => items[gi..end].sort_by(|a, b| {
-                        let o = a.1.snr_db.cmp(&b.1.snr_db);
+                        let o = a.d.snr_db.cmp(&b.d.snr_db);
                         if desc { o.reverse() } else { o }
                     }),
                     DecodeSort::Distance => items[gi..end].sort_by(|a, b| {
                         // Decodes without a grid always sort last (push them to the
                         // far end of whichever direction is active).
                         let sentinel = if desc { f64::NEG_INFINITY } else { f64::INFINITY };
-                        let ka = a.2.unwrap_or(sentinel);
-                        let kb = b.2.unwrap_or(sentinel);
+                        let ka = a.dist_km.unwrap_or(sentinel);
+                        let kb = b.dist_km.unwrap_or(sentinel);
                         let o = ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal);
                         if desc { o.reverse() } else { o }
                     }),
@@ -2266,15 +3044,14 @@ impl SdroxideApp {
                 });
                 ui.separator();
                 for k in gi..end {
-                    let (i, d, dist_km, cq, novelty) = items[k];
-                    // Decodes addressed to our own station stand out most.
-                    let to_me = !my_call.is_empty() && d.to.as_deref() == Some(my_call.as_str());
+                    let DecodeRow { idx: i, d, dist_km, cq, novelty, to_me } = items[k];
                     // Free text names no sender, and a hashed callsign nobody
                     // has heard yet resolves to none either — say which it is
                     // rather than showing a bare "?".
-                    let who = d.from.clone().unwrap_or_else(|| {
-                        if d.free_text { "TEXT".into() } else { "?".into() }
-                    });
+                    let who = d
+                        .from
+                        .clone()
+                        .unwrap_or_else(|| if d.free_text { "TEXT".into() } else { "?".into() });
                     // What this station would be worth working: one badge, and
                     // a dupe fades the row back so the new ones carry the eye.
                     let (badge, badge_col) = match novelty.highlight() {
@@ -2289,238 +3066,310 @@ impl SdroxideApp {
                     };
                     let dupe = novelty.dupe;
                     let grid = d.grid.clone().unwrap_or_default();
+                    // Where in the world they are, from the callsign alone —
+                    // most decodes carry no grid, and the entity always knows.
+                    let entity = d.from.as_deref().and_then(sdroxide_types::resolve_callsign);
+                    let continent = entity.map(|e| e.continent).unwrap_or("");
                     let is_preview =
                         d.from.is_some() && preview_call.as_deref() == d.from.as_deref();
-                let mut reply = false;
-                // Left edge of the REPLY button, so the row-body click area can
-                // exclude it (otherwise the full-row interaction below sits on
-                // top of the button and swallows its clicks).
-                let mut reply_left: Option<f32> = None;
+                    let queued = d
+                        .from
+                        .as_deref()
+                        .is_some_and(|f| queued_calls.iter().any(|q| q.eq_ignore_ascii_case(f)));
+                    let mut reply = false;
+                    let mut queue = false;
+                    // Left edge of the REPLY button, so the row-body click area can
+                    // exclude it (otherwise the full-row interaction below sits on
+                    // top of the button and swallows its clicks).
+                    let mut reply_left: Option<f32> = None;
 
-                let inner = egui::Frame::new()
-                    .fill(if to_me {
-                        crate::theme::TOME_BG
-                    } else if cq {
-                        crate::theme::CQ_BG
-                    } else {
-                        crate::theme::ROW_BG
-                    })
-                    .inner_margin(egui::Margin { left: 11, right: 6, top: 6, bottom: 6 })
-                    .show(ui, |ui| {
-                        // Fixed-width columns so every field lines up down the
-                        // list. Right-aligned numbers, then callsign (wide
-                        // proportional font), grid, and the message filling the
-                        // rest with a right-pinned REPLY button.
-                        let ch = 22.0;
-                        ui.horizontal(|ui| {
-                            ui.set_min_height(ch);
-                            ui.spacing_mut().item_spacing.x = 7.0;
-                            let cell = |ui: &mut egui::Ui, w: f32, align_right: bool, lbl: egui::Label| {
-                                // Reserve the column width *exactly*: a plain
-                                // allocate_ui shrinks to its content, so a short
-                                // callsign would collapse the column and shift
-                                // the grid + message out of alignment.
-                                let (rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(w, ch), egui::Sense::hover());
-                                let layout = if align_right {
-                                    egui::Layout::right_to_left(egui::Align::Center)
-                                } else {
-                                    egui::Layout::left_to_right(egui::Align::Center)
-                                };
-                                let mut child =
-                                    ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
-                                child.add(lbl);
-                            };
-                            // SNR.
-                            cell(
-                                ui,
-                                28.0,
-                                true,
-                                egui::Label::new(
-                                    RichText::new(format!("{:+}", d.snr_db))
-                                        .monospace()
-                                        .size(13.0)
-                                        .color(snr_color(d.snr_db)),
-                                ),
-                            );
-                            // Audio frequency.
-                            cell(
-                                ui,
-                                40.0,
-                                true,
-                                egui::Label::new(
-                                    RichText::new(format!("{:.0}", d.audio_hz))
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(Color32::from_gray(120)),
-                                ),
-                            );
-                            // Callsign — wider proportional (button) font.
-                            cell(
-                                ui,
-                                98.0,
-                                false,
-                                egui::Label::new(
-                                    RichText::new(&who).size(15.0).strong().color(if to_me {
-                                        crate::theme::YELLOW
-                                    } else if d.from.is_none() || dupe {
-                                        Color32::from_gray(105)
-                                    } else if cq {
-                                        crate::theme::GREEN
-                                    } else {
-                                        crate::theme::TEXT_STRONG
-                                    }),
-                                )
-                                .truncate(),
-                            );
-                            // What they'd be worth: new entity / band / grid /
-                            // call, or a dupe already in the log for this band.
-                            cell(
-                                ui,
-                                34.0,
-                                false,
-                                egui::Label::new(
-                                    RichText::new(badge).size(9.5).strong().color(badge_col),
-                                ),
-                            );
-                            // Grid.
-                            cell(
-                                ui,
-                                44.0,
-                                false,
-                                egui::Label::new(
-                                    RichText::new(&grid)
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(crate::theme::CYAN_DIM),
-                                ),
-                            );
-                            // Distance (km, great-circle from my grid).
-                            cell(
-                                ui,
-                                58.0,
-                                true,
-                                egui::Label::new(
-                                    RichText::new(
-                                        dist_km
-                                            .map(|km| format!("{km:.0} km"))
-                                            .unwrap_or_default(),
-                                    )
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(crate::theme::YELLOW),
-                                ),
-                            );
-                            // Message fills the remaining width; REPLY pinned right.
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let resp = crate::chrome::chip_accent(
+                    let inner = egui::Frame::new()
+                        .fill(if to_me {
+                            crate::theme::TOME_BG
+                        } else if cq {
+                            crate::theme::CQ_BG
+                        } else {
+                            crate::theme::ROW_BG
+                        })
+                        .inner_margin(egui::Margin { left: 11, right: 6, top: 6, bottom: 6 })
+                        .show(ui, |ui| {
+                            // Fixed-width columns so every field lines up down the
+                            // list. Right-aligned numbers, then callsign (wide
+                            // proportional font), grid, and the message filling the
+                            // rest with a right-pinned REPLY button.
+                            let ch = 22.0;
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(ch);
+                                ui.spacing_mut().item_spacing.x = 7.0;
+                                let cell =
+                                    |ui: &mut egui::Ui,
+                                     w: f32,
+                                     align_right: bool,
+                                     lbl: egui::Label| {
+                                        row_cell(ui, w, ch, align_right, lbl)
+                                    };
+                                // SNR.
+                                cell(
                                     ui,
-                                    false,
-                                    RichText::new("REPLY").size(12.0).strong(),
-                                    if to_me {
-                                        crate::theme::YELLOW
-                                    } else if cq {
-                                        crate::theme::GREEN
-                                    } else {
-                                        crate::theme::CYAN
-                                    },
-                                    crate::theme::INK_ON_CYAN,
+                                    28.0,
+                                    true,
+                                    egui::Label::new(
+                                        RichText::new(format!("{:+}", d.snr_db))
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(snr_color(d.snr_db)),
+                                    ),
                                 );
-                                reply = resp.clicked();
-                                reply_left = Some(resp.rect.left());
+                                // Audio frequency.
+                                cell(
+                                    ui,
+                                    40.0,
+                                    true,
+                                    egui::Label::new(
+                                        RichText::new(format!("{:.0}", d.audio_hz))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(Color32::from_gray(120)),
+                                    ),
+                                );
+                                // Callsign — wider proportional (button) font.
+                                cell(
+                                    ui,
+                                    98.0,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(&who).size(15.0).strong().color(if to_me {
+                                            crate::theme::YELLOW
+                                        } else if d.from.is_none() || dupe {
+                                            Color32::from_gray(105)
+                                        } else if cq {
+                                            crate::theme::GREEN
+                                        } else {
+                                            crate::theme::TEXT_STRONG
+                                        }),
+                                    )
+                                    .truncate(),
+                                );
+                                // What they'd be worth: new entity / band / grid /
+                                // call, or a dupe already in the log for this band.
+                                cell(
+                                    ui,
+                                    34.0,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(badge).size(9.5).strong().color(badge_col),
+                                    ),
+                                );
+                                // Continent — the band's opening, readable down
+                                // the column without reading a single callsign.
+                                cell(
+                                    ui,
+                                    24.0,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(continent)
+                                            .monospace()
+                                            .size(11.0)
+                                            .strong()
+                                            .color(if dupe {
+                                                Color32::from_gray(85)
+                                            } else {
+                                                crate::theme::continent_color(continent)
+                                            }),
+                                    ),
+                                );
+                                // Grid.
+                                cell(
+                                    ui,
+                                    44.0,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(&grid)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(crate::theme::CYAN_DIM),
+                                    ),
+                                );
+                                // Distance (km, great-circle from my grid).
+                                cell(
+                                    ui,
+                                    58.0,
+                                    true,
+                                    egui::Label::new(
+                                        RichText::new(
+                                            dist_km
+                                                .map(|km| format!("{km:.0} km"))
+                                                .unwrap_or_default(),
+                                        )
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(crate::theme::YELLOW),
+                                    ),
+                                );
+                                // Message fills the remaining width; REPLY and the
+                                // queue button pinned right.
                                 ui.with_layout(
-                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&d.message)
-                                                    .monospace()
-                                                    .size(12.5)
-                                                    .color(if dupe {
-                                                        Color32::from_gray(95)
-                                                    } else {
-                                                        crate::theme::TEXT
-                                                    }),
-                                            )
-                                            .truncate(),
+                                        let resp = crate::chrome::chip_accent(
+                                            ui,
+                                            false,
+                                            RichText::new("REPLY").size(12.0).strong(),
+                                            if to_me {
+                                                crate::theme::YELLOW
+                                            } else if cq {
+                                                crate::theme::GREEN
+                                            } else {
+                                                crate::theme::CYAN
+                                            },
+                                            crate::theme::INK_ON_CYAN,
+                                        );
+                                        reply = resp.clicked();
+                                        // Mark for later. Pressing it again drops
+                                        // the station, so one button both queues
+                                        // and un-queues.
+                                        let qresp = crate::chrome::chip(
+                                            ui,
+                                            queued,
+                                            RichText::new(if queued { "＋" } else { "+" })
+                                                .size(12.0)
+                                                .strong(),
+                                        )
+                                        .on_hover_text(if queued {
+                                            "Queued — click to remove"
+                                        } else {
+                                            "Work this station after the current one"
+                                        });
+                                        queue = qresp.clicked();
+                                        reply_left = Some(resp.rect.left().min(qresp.rect.left()));
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&d.message)
+                                                            .monospace()
+                                                            .size(12.5)
+                                                            .color(if dupe {
+                                                                Color32::from_gray(95)
+                                                            } else {
+                                                                crate::theme::TEXT
+                                                            }),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
                                         );
                                     },
                                 );
                             });
                         });
-                    });
 
-                let r = inner.response.rect;
-                // Left-accent bar: gold (to us) / red (CQ) / cyan (other). Wider
-                // for a to-us decode so it really pops.
-                let (accent, aw) = if to_me {
-                    (crate::theme::YELLOW, 4.0)
-                } else if cq {
-                    (crate::theme::PINK, 2.5)
-                } else {
-                    (crate::theme::CYAN_DIM, 2.5)
-                };
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + aw, r.bottom())),
-                    0.0,
-                    accent,
-                );
-                // Row-body click (everything left of the REPLY button) tunes
-                // the audio freq. Excluding the button's rect keeps this
-                // interaction from covering — and stealing clicks from — REPLY.
-                let body_right = reply_left.map(|x| x - 2.0).unwrap_or(r.right());
-                let body_rect = egui::Rect::from_min_max(r.left_top(), egui::pos2(body_right, r.bottom()));
-                let row = ui.interact(body_rect, ui.id().with(("dec", i)), egui::Sense::click());
-                if is_preview {
-                    // Amber outline ties this row to its faint map marker.
-                    ui.painter().rect_stroke(
-                        r,
+                    let r = inner.response.rect;
+                    // Left-accent bar: gold (to us) / red (CQ) / cyan (other). Wider
+                    // for a to-us decode so it really pops — and for a directed CQ
+                    // (DX, EU, JA …) that names us, which is a better prospect than
+                    // a plain CQ anyone in the world is free to answer.
+                    let (accent, aw) = if to_me {
+                        (crate::theme::YELLOW, 4.0)
+                    } else if cq {
+                        (crate::theme::PINK, if d.cq_to.is_some() { 4.0 } else { 2.5 })
+                    } else {
+                        (crate::theme::CYAN_DIM, 2.5)
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            r.left_top(),
+                            egui::pos2(r.left() + aw, r.bottom()),
+                        ),
                         0.0,
-                        egui::Stroke::new(1.0, crate::theme::YELLOW),
-                        egui::StrokeKind::Inside,
+                        accent,
                     );
-                } else if to_me {
-                    // A message to our own station: a gold box so it can't be missed.
-                    ui.painter().rect_stroke(
-                        r,
-                        0.0,
-                        egui::Stroke::new(1.4, crate::theme::YELLOW),
-                        egui::StrokeKind::Inside,
-                    );
-                } else if row.hovered() {
-                    ui.painter().rect_stroke(
-                        r,
-                        0.0,
-                        egui::Stroke::new(1.0, crate::theme::CYAN_DIM),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                if row.hovered() {
-                    hover_ll = d.grid.as_deref().and_then(sdroxide_types::grid_to_latlon);
-                }
-                if reply {
-                    if let Some(from) = &d.from {
-                        // If they're neither calling CQ nor calling us, hold until
-                        // they call CQ rather than barging into their exchange.
-                        // Any CQ counts here, including a "CQ DX" we're local to:
-                        // the operator asked to call them, and they are free now.
-                        cmds.push(Command::DigiStartQso {
-                            from: from.clone(),
-                            grid: d.grid.clone(),
-                            snr: d.snr_db,
-                            audio_hz: d.audio_hz,
-                            wait_for_cq: !d.is_cq && !to_me,
-                        });
+                    // Row-body click (everything left of the REPLY button) tunes
+                    // the audio freq. Excluding the button's rect keeps this
+                    // interaction from covering — and stealing clicks from — REPLY.
+                    let body_right = reply_left.map(|x| x - 2.0).unwrap_or(r.right());
+                    let body_rect =
+                        egui::Rect::from_min_max(r.left_top(), egui::pos2(body_right, r.bottom()));
+                    let row =
+                        ui.interact(body_rect, ui.id().with(("dec", i)), egui::Sense::click());
+                    // Everything already resolved about this station, gathered
+                    // where there is room to say it: the row itself has to fit
+                    // twenty of these on screen.
+                    let row = row.on_hover_ui(|ui| {
+                        station_card(ui, d, entity, dist_km, &my_grid, novelty, band, queued, cq);
+                    });
+                    if is_preview {
+                        // Amber outline ties this row to its faint map marker.
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, crate::theme::YELLOW),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if to_me {
+                        // A message to our own station: a gold box so it can't be missed.
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.4, crate::theme::YELLOW),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if row.hovered() {
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, crate::theme::CYAN_DIM),
+                            egui::StrokeKind::Inside,
+                        );
                     }
-                    // Starting a QSO promotes the station to the active DX
-                    // marker; drop the faint preview so they don't overlap.
-                    new_preview = Some(None);
-                } else if row.clicked() {
-                    cmds.push(Command::SetDigiAudioFreq(d.audio_hz));
-                    // Preview this station's location (if it sent a grid).
-                    let ll = d.grid.as_deref().and_then(sdroxide_types::grid_to_latlon);
-                    new_preview = Some(ll.map(|ll| (who.clone(), ll)));
-                }
+                    if row.hovered() {
+                        hover_ll = d.grid.as_deref().and_then(sdroxide_types::grid_to_latlon);
+                    }
+                    if reply {
+                        if let Some(from) = &d.from {
+                            // If they're neither calling CQ nor calling us, hold until
+                            // they call CQ rather than barging into their exchange.
+                            // Any CQ counts here, including a "CQ DX" we're local to:
+                            // the operator asked to call them, and they are free now.
+                            cmds.push(Command::DigiStartQso {
+                                from: from.clone(),
+                                grid: d.grid.clone(),
+                                snr: d.snr_db,
+                                audio_hz: d.audio_hz,
+                                wait_for_cq: !d.is_cq && !to_me,
+                            });
+                        }
+                        // Starting a QSO promotes the station to the active DX
+                        // marker; drop the faint preview so they don't overlap.
+                        new_preview = Some(None);
+                    } else if queue {
+                        if let Some(from) = &d.from {
+                            if queued {
+                                cmds.push(Command::DigiQueueRemove(from.clone()));
+                            } else {
+                                cmds.push(Command::DigiQueueAdd {
+                                    from: from.clone(),
+                                    grid: d.grid.clone(),
+                                    snr: d.snr_db,
+                                    audio_hz: d.audio_hz,
+                                    // Same judgement the reply button makes: a
+                                    // station mid-exchange is not free yet.
+                                    wait_for_cq: !d.is_cq && !to_me,
+                                });
+                            }
+                        }
+                    } else if row.clicked() {
+                        // Moving our transmit onto theirs is exactly what Auto
+                        // TX FRQ exists to avoid, so with it on a click only
+                        // previews the station.
+                        if !auto_tx_freq {
+                            cmds.push(Command::SetDigiAudioFreq(d.audio_hz));
+                        }
+                        // Preview this station's location (if it sent a grid).
+                        let ll = d.grid.as_deref().and_then(sdroxide_types::grid_to_latlon);
+                        new_preview = Some(ll.map(|ll| (who.clone(), ll)));
+                    }
                     ui.add_space(3.0);
                 }
                 gi = end;
@@ -2549,6 +3398,9 @@ impl SdroxideApp {
             .unwrap_or(false);
 
         // Header: QSO left, session log + downloads centered, SETUP right.
+        // The count is this run's; the export buttons still save the whole
+        // logbook, which is what their hover text says.
+        let session = self.session_qsos;
         let logged = self.qso_log.len();
         let row_h = 26.0;
         let (row, _) =
@@ -2561,25 +3413,39 @@ impl SdroxideApp {
             )
         };
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(zone(0.0)).layout(egui::Layout::left_to_right(egui::Align::Center)),
+            egui::UiBuilder::new()
+                .max_rect(zone(0.0))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
                 ui.label(RichText::new("QSO").size(9.5).strong().color(crate::theme::CYAN_DIM));
+                self.digi_freq_chip(ui, cmds);
             },
         );
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(zone(1.0)).layout(egui::Layout::top_down(egui::Align::Center)),
+            egui::UiBuilder::new()
+                .max_rect(zone(1.0))
+                .layout(egui::Layout::top_down(egui::Align::Center)),
             |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Session: {logged} QSO"))
+                        RichText::new(format!("Session: {session} QSO"))
                             .size(11.0)
                             .color(Color32::from_gray(150)),
-                    );
-                    if ui.add_enabled(logged > 0, egui::Button::new("ADIF")).clicked() {
+                    )
+                    .on_hover_text("QSOs worked since sdroxide was started");
+                    if ui
+                        .add_enabled(logged > 0, egui::Button::new("ADIF"))
+                        .on_hover_text(format!("Save the whole logbook ({logged} QSO) as ADIF"))
+                        .clicked()
+                    {
                         let adif = sdroxide_types::qso_log_to_adif(&self.qso_log);
                         crate::download::save("sdroxide-log.adi", adif.as_bytes());
                     }
-                    if ui.add_enabled(logged > 0, egui::Button::new("TXT")).clicked() {
+                    if ui
+                        .add_enabled(logged > 0, egui::Button::new("TXT"))
+                        .on_hover_text(format!("Save the whole logbook ({logged} QSO) as text"))
+                        .clicked()
+                    {
                         let txt = sdroxide_types::qso_log_to_text(&self.qso_log);
                         crate::download::save("sdroxide-log.txt", txt.as_bytes());
                     }
@@ -2587,7 +3453,9 @@ impl SdroxideApp {
             },
         );
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(zone(2.0)).layout(egui::Layout::right_to_left(egui::Align::Center)),
+            egui::UiBuilder::new()
+                .max_rect(zone(2.0))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
                 if crate::chrome::chip(ui, self.show_digi_settings, "⚙ SETUP").clicked() {
                     self.show_digi_settings = !self.show_digi_settings;
@@ -2611,9 +3479,8 @@ impl SdroxideApp {
         // linearly across this range, so the divider tracks the cursor 1:1 and the
         // map genuinely grows/shrinks. Height is capped at the width (aspect ≤ 1).
         let map_lo = crate::widgets::worldmap::MIN_HEIGHT;
-        let map_hi = (full_h - (map_handle_h + CARD_RESERVE + 5.0 + gap + btn_h))
-            .min(avail_w)
-            .max(map_lo);
+        let map_hi =
+            (full_h - (map_handle_h + CARD_RESERVE + 5.0 + gap + btn_h)).min(avail_w).max(map_lo);
         let map_budget = map_lo + (map_hi - map_lo) * self.view.digi_map_fraction;
         let hover_ll = self.digi_hover_ll;
         let my_grid = status.as_ref().map(|s| s.config.my_grid.clone()).unwrap_or_default();
@@ -2628,14 +3495,22 @@ impl SdroxideApp {
         // Ages use egui frame time (monotonic, works native + wasm); each grid
         // remembers the frame it was last freshly decoded in.
         let now_t = ui.input(|i| i.time);
-        self.digi_stations.observe(&self.digi_decodes, now_t);
+        self.digi_stations.observe(&self.digi_decodes, now_t, now_unix());
         let stations = self.digi_stations.stations(now_t);
         // Located network spots (filtered by the shown-kind toggles), as
         // kind-coloured dots on the map.
+        //
+        // FreeDV Reporter is excluded whatever its toggle says: it lists every
+        // station currently *connected*, hundreds of them, which buries the
+        // decoded FT8 stations this map exists to show. The panadapter overlay
+        // and the SPOTS window still carry them.
+        // Broadcast stations do appear here: they carry real transmitter
+        // coordinates, and the on-air filter keeps their count in the same range
+        // as the cluster spots already drawn.
         let spot_dots: Vec<(f64, f64, (u8, u8, u8))> = self
-            .spots
-            .iter()
-            .filter(|s| self.spot_kinds_shown[spot_kind_index(s.kind)])
+            .all_spots()
+            .filter(|s| s.kind != SpotKind::FreeDv)
+            .filter(|s| self.spot_visible(s))
             .filter_map(|s| s.loc.map(|(lat, lon)| (lat, lon, s.kind.color())))
             .collect();
         if map_budget >= crate::widgets::worldmap::MIN_HEIGHT {
@@ -2652,27 +3527,15 @@ impl SdroxideApp {
                 map_budget,
             );
             // Draggable border between the map and the QSO form below it.
-            let (hrect, hresp) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), map_handle_h), egui::Sense::click_and_drag());
-            if hresp.hovered() || hresp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            }
+            let hresp = crate::chrome::split_handle(
+                ui,
+                egui::vec2(ui.available_width(), map_handle_h),
+                None,
+            );
             if hresp.dragged() {
                 // 1:1 with the cursor: a drag of `dy` px moves the map edge `dy` px.
                 let df = hresp.drag_delta().y / (map_hi - map_lo).max(1.0);
                 self.view.digi_map_fraction = (self.view.digi_map_fraction + df).clamp(0.0, 1.0);
-            }
-            {
-                let p = ui.painter_at(hrect);
-                let hot = hresp.hovered() || hresp.dragged();
-                let col = if hot { crate::theme::CYAN } else { Color32::from_gray(70) };
-                let (cx, cy) = (hrect.center().x, hrect.center().y);
-                for dx in [-16.0f32, 0.0, 16.0] {
-                    p.line_segment(
-                        [egui::pos2(cx + dx - 6.0, cy), egui::pos2(cx + dx + 6.0, cy)],
-                        egui::Stroke::new(2.0, col),
-                    );
-                }
             }
         }
         // Station card.
@@ -2680,9 +3543,31 @@ impl SdroxideApp {
             match status.as_ref() {
                 Some(s) => {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(s.step.label()).size(13.0).strong().color(crate::theme::CYAN));
+                        ui.label(
+                            RichText::new(s.step.label())
+                                .size(13.0)
+                                .strong()
+                                .color(crate::theme::CYAN),
+                        );
                         if s.transmitting {
-                            ui.label(RichText::new("● TX").size(13.0).strong().color(crate::theme::PINK));
+                            ui.label(
+                                RichText::new("● TX").size(13.0).strong().color(crate::theme::PINK),
+                            );
+                        }
+                        if s.config.dxped_mode != sdroxide_types::DxpedMode::Normal
+                            && s.mode == Mode::Ft8
+                        {
+                            ui.label(
+                                RichText::new(s.config.dxped_mode.label().to_uppercase())
+                                    .size(11.0)
+                                    .strong()
+                                    .color(crate::theme::PINK),
+                            )
+                            .on_hover_text(
+                                "DXpedition mode. The transmit frequency is held out of the \
+                                 Fox's half of the passband (below 1000 Hz) until the Fox \
+                                 answers.",
+                            );
                         }
                         if s.tx_watchdog {
                             // The sequencer stood down on its own; say so, since
@@ -2708,6 +3593,40 @@ impl SdroxideApp {
                                 .size(11.0)
                                 .color(Color32::from_gray(140)),
                             );
+                            // What everyone else's timing says about ours. A
+                            // clock far enough out that nobody can decode us
+                            // looks exactly like a dead band from this side, so
+                            // it is worth a permanent readout.
+                            if let Some(off) = s.clock_offset_s {
+                                use sdroxide_types::ClockHealth::*;
+                                let health = sdroxide_types::clock_health(off);
+                                let col = match health {
+                                    Good => Color32::from_gray(140),
+                                    Marginal => crate::theme::YELLOW,
+                                    Bad => crate::theme::PINK,
+                                };
+                                let txt = RichText::new(format!("DT {off:+.1} s")).size(11.0);
+                                ui.label(if health == Good {
+                                    txt.color(col)
+                                } else {
+                                    txt.strong().color(col)
+                                })
+                                .on_hover_text(format!(
+                                    "Your slot timing against the stations you are hearing.\n\
+                                     {}\n\nIt covers the whole receive path, so a slow audio or \
+                                     network chain counts the same as a wrong clock. Under 0.5 s \
+                                     is comfortable.",
+                                    match health {
+                                        Good => "Well inside tolerance.".to_string(),
+                                        _ => format!(
+                                            "You transmit {:.1} s {} everyone else — the usual \
+                                             reason calls go unanswered. Sync your computer clock.",
+                                            off.abs(),
+                                            if off > 0.0 { "before" } else { "after" },
+                                        ),
+                                    }
+                                ));
+                            }
                         });
                     });
                     match &s.dx_call {
@@ -2720,7 +3639,9 @@ impl SdroxideApp {
                                         .color(crate::theme::TEXT_STRONG),
                                 );
                                 if let Some(g) = &s.dx_grid {
-                                    ui.label(RichText::new(g).size(13.0).color(crate::theme::CYAN_DIM));
+                                    ui.label(
+                                        RichText::new(g).size(13.0).color(crate::theme::CYAN_DIM),
+                                    );
                                 }
                                 if let (Some(hg), Some(dg)) = (
                                     (!my_grid.is_empty()).then_some(my_grid.as_str()),
@@ -2757,10 +3678,74 @@ impl SdroxideApp {
                     }
                 }
                 None => {
-                    ui.label(RichText::new("FT8 engine idle").size(12.0).color(Color32::from_gray(130)));
+                    ui.label(
+                        RichText::new("FT8 engine idle").size(12.0).color(Color32::from_gray(130)),
+                    );
                 }
             }
         });
+
+        // Fox pile-up: who is being worked and who is waiting. Only a Fox has
+        // one, so its presence is the mode indicator.
+        let fox_queue = status.as_ref().map(|s| s.fox_queue.clone()).unwrap_or_default();
+        if !fox_queue.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(format!("PILE-UP {}", fox_queue.len()))
+                        .size(9.5)
+                        .strong()
+                        .color(crate::theme::CYAN_DIM),
+                );
+                for c in &fox_queue {
+                    let col = if c.working { crate::theme::GREEN } else { Color32::from_gray(150) };
+                    ui.label(RichText::new(&c.call).size(11.5).strong().color(col)).on_hover_text(
+                        format!(
+                            "{} · {:+} dB{}",
+                            if c.working { "being worked" } else { "waiting" },
+                            c.snr_db,
+                            c.grid.as_deref().map(|g| format!(" · {g}")).unwrap_or_default(),
+                        ),
+                    );
+                }
+            });
+        }
+
+        // The call queue: stations marked to be worked, in the order they will
+        // be taken. Clicking one drops it; CLEAR empties the lot.
+        let call_queue = status.as_ref().map(|s| s.call_queue.clone()).unwrap_or_default();
+        if !call_queue.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(format!("QUEUE {}", call_queue.len()))
+                        .size(9.5)
+                        .strong()
+                        .color(crate::theme::CYAN_DIM),
+                );
+                for (i, q) in call_queue.iter().enumerate() {
+                    // The one going next is the one worth reading first.
+                    let col = if i == 0 { crate::theme::GREEN } else { Color32::from_gray(150) };
+                    if crate::chrome::chip(ui, false, RichText::new(&q.call).size(11.5).color(col))
+                        .on_hover_text(format!(
+                            "{} · {:+} dB · {:.0} Hz{}\nClick to remove",
+                            if i == 0 { "next" } else { "waiting" },
+                            q.snr_db,
+                            q.audio_hz,
+                            q.grid.as_deref().map(|g| format!(" · {g}")).unwrap_or_default(),
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Command::DigiQueueRemove(q.call.clone()));
+                    }
+                }
+                if crate::chrome::chip(ui, false, RichText::new("CLEAR").size(10.0)).clicked() {
+                    cmds.push(Command::DigiQueueRemove(String::new()));
+                }
+            });
+        }
 
         // Transcript: a red-bordered scroll box that always fills the space
         // between the station card and the action buttons (reserve the button
@@ -2848,11 +3833,7 @@ impl SdroxideApp {
                 (sdroxide_types::QsoStep::Tx73, "73"),
             ] {
                 let resp = ui.add_enabled_ui(has_dx, |ui| {
-                    crate::chrome::chip(
-                        ui,
-                        step_now == Some(step),
-                        RichText::new(label).size(11.0),
-                    )
+                    crate::chrome::chip(ui, step_now == Some(step), RichText::new(label).size(11.0))
                 });
                 if resp.inner.clicked() {
                     cmds.push(Command::DigiSetStep(step));
@@ -2950,7 +3931,9 @@ impl SdroxideApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new(mode.label()).size(11.0).strong().color(crate::theme::CYAN));
             ui.label(
-                RichText::new(format!("{audio_hz:.0} Hz")).size(11.0).color(Color32::from_gray(150)),
+                RichText::new(format!("{audio_hz:.0} Hz"))
+                    .size(11.0)
+                    .color(Color32::from_gray(150)),
             );
             if crate::chrome::chip(ui, false, "−").on_hover_text("Tune down 10 Hz").clicked() {
                 cmds.push(Command::SetDigiAudioFreq((audio_hz - 10.0).clamp(200.0, 3500.0)));
@@ -2958,6 +3941,7 @@ impl SdroxideApp {
             if crate::chrome::chip(ui, false, "+").on_hover_text("Tune up 10 Hz").clicked() {
                 cmds.push(Command::SetDigiAudioFreq((audio_hz + 10.0).clamp(200.0, 3500.0)));
             }
+            self.digi_freq_chip(ui, cmds);
             // Mode parameters inline next to the tune buttons (RTTY shift/baud,
             // Olivia tones/bandwidth, THOR submode) — no separate setup dialog.
             self.text_modem_params_row(ui, cmds);
@@ -2995,9 +3979,7 @@ impl SdroxideApp {
                         .max_height((rx_h - 12.0).max(20.0))
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
-                        .show_themed(
-                        ui,
-                        |ui| {
+                        .show_themed(ui, |ui| {
                             if rx_text.is_empty() {
                                 ui.label(
                                     RichText::new("— listening —")
@@ -3016,8 +3998,7 @@ impl SdroxideApp {
                                     .wrap(),
                                 );
                             }
-                        },
-                    );
+                        });
                 });
         });
         ui.add_space(gap);
@@ -3028,8 +4009,7 @@ impl SdroxideApp {
         let prefix: String = prev.chars().take(sent).collect();
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
             let text = buf.as_str();
-            let sent_byte =
-                text.char_indices().nth(sent).map(|(i, _)| i).unwrap_or(text.len());
+            let sent_byte = text.char_indices().nth(sent).map(|(i, _)| i).unwrap_or(text.len());
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = wrap;
             let mono = egui::FontId::monospace(13.0);
@@ -3037,14 +4017,22 @@ impl SdroxideApp {
                 job.append(
                     &text[..sent_byte],
                     0.0,
-                    egui::TextFormat { font_id: mono.clone(), color: crate::theme::GREEN, ..Default::default() },
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color: crate::theme::GREEN,
+                        ..Default::default()
+                    },
                 );
             }
             if sent_byte < text.len() {
                 job.append(
                     &text[sent_byte..],
                     0.0,
-                    egui::TextFormat { font_id: mono.clone(), color: crate::theme::TEXT_STRONG, ..Default::default() },
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color: crate::theme::TEXT_STRONG,
+                        ..Default::default()
+                    },
                 );
             }
             ui.fonts_mut(|f| f.layout_job(job))
@@ -3132,6 +4120,226 @@ impl SdroxideApp {
         ui.add_space(bottom_pad);
     }
 
+    /// Hellschreiber panel: the scrolling receive raster on top, then a
+    /// streaming TX input (already-sent characters green) and controls.
+    ///
+    /// Laid out like [`Self::text_modem_panel`] — Hell types the same way — but
+    /// where that shows decoded text this shows the raster, because Hell carries
+    /// pictures of letters rather than letters.
+    fn hell_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, panel_h: f32) {
+        let content_bottom = ui.cursor().top() + panel_h - 40.0;
+        let status = self.digi_status.clone();
+        let audio_hz = status.as_ref().map(|s| s.audio_hz).unwrap_or(1500.0);
+        let sent = status.as_ref().map(|s| s.tx_sent).unwrap_or(0);
+        let tx_on = status.as_ref().map(|s| s.tx_next).unwrap_or(false);
+        let transmitting = status.as_ref().map(|s| s.transmitting).unwrap_or(false);
+        let my_call = status.as_ref().map(|s| s.config.my_call.clone()).unwrap_or_default();
+        let variant = status.as_ref().map(|s| s.config.hell_variant).unwrap_or_default();
+
+        // Header: mode + tuning readout / nudges, variant chips, TX indicator.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("HELL").size(11.0).strong().color(crate::theme::CYAN));
+            ui.label(
+                RichText::new(format!("{audio_hz:.0} Hz"))
+                    .size(11.0)
+                    .color(Color32::from_gray(150)),
+            );
+            if crate::chrome::chip(ui, false, "−").on_hover_text("Tune down 10 Hz").clicked() {
+                cmds.push(Command::SetDigiAudioFreq(audio_hz - 10.0));
+            }
+            if crate::chrome::chip(ui, false, "+").on_hover_text("Tune up 10 Hz").clicked() {
+                cmds.push(Command::SetDigiAudioFreq(audio_hz + 10.0));
+            }
+            self.digi_freq_chip(ui, cmds);
+            self.hell_params_row(ui, cmds);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if transmitting {
+                    ui.label(RichText::new("● TX").size(11.0).strong().color(crate::theme::PINK));
+                }
+                self.digi_squelch_slider(ui, cmds);
+            });
+        });
+        ui.add_space(4.0);
+
+        // Raster appearance + scale. All client-side, so none of it round-trips
+        // through the engine.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let v = &mut self.view.hell;
+            ui.label(RichText::new("Contrast").size(10.5).color(crate::theme::CYAN_DIM));
+            ui.spacing_mut().slider_width = 70.0;
+            ui.add(egui::Slider::new(&mut v.contrast, 0.4..=3.0).show_value(false))
+                .on_hover_text("Harder or softer dots — redraws the whole strip");
+            ui.add_space(6.0);
+            ui.label(RichText::new("Width").size(10.5).color(crate::theme::CYAN_DIM));
+            for px in [1.0f32, 2.0, 3.0, 4.0] {
+                let sel = (v.col_px - px).abs() < 0.01;
+                if ui.selectable_label(sel, format!("{px:.0}×")).clicked() {
+                    v.col_px = px;
+                }
+            }
+            ui.add_space(6.0);
+            if crate::chrome::chip(ui, v.doubled, " 2ROW ")
+                .on_hover_text(
+                    "Draw every column twice, stacked. Hell has no vertical sync, so this \
+                     keeps one complete copy of the text readable whatever the phase.",
+                )
+                .clicked()
+            {
+                v.doubled = !v.doubled;
+            }
+            if crate::chrome::chip(ui, v.reverse, " REV ")
+                .on_hover_text("Reverse video — light dots on dark paper")
+                .clicked()
+            {
+                v.reverse = !v.reverse;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::chrome::chip(ui, false, " CLEAR RX ").clicked() {
+                    self.hell.clear();
+                }
+                ui.label(
+                    RichText::new(format!("{:.1} char/s", variant.chars_per_sec()))
+                        .size(10.5)
+                        .color(Color32::from_gray(120)),
+                );
+            });
+        });
+        ui.add_space(4.0);
+
+        // Reserve the input + button rows at the bottom; the raster gets the rest.
+        let btn_h = 32.0;
+        let input_h = 56.0;
+        let gap = 5.0;
+        let bottom_pad = 12.0;
+        let rx_h = (content_bottom - ui.cursor().top() - btn_h - input_h - 2.0 * gap - bottom_pad)
+            .max(28.0);
+
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), rx_h),
+            egui::Sense::click_and_drag(),
+        );
+        // Dragging lines the text up by hand when the doubled view is off.
+        if resp.dragged() && !self.view.hell.doubled {
+            let d = resp.drag_delta().y / rect.height().max(1.0);
+            self.view.hell.valign = (self.view.hell.valign - d).rem_euclid(1.0);
+        }
+        if resp.hovered() && !self.view.hell.doubled {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        self.hell.draw(ui, rect, &self.view.hell);
+        ui.add_space(gap);
+
+        // TX input: already-sent characters coloured green, exactly as the
+        // keyboard modes do it.
+        let prev = self.text_tx.clone();
+        let sent = sent.min(prev.chars().count());
+        let prefix: String = prev.chars().take(sent).collect();
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+            let text = buf.as_str();
+            let sent_byte = text.char_indices().nth(sent).map(|(i, _)| i).unwrap_or(text.len());
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = wrap;
+            let mono = egui::FontId::monospace(13.0);
+            if sent_byte > 0 {
+                job.append(
+                    &text[..sent_byte],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color: crate::theme::GREEN,
+                        ..Default::default()
+                    },
+                );
+            }
+            if sent_byte < text.len() {
+                job.append(
+                    &text[sent_byte..],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color: crate::theme::TEXT_STRONG,
+                        ..Default::default()
+                    },
+                );
+            }
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+        let resp = ui
+            .allocate_ui(egui::vec2(ui.available_width(), input_h), |ui| {
+                egui::Frame::new()
+                    .fill(crate::theme::ROW_BG)
+                    .stroke(egui::Stroke::new(1.0, crate::theme::RED_DEEP))
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.set_min_height(ui.available_height());
+                        egui::ScrollArea::vertical()
+                            .id_salt("hell-tx")
+                            .max_height((input_h - 8.0).max(20.0))
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show_themed(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.text_tx)
+                                        .layouter(&mut layouter)
+                                        .frame(egui::Frame::NONE)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("Type here to transmit…"),
+                                )
+                            })
+                            .inner
+                    })
+                    .inner
+            })
+            .inner;
+        if resp.changed() {
+            if !self.text_tx.starts_with(&prefix) {
+                self.text_tx = prev;
+            }
+            cmds.push(Command::DigiTxText(self.text_tx.clone()));
+        }
+        ui.add_space(gap);
+
+        ui.horizontal(|ui| {
+            let label = if tx_on { "  TX ON  " } else { "   TX   " };
+            if crate::chrome::chip_accent(
+                ui,
+                tx_on,
+                RichText::new(label).size(14.0).strong(),
+                crate::theme::PINK,
+                Color32::WHITE,
+            )
+            .on_hover_text("Hold the channel: idle sends blank paper, so the strip keeps scrolling")
+            .clicked()
+            {
+                cmds.push(Command::DigiTxActive(!tx_on));
+            }
+            if crate::chrome::chip_accent(
+                ui,
+                false,
+                RichText::new(" CALL CQ ").size(13.0).strong(),
+                crate::theme::GREEN,
+                crate::theme::INK_ON_CYAN,
+            )
+            .clicked()
+            {
+                let call = if my_call.is_empty() { "NOCALL".to_string() } else { my_call.clone() };
+                let cq = format!("CQ CQ CQ DE {call} {call} {call} PSE K ");
+                cmds.push(Command::DigiAbortTx);
+                self.text_tx = cq.clone();
+                cmds.push(Command::DigiTxText(cq));
+                cmds.push(Command::DigiTxActive(true));
+            }
+            if crate::chrome::chip(ui, false, " CLEAR ").clicked() {
+                self.text_tx.clear();
+                cmds.push(Command::DigiAbortTx);
+                cmds.push(Command::DigiTxText(String::new()));
+            }
+        });
+        ui.add_space(bottom_pad);
+    }
+
     /// Mode-specific parameter buttons for the continuous keyboard modes, shown
     /// inline in the panel header next to the tune buttons (moved here from the
     /// setup dialog). Edits the UI-owned config copy and pushes it on change.
@@ -3163,8 +4371,11 @@ impl SdroxideApp {
                     cap(ui, "Baud");
                     for b in [45.45f32, 50.0, 75.0] {
                         let sel = (cfg.rtty_baud - b).abs() < 0.5;
-                        let lbl =
-                            if (b - 45.45).abs() < 0.5 { "45".to_string() } else { format!("{b:.0}") };
+                        let lbl = if (b - 45.45).abs() < 0.5 {
+                            "45".to_string()
+                        } else {
+                            format!("{b:.0}")
+                        };
                         if ui.selectable_label(sel, lbl).clicked() {
                             cfg.rtty_baud = b;
                             changed = true;
@@ -3217,7 +4428,8 @@ impl SdroxideApp {
             ui.label(RichText::new("Speed").size(10.5).strong().color(crate::theme::CYAN_DIM));
             for b in [2.0f32, 3.0, 4.5, 6.0] {
                 let sel = (cfg.fsq_baud - b).abs() < 0.05;
-                let lbl = if (b - 4.5).abs() < 0.05 { "4.5".to_string() } else { format!("{b:.0}") };
+                let lbl =
+                    if (b - 4.5).abs() < 0.05 { "4.5".to_string() } else { format!("{b:.0}") };
                 if ui.selectable_label(sel, lbl).clicked() {
                     cfg.fsq_baud = b;
                     changed = true;
@@ -3227,7 +4439,9 @@ impl SdroxideApp {
             ui.label(RichText::new("Call").size(10.5).strong().color(crate::theme::CYAN_DIM));
             if ui
                 .add(egui::TextEdit::singleline(&mut cfg.fsq_call).desired_width(76.0))
-                .on_hover_text("Callsign for directed (FSQCALL) messages; defaults to your callsign")
+                .on_hover_text(
+                    "Callsign for directed (FSQCALL) messages; defaults to your callsign",
+                )
                 .changed()
             {
                 cfg.fsq_call = cfg.fsq_call.to_uppercase();
@@ -3243,6 +4457,796 @@ impl SdroxideApp {
     /// list, a directed compose row (To: + message), and a contacts book.
     /// `panel_h` is the real bounded height (the frame reports an unbounded
     /// `available_height`).
+    /// The JS8 panel: what is on the band, and the conversation.
+    ///
+    /// Shaped like the FT8 panel — an activity list on the left, a draggable
+    /// split, a working area on the right — but the right-hand side is a chat
+    /// log rather than a QSO sequencer, because that is what JS8 carries.
+    fn js8_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, panel_h: f32) {
+        use sdroxide_types::Js8Speed;
+
+        let content_bottom = ui.cursor().top() + panel_h - 26.0;
+        let status = self.digi_status.clone();
+        let audio_hz = status.as_ref().map(|s| s.audio_hz).unwrap_or(1500.0);
+        let transmitting = status.as_ref().map(|s| s.transmitting).unwrap_or(false);
+        let js8 = status.as_ref().and_then(|s| s.js8.clone()).unwrap_or_default();
+
+        // ── Header: speed, tuning, queue depth ──────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("JS8").size(11.0).strong().color(crate::theme::CYAN));
+            for speed in Js8Speed::ALL {
+                if crate::chrome::chip(ui, js8.speed == speed, speed.label()).clicked()
+                    && js8.speed != speed
+                {
+                    self.digi_cfg_edit.js8_speed = speed;
+                    cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                }
+            }
+            ui.label(RichText::new(format!("{audio_hz:.0} Hz")).monospace());
+            if crate::chrome::chip(ui, false, "−").clicked() {
+                cmds.push(Command::SetDigiAudioFreq((audio_hz - 10.0).clamp(200.0, 3500.0)));
+            }
+            if crate::chrome::chip(ui, false, "+").clicked() {
+                cmds.push(Command::SetDigiAudioFreq((audio_hz + 10.0).clamp(200.0, 3500.0)));
+            }
+            self.digi_freq_chip(ui, cmds);
+            // Beacon state. An unattended transmitter must say so where the
+            // operator is already looking, and say when it will key next — a
+            // countdown is the difference between "armed" and "hung".
+            let hb_min = self.digi_cfg_edit.js8_heartbeat_min;
+            // Lit by what the engine is *doing*, not by what is configured: at
+            // Turbo the interval is set and nothing beacons, and a chip that
+            // claimed otherwise would be the one place this must not be wrong.
+            let hb_on = crate::chrome::chip(ui, js8.next_hb_in_s.is_some(), "HB AUTO")
+                .on_hover_text(match js8.next_hb_in_s {
+                    Some(_) => format!("Beaconing every {hb_min} min — click to stop"),
+                    None if js8.speed == Js8Speed::Turbo => {
+                        "Turbo does not beacon — it is the local and VHF speed".to_string()
+                    }
+                    None => "Beacon your callsign and grid every 15 minutes".to_string(),
+                })
+                .clicked();
+            if hb_on {
+                // Off if it was on; otherwise the interval most of the band
+                // uses, which SETUP can then change.
+                self.digi_cfg_edit.js8_heartbeat_min = if hb_min > 0 { 0 } else { 15 };
+                cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+            }
+            if let Some(left) = js8.next_hb_in_s {
+                ui.label(
+                    RichText::new(format!("{}:{:02}", left / 60, left % 60))
+                        .monospace()
+                        .color(crate::theme::CYAN_DIM),
+                )
+                .on_hover_text("Until the next heartbeat");
+            }
+            // Beacons do not go out on the working frequency, so the waterfall
+            // shows a burst where the panel's marker is not. Saying where it
+            // went is the difference between that reading as a bug and as the
+            // sub-band convention working.
+            if let Some(hz) = js8.hb_hz {
+                ui.label(
+                    RichText::new(format!("HB {hz:.0} Hz")).monospace().color(crate::theme::GREEN),
+                )
+                .on_hover_text(format!(
+                    "The last beacon went out at {hz:.0} Hz — a free slot in the {:.0}–{:.0} Hz \
+                     heartbeat sub-band, chosen so it lands clear of the signals being decoded.",
+                    sdroxide_types::HB_BAND_LO_HZ,
+                    sdroxide_types::HB_BAND_HI_HZ,
+                ));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Every setting this mode has — callsign, groups, auto-reply,
+                // the beacon interval, the status message — lives in that
+                // window, and the JS8 panel is the only one with no other way
+                // in: FT8 reaches it from the QSO area, and the keyboard modes
+                // keep their parameters in the header instead.
+                if crate::chrome::chip(ui, self.show_digi_settings, "⚙ SETUP").clicked() {
+                    self.show_digi_settings = !self.show_digi_settings;
+                }
+                if transmitting {
+                    ui.label(RichText::new("● TX").color(crate::theme::PINK).strong());
+                }
+                // A long message takes minutes, not seconds. Saying so while it
+                // is going out is the difference between "stuck" and "working".
+                if js8.tx_frames_total > 0 {
+                    let left = f64::from(js8.tx_frames_pending) * js8.speed.slot_s();
+                    ui.label(
+                        RichText::new(format!(
+                            "{}/{} frames · {left:.0}s",
+                            js8.tx_frames_total - js8.tx_frames_pending,
+                            js8.tx_frames_total
+                        ))
+                        .monospace()
+                        .color(crate::theme::YELLOW),
+                    );
+                }
+                self.digi_squelch_slider(ui, cmds);
+            });
+        });
+        ui.add_space(4.0);
+
+        // Locate the heard stations and hand them to the maps. Done before the
+        // list is drawn so a row and its dot on the globe agree this frame.
+        let now_t = ui.input(|i| i.time);
+        self.js8_observe(&js8.heard, now_t);
+
+        let avail_h = (content_bottom - ui.cursor().top()).max(80.0);
+        let total_w = ui.available_width();
+        let left_w = (total_w * self.view.js8_split_fraction).clamp(160.0, total_w - 200.0);
+
+        ui.horizontal_top(|ui| {
+            // ── Left: who is on the band ────────────────────────────────────
+            ui.vertical(|ui| {
+                ui.set_width(left_w);
+                ui.label(RichText::new("HEARD").size(10.5).strong().color(crate::theme::CYAN_DIM));
+                self.js8_heard_list(ui, &js8, avail_h - 18.0, left_w);
+            });
+
+            // ── The drag handle ─────────────────────────────────────────────
+            let resp = crate::chrome::split_handle(ui, egui::vec2(7.0, avail_h), None);
+            if resp.dragged() {
+                let dx = resp.drag_delta().x;
+                self.view.js8_split_fraction = ((left_w + dx) / total_w).clamp(0.22, 0.72);
+            }
+
+            // ── Right: the conversation ─────────────────────────────────────
+            //
+            // Laid out bottom-up so the controls claim their real height and
+            // the conversation takes whatever is left. Reserving a guessed
+            // number of pixels for them instead clips the bottom row as soon as
+            // a chip is added or the theme's spacing changes.
+            ui.vertical(|ui| {
+                ui.set_height(avail_h);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    // First declared is lowest in a bottom-up layout, so this
+                    // is the gap between the controls and the panel edge.
+                    // Without it they sit flush against the frame.
+                    ui.add_space(8.0);
+                    self.js8_compose(ui, cmds, &js8);
+                    ui.add_space(4.0);
+                    // Back to normal order for the scrolling part.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        self.js8_conversation(ui, &js8);
+                    });
+                });
+            });
+        });
+    }
+
+    // ── JS8: locating stations ──────────────────────────────────────────────
+
+    /// Where a JS8 station is, if anything knows.
+    ///
+    /// On-air first — a heartbeat, a CQ or a ` GRID` reply carries a real
+    /// locator — then whatever callsign lookup resolved. Most JS8 traffic
+    /// carries no grid at all, which is the whole reason the lookup path is
+    /// here: without it the map would show only the stations that happened to
+    /// beacon while we were listening.
+    fn js8_grid_for(&self, call: &str, heard: &[sdroxide_types::Js8Heard]) -> Option<String> {
+        if call.is_empty() {
+            return None;
+        }
+        heard
+            .iter()
+            .find(|h| h.call.eq_ignore_ascii_case(call))
+            .and_then(|h| h.grid.clone())
+            .or_else(|| {
+                self.callsign_cache.get(&call.to_ascii_uppercase()).and_then(|i| i.grid.clone())
+            })
+            .filter(|g| sdroxide_types::grid_to_latlon(g).is_some())
+    }
+
+    /// Feed the heard list to the maps, and ask the lookup service where the
+    /// stations that never sent a locator actually are.
+    ///
+    /// The flat map and the globe both draw [`crate::digi_map::DigiStations`],
+    /// which speaks in [`Decode`]s — so the heard stations are handed over in
+    /// that shape rather than teaching the map a second kind of station.
+    fn js8_observe(&mut self, heard: &[sdroxide_types::Js8Heard], now_t: f64) {
+        // JS8's own convention is a heartbeat every ten or fifteen minutes, so
+        // FT8's two-minute fade would leave the map blank between them.
+        self.digi_stations.set_fade_s(JS8_STATION_FADE_S);
+        let located: Vec<Decode> = heard
+            .iter()
+            .filter_map(|h| {
+                let grid = self.js8_grid_for(&h.call, heard)?;
+                Some(Decode {
+                    slot_utc: h.last_utc,
+                    snr_db: h.snr_db,
+                    dt: 0.0,
+                    audio_hz: h.audio_hz,
+                    message: String::new(),
+                    to: None,
+                    from: Some(h.call.clone()),
+                    grid: Some(grid),
+                    is_cq: false,
+                    cq_to: None,
+                    rr73_to: None,
+                    free_text: false,
+                })
+            })
+            .collect();
+        self.digi_stations.observe(&located, now_t, now_unix());
+
+        // One lookup at a time. Each is an HTTP round trip on a thread of its
+        // own, and a busy band puts fifty stations in this list at once.
+        if now_t - self.js8_lookup_at < JS8_LOOKUP_INTERVAL_S {
+            return;
+        }
+        let next = heard.iter().map(|h| h.call.to_ascii_uppercase()).find(|c| {
+            !c.is_empty()
+                && !c.starts_with('@')
+                && !self.js8_looked_up.contains(c)
+                && self.js8_grid_for(c, heard).is_none()
+        });
+        if let Some(call) = next {
+            // Only spend the interval on a request that actually left: with no
+            // provider configured this must stay ready for the moment one is.
+            if self.queue_lookup(call.clone()) {
+                self.js8_looked_up.insert(call);
+                self.js8_lookup_at = now_t;
+            }
+        }
+    }
+
+    // ── JS8: the heard list ─────────────────────────────────────────────────
+
+    /// Who is on the band, as the same styled rows the FT8 decode list uses.
+    ///
+    /// Deliberately the same shape — signal, frequency, callsign, what they'd
+    /// be worth, where they are, and a REPLY button — because it is the same
+    /// judgement being made, and an operator who has learned to read one list
+    /// should not have to learn a second.
+    fn js8_heard_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        js8: &sdroxide_types::Js8Status,
+        max_h: f32,
+        col_w: f32,
+    ) {
+        let my_grid = self.my_grid();
+        let dial_hz = self.state.active_freq_hz();
+        let band = if dial_hz > 0.0 { sdroxide_types::adif_band(dial_hz) } else { "" };
+        self.log_index();
+        // The last thing each station said: what the row shows, and what the
+        // REPLY button drafts an answer to.
+        let last_msg: std::collections::HashMap<&str, &sdroxide_types::Js8Msg> = js8
+            .messages
+            .iter()
+            .filter(|m| !m.from.is_empty())
+            .map(|m| (m.from.as_str(), m))
+            .collect();
+        let me = self.js8_me(js8);
+        // Dropping the last three columns is what keeps the row readable when
+        // the split is dragged narrow; the message then gets the space instead.
+        let wide = col_w > 430.0;
+
+        // Staged, because the row closures borrow `self` immutably.
+        let mut pick: Option<(String, Option<String>)> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("js8-heard")
+            .max_height(max_h)
+            .auto_shrink([false, false])
+            .show_themed(ui, |ui| {
+                if js8.heard.is_empty() {
+                    ui.label(RichText::new("— nothing heard yet —").weak());
+                }
+                for (i, h) in js8.heard.iter().enumerate() {
+                    let msg = last_msg.get(h.call.as_str()).copied();
+                    let to_me = msg.is_some_and(js8_personally_addressed);
+                    // A heartbeat or a CQ is an invitation, which is what FT8's
+                    // red CQ row means too.
+                    let calling =
+                        msg.is_some_and(|m| matches!(m.cmd.as_deref(), Some("CQ") | Some("HB")));
+                    let selected = self.js8_target.eq_ignore_ascii_case(&h.call);
+                    let grid = self.js8_grid_for(&h.call, &js8.heard);
+                    let dist_km = (!my_grid.is_empty())
+                        .then(|| {
+                            grid.as_deref()
+                                .and_then(|g| sdroxide_types::grid_distance_km(&my_grid, g))
+                        })
+                        .flatten();
+                    let entity = sdroxide_types::resolve_callsign(&h.call);
+                    let continent = entity.map(|e| e.continent).unwrap_or("");
+                    let novelty = self.log_index_cache.as_ref().expect("just refreshed").1.novelty(
+                        &h.call,
+                        grid.as_deref(),
+                        band,
+                    );
+                    let (badge, badge_col) = match novelty.highlight() {
+                        Some(sdroxide_types::Highlight::NewDxcc) => ("DXCC", crate::theme::PINK),
+                        Some(sdroxide_types::Highlight::NewDxccBand) => {
+                            ("BAND", crate::theme::YELLOW)
+                        }
+                        Some(sdroxide_types::Highlight::NewGrid) => ("GRID", crate::theme::CYAN),
+                        Some(sdroxide_types::Highlight::NewCall) => ("NEW", crate::theme::CYAN_DIM),
+                        Some(sdroxide_types::Highlight::Dupe) => ("DUPE", Color32::from_gray(85)),
+                        None => ("", Color32::TRANSPARENT),
+                    };
+                    let dupe = novelty.dupe;
+                    // A grid nobody sent is a guess from the callsign database,
+                    // and the row says so rather than passing it off as heard.
+                    let looked_up = grid.is_some() && h.grid.is_none();
+                    let mut reply = false;
+                    let mut reply_left: Option<f32> = None;
+
+                    let inner = egui::Frame::new()
+                        .fill(if to_me {
+                            crate::theme::TOME_BG
+                        } else if calling {
+                            crate::theme::CQ_BG
+                        } else {
+                            crate::theme::ROW_BG
+                        })
+                        .inner_margin(egui::Margin { left: 11, right: 6, top: 6, bottom: 6 })
+                        .show(ui, |ui| {
+                            let ch = 22.0;
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(ch);
+                                ui.spacing_mut().item_spacing.x = 7.0;
+                                row_cell(
+                                    ui,
+                                    28.0,
+                                    ch,
+                                    true,
+                                    egui::Label::new(
+                                        RichText::new(format!("{:+}", h.snr_db))
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(snr_color(h.snr_db)),
+                                    ),
+                                );
+                                row_cell(
+                                    ui,
+                                    40.0,
+                                    ch,
+                                    true,
+                                    egui::Label::new(
+                                        RichText::new(format!("{:.0}", h.audio_hz))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(Color32::from_gray(120)),
+                                    ),
+                                );
+                                row_cell(
+                                    ui,
+                                    92.0,
+                                    ch,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(&h.call).size(15.0).strong().color(
+                                            if to_me {
+                                                crate::theme::YELLOW
+                                            } else if dupe {
+                                                Color32::from_gray(105)
+                                            } else if calling {
+                                                crate::theme::GREEN
+                                            } else {
+                                                crate::theme::TEXT_STRONG
+                                            },
+                                        ),
+                                    )
+                                    .truncate(),
+                                );
+                                row_cell(
+                                    ui,
+                                    34.0,
+                                    ch,
+                                    false,
+                                    egui::Label::new(
+                                        RichText::new(badge).size(9.5).strong().color(badge_col),
+                                    ),
+                                );
+                                if wide {
+                                    row_cell(
+                                        ui,
+                                        24.0,
+                                        ch,
+                                        false,
+                                        egui::Label::new(
+                                            RichText::new(continent)
+                                                .monospace()
+                                                .size(11.0)
+                                                .strong()
+                                                .color(if dupe {
+                                                    Color32::from_gray(85)
+                                                } else {
+                                                    crate::theme::continent_color(continent)
+                                                }),
+                                        ),
+                                    );
+                                    row_cell(
+                                        ui,
+                                        50.0,
+                                        ch,
+                                        false,
+                                        egui::Label::new(
+                                            RichText::new(grid.clone().unwrap_or_default())
+                                                .monospace()
+                                                .size(12.0)
+                                                // Dimmer for a grid the database
+                                                // supplied rather than the air.
+                                                .color(if looked_up {
+                                                    Color32::from_gray(110)
+                                                } else {
+                                                    crate::theme::CYAN_DIM
+                                                }),
+                                        ),
+                                    );
+                                    row_cell(
+                                        ui,
+                                        58.0,
+                                        ch,
+                                        true,
+                                        egui::Label::new(
+                                            RichText::new(
+                                                dist_km
+                                                    .map(|km| format!("{km:.0} km"))
+                                                    .unwrap_or_default(),
+                                            )
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(crate::theme::YELLOW),
+                                        ),
+                                    );
+                                }
+                                // What they last said fills the rest, with the
+                                // REPLY button pinned right.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let resp = crate::chrome::chip_accent(
+                                            ui,
+                                            false,
+                                            RichText::new("REPLY").size(12.0).strong(),
+                                            if to_me {
+                                                crate::theme::YELLOW
+                                            } else if calling {
+                                                crate::theme::GREEN
+                                            } else {
+                                                crate::theme::CYAN
+                                            },
+                                            crate::theme::INK_ON_CYAN,
+                                        );
+                                        reply = resp.clicked();
+                                        reply_left = Some(resp.rect.left());
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let said =
+                                                    msg.map(js8_msg_summary).unwrap_or_default();
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(said)
+                                                            .monospace()
+                                                            .size(12.5)
+                                                            .color(if dupe {
+                                                                Color32::from_gray(95)
+                                                            } else {
+                                                                crate::theme::TEXT
+                                                            }),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                    let r = inner.response.rect;
+                    let (accent, aw) = if to_me {
+                        (crate::theme::YELLOW, 4.0)
+                    } else if calling {
+                        (crate::theme::PINK, 2.5)
+                    } else {
+                        (crate::theme::CYAN_DIM, 2.5)
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            r.left_top(),
+                            egui::pos2(r.left() + aw, r.bottom()),
+                        ),
+                        0.0,
+                        accent,
+                    );
+                    let body_right = reply_left.map(|x| x - 2.0).unwrap_or(r.right());
+                    let body =
+                        egui::Rect::from_min_max(r.left_top(), egui::pos2(body_right, r.bottom()));
+                    let row = ui
+                        .interact(body, ui.id().with(("js8h", i)), egui::Sense::click())
+                        .on_hover_ui(|ui| {
+                            let d = js8_station_decode(h, grid.clone(), msg);
+                            station_card(
+                                ui, &d, entity, dist_km, &my_grid, novelty, band, false, calling,
+                            );
+                        });
+                    if selected {
+                        // The composer is aimed here: the same amber outline the
+                        // FT8 list uses for the decode it is previewing.
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.4, crate::theme::YELLOW),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if row.hovered() {
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, crate::theme::CYAN_DIM),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    // REPLY drafts the answer this exchange expects; a plain
+                    // click only aims the composer, so it never overwrites a
+                    // half-typed sentence.
+                    if reply {
+                        pick = Some((
+                            h.call.clone(),
+                            msg.and_then(|m| js8_reply_for(m, &me)).or(Some(String::new())),
+                        ));
+                    } else if row.clicked() {
+                        pick = Some((h.call.clone(), None));
+                    }
+                    ui.add_space(3.0);
+                }
+            });
+
+        if let Some((call, draft)) = pick {
+            self.js8_select(&call, draft, &js8.heard);
+        }
+    }
+
+    /// The conversation: every reassembled transmission, newest at the bottom.
+    ///
+    /// Rows are clickable — that is where a heartbeat, a CQ or a `HW CPY?`
+    /// turns into the reply it expects.
+    fn js8_conversation(&mut self, ui: &mut egui::Ui, js8: &sdroxide_types::Js8Status) {
+        let me = self.js8_me(js8);
+        let mut pick: Option<(String, Option<String>)> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("js8-convo")
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show_themed(ui, |ui| {
+                if js8.messages.is_empty() {
+                    ui.label(RichText::new("— no messages —").weak());
+                }
+                for (i, m) in js8.messages.iter().enumerate() {
+                    let selected =
+                        !m.from.is_empty() && self.js8_target.eq_ignore_ascii_case(&m.from);
+                    let to_me = js8_personally_addressed(m);
+                    let inner = egui::Frame::new()
+                        .fill(if to_me { crate::theme::TOME_BG } else { crate::theme::ROW_BG })
+                        .inner_margin(egui::Margin { left: 8, right: 5, top: 3, bottom: 3 })
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let (_, _, _, h, mi, _) =
+                                    sdroxide_types::utc_ymd_hms(m.last_slot_utc);
+                                ui.label(
+                                    RichText::new(format!("{h:02}:{mi:02}")).monospace().weak(),
+                                );
+                                if to_me {
+                                    ui.label(RichText::new("★").color(crate::theme::YELLOW));
+                                }
+                                let who = if m.from.is_empty() { "…" } else { &m.from };
+                                ui.label(
+                                    RichText::new(format!("{who}:")).monospace().strong().color(
+                                        if to_me {
+                                            crate::theme::CYAN
+                                        } else {
+                                            crate::theme::CYAN_DIM
+                                        },
+                                    ),
+                                );
+                                if let Some(c) = &m.cmd {
+                                    ui.label(
+                                        RichText::new(c).monospace().color(crate::theme::PINK),
+                                    );
+                                }
+                                let body = RichText::new(&m.text).monospace();
+                                // An incomplete message is still arriving; greying
+                                // it stops a half-sentence reading as the whole one.
+                                ui.label(if m.complete { body } else { body.weak() });
+                                if !m.complete {
+                                    ui.label(
+                                        RichText::new(format!("… ({} frames)", m.frames)).weak(),
+                                    );
+                                }
+                            });
+                        });
+
+                    let r = inner.response.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            r.left_top(),
+                            egui::pos2(r.left() + if to_me { 3.0 } else { 2.0 }, r.bottom()),
+                        ),
+                        0.0,
+                        if to_me { crate::theme::YELLOW } else { crate::theme::CYAN_DIM },
+                    );
+                    let mut row = ui.interact(r, ui.id().with(("js8m", i)), egui::Sense::click());
+                    // Drafted only for the row under the cursor: the log holds
+                    // two hundred of these and every draft is an allocation.
+                    if !m.from.is_empty() && (row.hovered() || row.clicked()) {
+                        let draft = js8_reply_for(m, &me);
+                        row = row.on_hover_text(match &draft {
+                            Some(d) => format!("Reply to {}: “{d}”", m.from),
+                            None => format!("Address the composer at {}", m.from),
+                        });
+                        if row.clicked() {
+                            pick = Some((m.from.clone(), draft));
+                        }
+                    }
+                    if selected || row.hovered() {
+                        ui.painter().rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(
+                                1.0,
+                                if selected {
+                                    crate::theme::YELLOW
+                                } else {
+                                    crate::theme::CYAN_DIM
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    ui.add_space(2.0);
+                }
+            });
+        if let Some((call, draft)) = pick {
+            self.js8_select(&call, draft, &js8.heard);
+        }
+    }
+
+    /// Facts about our own station the reply drafts may quote.
+    fn js8_me(&self, js8: &sdroxide_types::Js8Status) -> Js8Me {
+        let cfg = self.digi_status.as_ref().map(|s| &s.config).unwrap_or(&self.digi_cfg_edit);
+        Js8Me {
+            grid: cfg.my_grid.to_uppercase(),
+            status: cfg.js8_status.clone(),
+            hearing: js8.heard.iter().take(4).map(|h| h.call.clone()).collect(),
+            last_sent: self.js8_last_sent.clone(),
+        }
+    }
+
+    /// Aim the composer at a station, optionally with a draft in it, and put
+    /// them on the map as the preview marker.
+    fn js8_select(
+        &mut self,
+        call: &str,
+        draft: Option<String>,
+        heard: &[sdroxide_types::Js8Heard],
+    ) {
+        self.js8_target = call.to_string();
+        if let Some(d) = draft {
+            self.text_tx = d;
+        }
+        let ll = self.js8_grid_for(call, heard).as_deref().and_then(sdroxide_types::grid_to_latlon);
+        self.digi_preview = ll.map(|ll| (call.to_string(), ll));
+    }
+
+    /// The two rows under the JS8 conversation: the actions, and the composer.
+    ///
+    /// **Declared bottom-first.** The caller lays this out with
+    /// [`egui::Layout::bottom_up`] so the controls claim their true height and
+    /// the conversation gets the remainder, which means the first row written
+    /// here is the one that appears lowest.
+    fn js8_compose(
+        &mut self,
+        ui: &mut egui::Ui,
+        cmds: &mut Vec<Command>,
+        js8: &sdroxide_types::Js8Status,
+    ) {
+        let has_target = !self.js8_target.is_empty();
+
+        // Actions — the lower of the two rows. Wrapped, because the right
+        // column can be dragged narrow and a chip that does not fit must move
+        // to the next line rather than be clipped off the edge.
+        ui.horizontal_wrapped(|ui| {
+            if crate::chrome::chip(ui, false, " CQ ").clicked() {
+                cmds.push(Command::DigiCallCq);
+            }
+            if crate::chrome::chip(ui, false, " HB ").clicked() {
+                cmds.push(Command::DigiSendText("@ALLCALL HB".into()));
+            }
+            // The queries address whichever station is selected. Shown greyed
+            // rather than hidden when there is none: a row that changes shape
+            // as you click around is hard to aim at, and chips that only exist
+            // sometimes are chips nobody discovers.
+            ui.add_enabled_ui(has_target, |ui| {
+                for q in ["SNR?", "GRID?", "HEARING?", "STATUS?", "HW CPY?"] {
+                    if crate::chrome::chip(ui, false, q).clicked() {
+                        let full = format!("{} {q}", self.js8_target);
+                        self.js8_last_sent = full.clone();
+                        cmds.push(Command::DigiSendText(full));
+                    }
+                }
+                // The two that close a contact. Worth a button of their own:
+                // they are the most-typed things on the band, and typing them
+                // is the one moment an operator is not watching the panel.
+                for q in ["RR", "73"] {
+                    if crate::chrome::chip(ui, false, q).clicked() {
+                        let full = format!("{} {q}", self.js8_target);
+                        self.js8_last_sent = full.clone();
+                        cmds.push(Command::DigiSendText(full));
+                    }
+                }
+            });
+            if has_target && crate::chrome::chip(ui, false, " CLEAR TO ").clicked() {
+                self.js8_target.clear();
+            }
+        });
+
+        // The gap between the two rows. In a bottom-up layout this space sits
+        // above what was just written, so it separates the actions from the
+        // composer rather than pushing them into the panel edge.
+        ui.add_space(6.0);
+
+        // Compose. The buttons are declared right-to-left first so they always
+        // get their width, and the text box takes whatever is left over.
+        let target = if has_target { self.js8_target.clone() } else { "@ALLCALL".to_string() };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{target}:")).monospace().color(crate::theme::CYAN_DIM));
+            let mut send = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Stop lives next to send: they are the two things you reach
+                // for in a hurry, and a long message takes minutes to drain.
+                if crate::chrome::chip(ui, false, " STOP ").clicked() {
+                    cmds.push(Command::DigiAbortTx);
+                }
+                send = crate::chrome::chip_accent(
+                    ui,
+                    false,
+                    " SEND ",
+                    crate::theme::PINK,
+                    crate::theme::INK_ON_CYAN,
+                )
+                .clicked();
+                // Before pressing send, say how long it will take. JS8's most
+                // surprising property to a new operator is that a sentence can
+                // occupy a minute of air time.
+                if !self.text_tx.trim().is_empty() {
+                    let frames = js8_frame_estimate(&self.text_tx);
+                    ui.label(
+                        RichText::new(format!(
+                            "{frames}f · {:.0}s",
+                            f64::from(frames) * js8.speed.slot_s()
+                        ))
+                        .monospace()
+                        .weak(),
+                    );
+                }
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.text_tx)
+                        .desired_width(ui.available_width().max(60.0))
+                        .hint_text("Message…"),
+                );
+                send |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            });
+            if send && !self.text_tx.trim().is_empty() {
+                let body = self.text_tx.trim();
+                let full = if has_target {
+                    format!("{} {body}", self.js8_target)
+                } else {
+                    body.to_string()
+                };
+                // Kept so `AGN?` — "say again" — has something to draft from.
+                self.js8_last_sent = full.clone();
+                cmds.push(Command::DigiSendText(full));
+                self.text_tx.clear();
+            }
+        });
+    }
+
     fn fsq_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, panel_h: f32) {
         let content_bottom = ui.cursor().top() + panel_h - 26.0;
         let status = self.digi_status.clone();
@@ -3272,6 +5276,7 @@ impl SdroxideApp {
             if crate::chrome::chip(ui, false, "+").clicked() {
                 cmds.push(Command::SetDigiAudioFreq((audio_hz + 10.0).clamp(200.0, 3500.0)));
             }
+            self.digi_freq_chip(ui, cmds);
             // Mode settings inline next to the tune buttons (moved here from the
             // setup dialog): the FSQ speed and the directed-message callsign.
             self.fsq_params_row(ui, cmds);
@@ -3366,7 +5371,8 @@ impl SdroxideApp {
                                     if text_rx.is_empty() && messages.is_empty() {
                                         ui.label(RichText::new("— listening —").weak());
                                     }
-                                    for m in messages.iter().filter(|m| m.to_me && !m.to.is_empty()) {
+                                    for m in messages.iter().filter(|m| m.to_me && !m.to.is_empty())
+                                    {
                                         ui.label(
                                             RichText::new(format!(
                                                 "★ {} → {}: {}",
@@ -3377,7 +5383,9 @@ impl SdroxideApp {
                                         );
                                     }
                                     ui.label(
-                                        RichText::new(&text_rx).monospace().color(crate::theme::GREEN),
+                                        RichText::new(&text_rx)
+                                            .monospace()
+                                            .color(crate::theme::GREEN),
                                     );
                                 });
                         });
@@ -3485,10 +5493,25 @@ impl SdroxideApp {
                                 set_target = Some(c.call.clone());
                             }
                             ui.label(RichText::new(&c.call).monospace().strong());
-                            if ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("name").desired_width(120.0)).changed() {
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut c.name)
+                                        .hint_text("name")
+                                        .desired_width(120.0),
+                                )
+                                .changed()
+                            {
                                 changed = true;
                             }
-                            if crate::chrome::chip_accent(ui, false, "DEL", crate::theme::PINK, crate::theme::INK_ON_CYAN).clicked() {
+                            if crate::chrome::chip_accent(
+                                ui,
+                                false,
+                                "DEL",
+                                crate::theme::PINK,
+                                crate::theme::INK_ON_CYAN,
+                            )
+                            .clicked()
+                            {
                                 to_delete = Some(c.id);
                             }
                         });
@@ -3509,6 +5532,39 @@ impl SdroxideApp {
         self.fsq_show_contacts = open;
     }
 
+    /// Hellschreiber variant chips, shown inline in the Hell panel header next
+    /// to the tune buttons.
+    ///
+    /// The variant lives in `DigiConfig` (the engine has to know the dot rate);
+    /// contrast and reverse video live in `ViewState`, so moving them repaints
+    /// the whole scrollback rather than just what arrives next.
+    fn hell_params_row(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(RichText::new("Mode").size(10.5).strong().color(crate::theme::CYAN_DIM));
+            let cfg = &mut self.digi_cfg_edit;
+            let mut changed = false;
+            for v in sdroxide_types::HellVariant::ALL {
+                let sel = cfg.hell_variant == v;
+                let hint = format!(
+                    "{} — {:.1} char/s, {:.0} Hz wide, {}",
+                    v.label(),
+                    v.chars_per_sec(),
+                    v.bandwidth_hz(),
+                    if v.is_fsk() { "frequency-shifted" } else { "on/off keyed" }
+                );
+                if ui.selectable_label(sel, v.label()).on_hover_text(hint).clicked() && !sel {
+                    cfg.hell_variant = v;
+                    changed = true;
+                }
+            }
+            if changed {
+                cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+            }
+        });
+    }
+
     /// Own-call / grid / message-template editor (and RTTY parameters).
     fn digi_settings_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
         let mut open = self.show_digi_settings;
@@ -3516,7 +5572,7 @@ impl SdroxideApp {
         // Per-mode parameters (RTTY/Olivia/THOR/FSQ) now live in each panel's
         // header, so this dialog only carries the shared identity + FT8/FT4
         // message templates.
-        let title = if mode.is_text_modem() {
+        let title = if mode.is_text_modem() || mode.is_hell() || mode.is_js8() {
             format!("{} Setup", mode.label())
         } else {
             "FT8 / FT4 Setup".to_string()
@@ -3543,6 +5599,108 @@ impl SdroxideApp {
                         changed = true;
                     }
                     ui.end_row();
+                    if mode.is_js8() {
+                        let turbo = cfg.js8_speed == sdroxide_types::Js8Speed::Turbo;
+                        ui.label("Auto-reply");
+                        changed |= ui
+                            .checkbox(&mut cfg.js8_auto_reply, "Answer SNR? / GRID? / STATUS?")
+                            .on_hover_text(
+                                "Answer a direct question addressed to you or to @ALLCALL, with \
+                                 the answer rather than an acknowledgement. Never answers another \
+                                 station's traffic, and never answers itself.",
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Heartbeat");
+                        ui.horizontal(|ui| {
+                            // The intervals JS8Call offers, plus off. A beacon
+                            // is a commitment of air time, so the choice is a
+                            // few sensible ones rather than a free number.
+                            for (mins, label) in [
+                                (0u32, "Off"),
+                                (10, "10 min"),
+                                (15, "15 min"),
+                                (30, "30 min"),
+                                (60, "60 min"),
+                            ] {
+                                if crate::chrome::chip(ui, cfg.js8_heartbeat_min == mins, label)
+                                    .clicked()
+                                    && cfg.js8_heartbeat_min != mins
+                                {
+                                    cfg.js8_heartbeat_min = mins;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        // Off by default and worth saying why: a beacon that
+                        // switches itself on is an on-air behaviour the
+                        // operator never chose.
+                        ui.label(
+                            RichText::new(if turbo {
+                                "Turbo does not beacon — it is the local and VHF speed."
+                            } else {
+                                "Sends your callsign and grid so others know you are receivable. \
+                                 The first goes out one interval from now, not immediately."
+                            })
+                            .size(10.5)
+                            .weak(),
+                        );
+                        ui.end_row();
+                        ui.label("Beacon frequency");
+                        ui.horizontal(|ui| {
+                            let sub_band = !cfg.js8_hb_anywhere;
+                            if crate::chrome::chip(ui, sub_band, "500–1000 Hz")
+                                .on_hover_text(
+                                    "Move each beacon to a free slot in the heartbeat sub-band, \
+                                     the way JS8Call does: it is where stations watching for \
+                                     beacons look, and it keeps an unattended transmitter off \
+                                     somebody else's QSO. The slot is chosen when the beacon \
+                                     actually goes out, clear of everything being decoded.",
+                                )
+                                .clicked()
+                                && !sub_band
+                            {
+                                cfg.js8_hb_anywhere = false;
+                                changed = true;
+                            }
+                            if crate::chrome::chip(ui, !sub_band, "Working freq")
+                                .on_hover_text(
+                                    "Beacon where you are working instead. Against the band \
+                                     convention, but it keeps everything you transmit in one \
+                                     place.",
+                                )
+                                .clicked()
+                                && sub_band
+                            {
+                                cfg.js8_hb_anywhere = true;
+                                changed = true;
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Heartbeat reply");
+                        ui.add_enabled_ui(cfg.js8_auto_reply && !turbo, |ui| {
+                            changed |= ui
+                                .checkbox(
+                                    &mut cfg.js8_hb_ack,
+                                    "Answer heartbeats with a signal report",
+                                )
+                                .on_hover_text(
+                                    "Tell a station that beaconed how well you copied them. Off \
+                                     by default: a busy band carries a heartbeat every slot, and \
+                                     answering all of them would flood exactly the band \
+                                     heartbeats exist to keep quiet. Rate-limited to one answer \
+                                     per station every 15 minutes, and never while a message is \
+                                     still arriving or while you have something queued to send.",
+                                )
+                                .changed();
+                        });
+                        ui.end_row();
+                        ui.label("Status message");
+                        changed |= ui.text_edit_singleline(&mut cfg.js8_status).changed();
+                        ui.end_row();
+                    }
                     ui.label("TX period");
                     ui.horizontal(|ui| {
                         changed |= ui.selectable_value(&mut cfg.tx_even, true, "Even").changed();
@@ -3551,6 +5709,16 @@ impl SdroxideApp {
                     ui.end_row();
                     ui.label("Auto-sequence");
                     changed |= ui.checkbox(&mut cfg.auto_seq, "").changed();
+                    ui.end_row();
+                    ui.label("Auto TX frequency");
+                    changed |= ui
+                        .checkbox(&mut cfg.auto_tx_freq, "")
+                        .on_hover_text(
+                            "Choose the transmit frequency automatically: the quietest spot in \
+                             the period you transmit in, rather than the frequency of the \
+                             station you are answering. Off holds whatever you set by hand.",
+                        )
+                        .changed();
                     ui.end_row();
                     ui.label("TX watchdog");
                     changed |= ui
@@ -3578,6 +5746,43 @@ impl SdroxideApp {
                         )
                         .changed();
                     ui.end_row();
+                    ui.label("DXpedition");
+                    ui.horizontal(|ui| {
+                        for m in sdroxide_types::DxpedMode::ALL {
+                            changed |= ui
+                                .selectable_value(&mut cfg.dxped_mode, m, m.label())
+                                .on_hover_text(match m {
+                                    sdroxide_types::DxpedMode::Normal => "Ordinary FT8 operation.",
+                                    sdroxide_types::DxpedMode::Hound => {
+                                        "Calling a DXpedition running Fox mode: call from above \
+                                         1000 Hz, move down onto the Fox when it answers, and \
+                                         log on its RR73 without sending 73."
+                                    }
+                                    sdroxide_types::DxpedMode::Fox => {
+                                        "Run the pile-up: several signals at once, a queue of \
+                                         callers, worked strongest and rarest first. CALL CQ \
+                                         starts it, STOP QSO stands it down."
+                                    }
+                                })
+                                .changed();
+                        }
+                    });
+                    ui.end_row();
+                    if cfg.dxped_mode == sdroxide_types::DxpedMode::Fox {
+                        ui.label("Fox signals");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut cfg.fox_slots)
+                                    .range(1..=sdroxide_types::FOX_MAX_SLOTS)
+                                    .suffix(" at once"),
+                            )
+                            .on_hover_text(
+                                "Simultaneous transmissions, spaced 60 Hz apart. They share the \
+                                 transmitter's power, so more signals means each is weaker.",
+                            )
+                            .changed();
+                        ui.end_row();
+                    }
                 });
                 ui.separator();
                 ui.label(
@@ -3711,9 +5916,11 @@ impl SdroxideApp {
                     .size(11.5),
                 );
                 ui.add_space(6.0);
-                egui::Grid::new("voice-grid").num_columns(6).spacing([8.0, 6.0]).striped(true).show(
-                    ui,
-                    |ui| {
+                egui::Grid::new("voice-grid")
+                    .num_columns(6)
+                    .spacing([8.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
                         for (i, slot) in slots.iter().enumerate() {
                             let is_rec = recording == Some(i as u8);
                             let is_play = playing == Some(i as u8);
@@ -3774,9 +5981,11 @@ impl SdroxideApp {
                                     format!("Record from the microphone (up to {max_len:.0} s)")
                                 });
                             if rec.clicked() {
-                                cmds.push(Command::VoiceRecord(
-                                    if is_rec { None } else { Some(i as u8) },
-                                ));
+                                cmds.push(Command::VoiceRecord(if is_rec {
+                                    None
+                                } else {
+                                    Some(i as u8)
+                                }));
                             }
 
                             // PLAY — listen to the message locally. Nothing goes
@@ -3875,8 +6084,7 @@ impl SdroxideApp {
                                     )
                                     .selectable(false),
                                 );
-                                let erasable =
-                                    !slot.is_empty() && !is_rec && !is_play && !is_prev;
+                                let erasable = !slot.is_empty() && !is_rec && !is_play && !is_prev;
                                 if ui
                                     .add_enabled_ui(erasable, |ui| {
                                         crate::chrome::chip_accent(
@@ -3896,8 +6104,7 @@ impl SdroxideApp {
                             });
                             ui.end_row();
                         }
-                    },
-                );
+                    });
 
                 if self.state.rx[0].mode.is_rade() {
                     ui.add_space(4.0);
@@ -3941,21 +6148,27 @@ impl SdroxideApp {
         self.prefill_from_spot(spot);
     }
 
-    /// The live-spots window: source filters, a click-to-tune list of current
-    /// DX-cluster / POTA / SOTA / PSK-Reporter spots, and the feed status line.
+    /// The live-spots window: source filters, a fuzzy search box, a
+    /// click-to-tune list of current DX-cluster / POTA / SOTA / PSK-Reporter
+    /// spots and broadcast stations, and the feed status line.
     fn spots_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
         let worked_entities = self.worked_entities().clone();
         let mut open = self.show_spots;
         let mut clicked: Option<Spot> = None;
         let mut open_setup = false;
         let now = now_unix();
-        let spots = self.spots.clone();
+        self.refresh_broadcast_spots(now);
+        // Cloned out of `self` because the window closure needs `&mut self`.
+        let spots = self.merged_spots();
+        // Chip order has to match `spot_kind_index`: the loop below indexes
+        // `spot_kinds_shown` positionally.
         let labels = [
             (SpotKind::DxCluster, "DX"),
             (SpotKind::Pota, "POTA"),
             (SpotKind::Sota, "SOTA"),
             (SpotKind::PskReporter, "PSK"),
             (SpotKind::FreeDv, "FREEDV"),
+            (SpotKind::Broadcast, "BC"),
         ];
         let resp = egui::Window::new("SPOTS")
             .open(&mut open)
@@ -3965,8 +6178,16 @@ impl SdroxideApp {
             .default_height(480.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, (_, label)) in labels.iter().enumerate() {
-                        if crate::chrome::chip(ui, self.spot_kinds_shown[i], *label).clicked() {
+                    for (i, (kind, label)) in labels.iter().enumerate() {
+                        let chip = crate::chrome::chip(ui, self.spot_kinds_shown[i], *label);
+                        let chip = if *kind == SpotKind::Broadcast {
+                            chip.on_hover_text(
+                                "Longwave & shortwave broadcast stations on air now",
+                            )
+                        } else {
+                            chip
+                        };
+                        if chip.clicked() {
                             self.spot_kinds_shown[i] = !self.spot_kinds_shown[i];
                         }
                     }
@@ -3985,35 +6206,66 @@ impl SdroxideApp {
                         }
                     });
                 });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.label(RichText::new("⌕").color(crate::theme::CYAN_DIM).size(14.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.spot_search)
+                            .desired_width(200.0)
+                            .hint_text("call, station, site, frequency")
+                            .text_color(crate::theme::TEXT_STRONG),
+                    );
+                    if !self.spot_search.trim().is_empty()
+                        && ui.button("✕").on_hover_text("Clear the search").clicked()
+                    {
+                        self.spot_search.clear();
+                    }
+                });
                 if let Some(s) = &self.net_status {
                     ui.label(RichText::new(s).size(11.0).color(Color32::from_gray(150)));
                 }
                 ui.separator();
+                // Filter by the category chips, then rank by how well each row
+                // matched the query. With no query the natural frequency order
+                // is kept; with one, the best matches come first, because the
+                // whole point of typing is to get the wanted row to the top.
+                let query = self.spot_search.trim();
+                let visible: Vec<&Spot> = spots.iter().filter(|s| self.spot_visible(s)).collect();
+                let mut rows: Vec<(&Spot, i32)> = visible
+                    .iter()
+                    .filter_map(|s| {
+                        crate::fuzzy::score_terms(&spot_haystack(s), query).map(|sc| (*s, sc))
+                    })
+                    .collect();
+                if !query.is_empty() {
+                    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+                    // Counted against what the chips let through, not against
+                    // every spot held — "3 of 5" when three categories are off
+                    // would look like the search had lost the rest.
+                    let (text, colour) = match rows.len() {
+                        0 => ("no match".to_string(), crate::theme::PINK),
+                        n => (format!("{n} of {}", visible.len()), crate::theme::YELLOW),
+                    };
+                    ui.label(RichText::new(text).color(colour).size(10.0));
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show_themed(ui, |ui| {
-                    let mut shown = 0usize;
-                    for s in &spots {
-                        if !self.spot_kinds_shown[spot_kind_index(s.kind)] {
-                            continue;
-                        }
-                        if self.spot_in_view_only
-                            && !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&s.freq_hz)
-                        {
-                            continue;
-                        }
-                        let needed = sdroxide_types::entity_name(&s.call)
-                            .map(|n| !worked_entities.contains(n))
-                            .unwrap_or(false);
+                    for (s, _) in &rows {
+                        let needed = s.kind != SpotKind::Broadcast
+                            && sdroxide_types::entity_name(&s.call)
+                                .map(|n| !worked_entities.contains(n))
+                                .unwrap_or(false);
                         if spot_row(ui, s, now, needed).clicked() {
-                            clicked = Some(s.clone());
+                            clicked = Some((*s).clone());
                         }
-                        shown += 1;
                     }
-                    if shown == 0 {
+                    if rows.is_empty() {
                         ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("no spots — enable a feed in ⚙ SETUP")
-                                .color(Color32::from_gray(120)),
-                        );
+                        let msg = if query.is_empty() {
+                            "no spots — enable a feed in ⚙ SETUP"
+                        } else {
+                            "nothing matches the search"
+                        };
+                        ui.label(RichText::new(msg).color(Color32::from_gray(120)));
                     }
                 });
             });
@@ -4066,7 +6318,11 @@ impl SdroxideApp {
                             .on_hover_text("Import QSOs from an ADIF (.adi) file")
                             .clicked()
                         {
-                            crate::download::load_text("ADIF", "adi", self.adif_import_inbox.clone());
+                            crate::download::load_text(
+                                "ADIF",
+                                "adi",
+                                self.adif_import_inbox.clone(),
+                            );
                         }
                         ui.label(
                             RichText::new(format!("{} QSO", self.qso_log.len()))
@@ -4102,8 +6358,11 @@ impl SdroxideApp {
         let (dupe, dupe_band) = {
             let f = self.log_edit.as_ref().unwrap();
             let freq_hz = f.freq_mhz.trim().parse::<f64>().ok().map(|m| m * 1e6).unwrap_or(0.0);
-            let band =
-                if freq_hz > 0.0 { sdroxide_types::adif_band(freq_hz).to_string() } else { String::new() };
+            let band = if freq_hz > 0.0 {
+                sdroxide_types::adif_band(freq_hz).to_string()
+            } else {
+                String::new()
+            };
             let dupe = !band.is_empty()
                 && !f.call.trim().is_empty()
                 && sdroxide_types::worked_before(&self.qso_log, f.call.trim(), &band, "", f.id);
@@ -4143,9 +6402,11 @@ impl SdroxideApp {
                     let lbl = |ui: &mut egui::Ui, text: &str| {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(72.0, 24.0), egui::Sense::hover());
-                        ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(
-                            egui::Layout::left_to_right(egui::Align::Center),
-                        ))
+                        ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        )
                         .label(text);
                     };
                     let field = |ui: &mut egui::Ui, w: f32, s: &mut String| {
@@ -4153,7 +6414,8 @@ impl SdroxideApp {
                     };
                     ui.horizontal(|ui| {
                         lbl(ui, "Call");
-                        let cr = ui.add(egui::TextEdit::singleline(&mut f.call).desired_width(150.0));
+                        let cr =
+                            ui.add(egui::TextEdit::singleline(&mut f.call).desired_width(150.0));
                         if has_provider
                             && crate::chrome::chip(ui, false, "LOOKUP")
                                 .on_hover_text("Look up name / QTH / grid")
@@ -4264,8 +6526,14 @@ impl SdroxideApp {
                             let mut rec = rec;
                             rec.id = self.next_log_id();
                             self.qso_log.push(rec);
+                            // A hand-entered contact is one worked this session
+                            // too; an ADIF import is not, and does not count.
+                            self.session_qsos += 1;
                         } else if let Some(e) = self.qso_log.iter_mut().find(|q| q.id == rec.id) {
+                            // An edit can change the call, the grid or the QSL
+                            // flags, none of which move the log's length.
                             *e = rec;
+                            self.log_content_changed();
                         }
                         persist_qso_log(&self.qso_log);
                     } else {
@@ -4338,9 +6606,9 @@ impl SdroxideApp {
                                 let (rect, _) = ui
                                     .allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
                                 let mut c = ui.new_child(
-                                    egui::UiBuilder::new().max_rect(rect).layout(
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                    ),
+                                    egui::UiBuilder::new()
+                                        .max_rect(rect)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                 );
                                 c.add(lbl);
                             };
@@ -4349,7 +6617,10 @@ impl SdroxideApp {
                                 ui,
                                 40.0,
                                 egui::Label::new(
-                                    RichText::new(time_str(r.start_utc)).monospace().size(12.0).color(gray),
+                                    RichText::new(time_str(r.start_utc))
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(gray),
                                 ),
                             );
                             col(
@@ -4385,7 +6656,9 @@ impl SdroxideApp {
                             col(
                                 ui,
                                 72.0,
-                                egui::Label::new(RichText::new(rst).monospace().size(11.5).color(gray)),
+                                egui::Label::new(
+                                    RichText::new(rst).monospace().size(11.5).color(gray),
+                                ),
                             );
                             col(
                                 ui,
@@ -4428,9 +6701,11 @@ impl SdroxideApp {
                                     egui::vec2(16.0, 20.0),
                                     egui::Sense::hover(),
                                 );
-                                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                ));
+                                let mut c = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(rect)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
                                 let resp = c.add(egui::Label::new(
                                     RichText::new(qsl_txt).size(13.0).strong().color(qsl_col),
                                 ));
@@ -4453,15 +6728,23 @@ impl SdroxideApp {
                                     {
                                         to_delete = Some(r.id);
                                     }
-                                    if crate::chrome::chip(ui, false, RichText::new("EDIT").size(11.0))
-                                        .clicked()
+                                    if crate::chrome::chip(
+                                        ui,
+                                        false,
+                                        RichText::new("EDIT").size(11.0),
+                                    )
+                                    .clicked()
                                     {
                                         to_edit = Some(r.id);
                                     }
                                     if !up_targets.is_empty()
-                                        && crate::chrome::chip(ui, false, RichText::new("UP").size(11.0))
-                                            .on_hover_text("Upload this QSO to configured logs")
-                                            .clicked()
+                                        && crate::chrome::chip(
+                                            ui,
+                                            false,
+                                            RichText::new("UP").size(11.0),
+                                        )
+                                        .on_hover_text("Upload this QSO to configured logs")
+                                        .clicked()
                                     {
                                         to_upload = Some(r.id);
                                     }
@@ -4481,7 +6764,10 @@ impl SdroxideApp {
                     });
                 let rr = inner.response.rect;
                 ui.painter().rect_filled(
-                    egui::Rect::from_min_max(rr.left_top(), egui::pos2(rr.left() + 2.0, rr.bottom())),
+                    egui::Rect::from_min_max(
+                        rr.left_top(),
+                        egui::pos2(rr.left() + 2.0, rr.bottom()),
+                    ),
                     0.0,
                     crate::theme::CYAN_DIM,
                 );
@@ -4531,12 +6817,19 @@ impl SdroxideApp {
                 self.wsjtx_edit = cfg;
                 self.wsjtx_seeded = true;
             }
+            // The satellite config is the client's own, so it comes from the
+            // live copy rather than from the engine. Subscription status is
+            // read from the disk cache, which is the only source that has an
+            // answer when the solar window has never been opened.
+            self.sat_cfg_edit = (*self.sat_cfg).clone();
+            self.refresh_sat_sub_status();
             self.audio_devices_queried = true;
         }
         // Edits collected here and applied after the window closure, which
         // borrows `&self` and so can't touch `&mut self.ctrl`.
         let mut audio_pick: Option<(bool, Option<String>)> = None;
         let mut hpsdr_discover = false;
+        let mut rtlsdr_rescan = false;
         let mut tci_test = false;
         let mut flex_discover = false;
         let mut flex_test = false;
@@ -4559,6 +6852,12 @@ impl SdroxideApp {
         let mut key_capture = self.input.key_capture;
         let mut midi_learn = self.input.midi_learn;
         let mut midi_rescan = false;
+        let mut sat_edit = self.sat_cfg_edit.clone();
+        let mut sat_ui = std::mem::take(&mut self.sat_ui);
+        let mut sat_sub_refresh = false;
+        let sat_subs = self.sat_sub_views();
+        let mut bc_reload = false;
+        let mut bc_restore = false;
 
         // The concrete interface types the user chooses between. SoapySDR only
         // appears when compiled in; there is no auto-detect (an unavailable
@@ -4570,11 +6869,19 @@ impl SdroxideApp {
         iface_opts.push(sdroxide_types::Backend::Hpsdr);
         iface_opts.push(sdroxide_types::Backend::Cat);
         iface_opts.push(sdroxide_types::Backend::Tci);
+        // Ungated, unlike SoapySDR: the RTL-SDR driver is pure Rust and needs
+        // no system library, so it is compiled into every build variant.
+        iface_opts.push(sdroxide_types::Backend::RtlSdr);
         iface_opts.push(sdroxide_types::Backend::Flex);
         iface_opts.push(sdroxide_types::Backend::Icom);
 
         let mut tab = self.settings_tab;
         let mut open = self.show_settings;
+        // The 3D window owns the live copy of its own settings — `view.solar3d`
+        // is only the snapshot persisted from it — so this is read out of the
+        // window here and handed back to it below, the way `ui_edit` is.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut solar_cloud_march = self.solar.cloud_march();
         // The window does its own scrolling, so its bar can only be themed
         // through the context style — lend the palette for the length of the
         // call and hand the body back the normal one.
@@ -4594,6 +6901,7 @@ impl SdroxideApp {
                         radio_edit: &mut radio_edit,
                         audio_pick: &mut audio_pick,
                         hpsdr_discover: &mut hpsdr_discover,
+                        rtlsdr_rescan: &mut rtlsdr_rescan,
                         tci_test: &mut tci_test,
                         flex_discover: &mut flex_discover,
                         flex_test: &mut flex_test,
@@ -4604,6 +6912,8 @@ impl SdroxideApp {
                         net_edit: &mut net_edit,
                         net_cmds: &mut net_cmds,
                         net_apply: &mut net_apply,
+                        bc_reload: &mut bc_reload,
+                        bc_restore: &mut bc_restore,
                         net_sync: &mut net_sync,
                         tci_srv_edit: &mut tci_srv_edit,
                         tci_srv_apply: &mut tci_srv_apply,
@@ -4615,6 +6925,14 @@ impl SdroxideApp {
                         key_capture: &mut key_capture,
                         midi_learn: &mut midi_learn,
                         midi_rescan: &mut midi_rescan,
+                        sat_edit: &mut sat_edit,
+                        sat_ui: &mut sat_ui,
+                        sat_subs: &sat_subs,
+                        sat_sub_refresh: &mut sat_sub_refresh,
+                        #[cfg(not(target_arch = "wasm32"))]
+                        solar_cloud_march: Some(&mut solar_cloud_march),
+                        #[cfg(target_arch = "wasm32")]
+                        solar_cloud_march: None,
                         tab: &mut tab,
                     },
                 );
@@ -4625,6 +6943,10 @@ impl SdroxideApp {
         }
         self.show_settings = open;
         self.settings_tab = tab;
+        #[cfg(not(target_arch = "wasm32"))]
+        if solar_cloud_march != self.solar.cloud_march() {
+            self.solar.set_cloud_march(solar_cloud_march);
+        }
         // Persist net-config edits (kept across frames) and apply on demand.
         self.net_cfg_edit = net_edit;
         self.net_cluster_cmds = net_cmds;
@@ -4668,6 +6990,30 @@ impl SdroxideApp {
             // The engine persists wsjtx.json when it opens the socket.
             cmds.push(Command::SetWsjtxConfig(self.wsjtx_edit.clone()));
         }
+        self.sat_ui = sat_ui;
+        if sat_edit != self.sat_cfg_edit {
+            // Written straight out, like the input bindings: there is no APPLY
+            // step here, and a satellite the operator cannot see saved is one
+            // they will add again after the next restart. The solar window
+            // picks the new `Arc` up on its next frame.
+            self.sat_cfg_edit = sat_edit;
+            self.sat_cfg_edit.prune();
+            self.sat_cfg = std::sync::Arc::new(self.sat_cfg_edit.clone());
+            persist_sat_config(&self.sat_cfg_edit);
+        }
+        if sat_sub_refresh {
+            // Blocking: one HTTPS round trip per subscription. After the window
+            // closure, the way the HPSDR scan is.
+            self.refresh_sat_subs_now();
+        }
+        if bc_restore {
+            restore_bundled_broadcast_stations();
+        }
+        if bc_reload || bc_restore {
+            self.broadcast = load_broadcast_stations();
+            // Force a rebuild rather than waiting up to a minute for the tick.
+            self.broadcast_minute = -1;
+        }
         if let Some((output, name)) = audio_pick {
             self.ctrl.set_audio_device(output, name);
             self.audio_devices_queried = false;
@@ -4676,6 +7022,11 @@ impl SdroxideApp {
             // Blocking LAN scan (~1.5 s); done after the window closure so it can
             // take `&self.ctrl`. Results feed the device dropdown next frame.
             self.hpsdr_devices = self.ctrl.discover_hpsdr();
+        }
+        if rtlsdr_rescan {
+            // USB enumeration only — no device is opened, so this is safe to
+            // press at any time, including while a dongle is streaming.
+            self.rtlsdr_devices = self.ctrl.list_rtlsdr();
         }
         if flex_discover {
             // Passive listen for radio announcements (~2.5 s); after the
@@ -4747,6 +7098,7 @@ impl SdroxideApp {
                 (SettingsTab::FreeDv, "FreeDV"),
                 (SettingsTab::Uploads, "Uploads"),
                 (SettingsTab::Servers, "Servers"),
+                (SettingsTab::Tle, "TLE"),
             ] {
                 if crate::chrome::chip(ui, *io.tab == t, label).clicked() {
                     *io.tab = t;
@@ -4865,18 +7217,24 @@ impl SdroxideApp {
                             .weak(),
                         );
                     }
-                    Backend::Hpsdr => {
-                        settings_hpsdr_tab(
-                            ui,
-                            &self.hpsdr_devices,
-                            io.radio_edit,
-                            io.hpsdr_discover,
-                        )
-                    }
+                    Backend::Hpsdr => settings_hpsdr_tab(
+                        ui,
+                        &self.hpsdr_devices,
+                        io.radio_edit,
+                        io.hpsdr_discover,
+                        cmds,
+                    ),
                     Backend::Cat => settings_cat_tab(ui, &self.serial_ports, io.radio_edit),
                     Backend::Tci => {
                         settings_tci_tab(ui, io.radio_edit, io.tci_test, &self.tci_test_result)
                     }
+                    Backend::RtlSdr => settings_rtlsdr_tab(
+                        ui,
+                        &self.rtlsdr_devices,
+                        io.radio_edit,
+                        io.rtlsdr_rescan,
+                        cmds,
+                    ),
                     Backend::Icom => settings_icom_tab(ui, io.radio_edit),
                     Backend::Flex => settings_flex_tab(
                         ui,
@@ -4907,12 +7265,10 @@ impl SdroxideApp {
                     {
                         *io.apply_iface = true;
                     }
-                    ui.label(
-                        RichText::new("Switches the live radio without restarting.").weak(),
-                    );
+                    ui.label(RichText::new("Switches the live radio without restarting.").weak());
                 });
             }
-            SettingsTab::Ui => settings_ui_tab(ui, io.ui_edit),
+            SettingsTab::Ui => settings_ui_tab(ui, io.ui_edit, io.solar_cloud_march.as_deref_mut()),
             SettingsTab::Spots => {
                 operator_identity_note(ui, io.digi_edit, io.digi_seeded);
 
@@ -4974,6 +7330,9 @@ impl SdroxideApp {
                 {
                     *io.net_apply = true;
                 }
+
+                net_heading(ui, "Broadcast stations");
+                broadcast_stations_settings(ui, io.bc_reload, io.bc_restore);
             }
             SettingsTab::Uploads => {
                 net_heading(ui, "Callsign lookup");
@@ -5087,8 +7446,64 @@ impl SdroxideApp {
                 ui.add_space(8.0);
                 settings_wsjtx_tab(ui, io.wsjtx_edit, self.wsjtx_seeded, io.wsjtx_apply);
             }
+            SettingsTab::Tle => settings_tle_tab(ui, io),
         }
     }
+
+    /// Subscription status for the settings dialog.
+    ///
+    /// The live feed is preferred — it has the result of the fetch it just did
+    /// — but it only exists while the solar window is open, so the disk cache
+    /// answers for the far more common case of the dialog being opened with the
+    /// window shut.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_sat_sub_status(&mut self) {
+        let live = self.solar.tle_sub_status();
+        let subs: Vec<_> = self.sat_cfg.subs.clone();
+        self.sat_sub_status =
+            if live.is_empty() { sdroxide_solar::tlesub::status_all(&subs) } else { live }
+                .into_iter()
+                .map(|s| SubStatusView {
+                    url: s.url,
+                    fetched_unix: s.fetched_unix,
+                    count: s.count,
+                    curated: s.curated,
+                    error: s.error,
+                })
+                .collect();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn refresh_sat_sub_status(&mut self) {}
+
+    fn sat_sub_views(&self) -> Vec<SubStatusView> {
+        self.sat_sub_status.clone()
+    }
+
+    /// Fetch every enabled subscription now, from the settings dialog's UPDATE
+    /// NOW button. Blocking — up to one HTTPS round trip per subscription.
+    ///
+    /// The solar window's feed shares the same disk cache, so a listing fetched
+    /// here is what it serves next time it looks, without a second request.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_sat_subs_now(&mut self) {
+        let subs: Vec<_> = self.sat_cfg_edit.subs.clone();
+        let done = sdroxide_solar::tlesub::refresh_all(&subs);
+        let failed = done.iter().filter(|s| s.error.is_some()).count();
+        let total: usize = done.iter().map(|s| s.count).sum();
+        self.sat_ui.note = match (done.len(), failed) {
+            (0, _) => "No enabled subscriptions to update.".to_string(),
+            (n, 0) => format!("Updated {n} subscription(s): {total} satellites."),
+            (n, f) => format!("Updated {} of {n}; {f} failed — see the rows above.", n - f),
+        };
+        self.refresh_sat_sub_status();
+        // The window's feed is told to re-read the cache rather than being left
+        // on what it loaded at open time.
+        self.solar.reload_tle_subs();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn refresh_sat_subs_now(&mut self) {}
 
     /// The user's own speakers / microphone (applied live).
     fn settings_user_audio(
@@ -5180,18 +7595,18 @@ impl SdroxideApp {
         }
         if caps.antennas_rx.len() > 1 {
             ui.separator();
-            ComboBox::from_id_salt("ant-rx")
-                .selected_text(self.state.antenna_rx.clone())
-                .show_ui(ui, |ui| {
+            ComboBox::from_id_salt("ant-rx").selected_text(self.state.antenna_rx.clone()).show_ui(
+                ui,
+                |ui| {
                     for a in &caps.antennas_rx {
                         if ui.selectable_label(self.state.antenna_rx == *a, a).clicked() {
                             cmds.push(Command::SetAntenna { dir: Direction::Rx, name: a.clone() });
                         }
                     }
-                });
+                },
+            );
         }
     }
-
 }
 
 /// A device dropdown ("System default" + names); calls `pick(Some(name)|None)`.
@@ -5239,7 +7654,11 @@ fn net_secret(ui: &mut egui::Ui, label: &str, val: &mut String, w: f32) {
     });
 }
 
-fn settings_ui_tab(ui: &mut egui::Ui, cfg: &mut sdroxide_types::UiSettings) {
+fn settings_ui_tab(
+    ui: &mut egui::Ui,
+    cfg: &mut sdroxide_types::UiSettings,
+    cloud_march: Option<&mut bool>,
+) {
     use sdroxide_types::{Speed, UiSettings};
     ui.label(RichText::new("Display").size(14.0).strong().color(crate::theme::CYAN));
     ui.add_space(6.0);
@@ -5294,6 +7713,32 @@ fn settings_ui_tab(ui: &mut egui::Ui, cfg: &mut sdroxide_types::UiSettings) {
         )
         .weak(),
     );
+
+    let Some(cloud_march) = cloud_march else { return };
+    ui.add_space(14.0);
+    ui.label(RichText::new("3D view").size(14.0).strong().color(crate::theme::CYAN));
+    ui.add_space(6.0);
+    egui::Grid::new("ui-grid-3d").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+        ui.label("Cloud rendering");
+        ComboBox::from_id_salt("ui-cloud-march")
+            .selected_text(if *cloud_march { "Volumetric" } else { "Layered" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(cloud_march, false, "Layered");
+                ui.selectable_value(cloud_march, true, "Volumetric");
+            });
+        ui.end_row();
+    });
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "How the CLOUDS layer in the 3D view draws the weather. Layered stacks \
+             slices through the troposphere and is the cheap option. Volumetric walks \
+             a ray through it instead, so the Sun casts the cloud tops onto the deck \
+             below and lightning glows out through the storm making it rather than \
+             only brightening its outside — at several times the cost per pixel.",
+        )
+        .weak(),
+    );
 }
 
 fn enum_combo<T: PartialEq + Copy>(
@@ -5319,7 +7764,9 @@ fn settings_cat_tab(
     serial_ports: &[String],
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
 ) {
-    use sdroxide_types::{CatFamily, DigiMode, LineState, ModeControl, Parity, PttMethod, SoundFormat, StopBits};
+    use sdroxide_types::{
+        CatFamily, DigiMode, LineState, ModeControl, Parity, PttMethod, SoundFormat, StopBits,
+    };
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Radio configuration is only available in the native app.");
         return;
@@ -5331,12 +7778,21 @@ fn settings_cat_tab(
 
         if matches!(cfg.cat.format, SoundFormat::DemodAudio) {
             ui.label("Panadapter BW");
-            ui.add(DragValue::new(&mut cfg.cat.audio_bw_hz).speed(100.0).range(1000.0..=24000.0).suffix(" Hz"));
+            ui.add(
+                DragValue::new(&mut cfg.cat.audio_bw_hz)
+                    .speed(100.0)
+                    .range(1000.0..=24000.0)
+                    .suffix(" Hz"),
+            );
             ui.end_row();
         }
 
         ui.label("Serial port");
-        let shown = if cfg.cat.serial.path.is_empty() { "— select —".to_string() } else { cfg.cat.serial.path.clone() };
+        let shown = if cfg.cat.serial.path.is_empty() {
+            "— select —".to_string()
+        } else {
+            cfg.cat.serial.path.clone()
+        };
         ComboBox::from_id_salt("serport").width(260.0).selected_text(shown).show_ui(ui, |ui| {
             for p in serial_ports {
                 if ui.selectable_label(&cfg.cat.serial.path == p, p).clicked() {
@@ -5351,23 +7807,28 @@ fn settings_cat_tab(
         ui.end_row();
 
         ui.label("Baud");
-        ComboBox::from_id_salt("baud").selected_text(cfg.cat.serial.baud.to_string()).show_ui(ui, |ui| {
-            for b in [4800u32, 9600, 19200, 38400, 57600, 115200] {
-                if ui.selectable_label(cfg.cat.serial.baud == b, b.to_string()).clicked() {
-                    cfg.cat.serial.baud = b;
+        ComboBox::from_id_salt("baud").selected_text(cfg.cat.serial.baud.to_string()).show_ui(
+            ui,
+            |ui| {
+                for b in [4800u32, 9600, 19200, 38400, 57600, 115200] {
+                    if ui.selectable_label(cfg.cat.serial.baud == b, b.to_string()).clicked() {
+                        cfg.cat.serial.baud = b;
+                    }
                 }
-            }
-        });
+            },
+        );
         ui.end_row();
 
         ui.label("Data bits");
-        ComboBox::from_id_salt("databits").selected_text(cfg.cat.serial.data_bits.to_string()).show_ui(ui, |ui| {
-            for d in [7u8, 8] {
-                if ui.selectable_label(cfg.cat.serial.data_bits == d, d.to_string()).clicked() {
-                    cfg.cat.serial.data_bits = d;
+        ComboBox::from_id_salt("databits")
+            .selected_text(cfg.cat.serial.data_bits.to_string())
+            .show_ui(ui, |ui| {
+                for d in [7u8, 8] {
+                    if ui.selectable_label(cfg.cat.serial.data_bits == d, d.to_string()).clicked() {
+                        cfg.cat.serial.data_bits = d;
+                    }
                 }
-            }
-        });
+            });
         ui.end_row();
 
         ui.label("Parity");
@@ -5424,6 +7885,7 @@ fn settings_hpsdr_tab(
     devices: &[sdroxide_types::HpsdrDevice],
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
     discover: &mut bool,
+    cmds: &mut Vec<Command>,
 ) {
     use sdroxide_types::HpsdrConfig;
     let Some(cfg) = radio_edit.as_mut() else {
@@ -5437,22 +7899,25 @@ fn settings_hpsdr_tab(
                 *discover = true;
             }
             let shown = cfg.hpsdr.selected_ip.clone().unwrap_or_else(|| "— none —".into());
-            ComboBox::from_id_salt("hpsdr_dev").width(320.0).selected_text(shown).show_ui(ui, |ui| {
-                if devices.is_empty() {
-                    ui.label(RichText::new("no devices — press Discover").weak());
-                }
-                for d in devices {
-                    // Only Protocol 2 devices are selectable; P1 (e.g. HL2) is shown but greyed.
-                    if d.supported() {
-                        let sel = cfg.hpsdr.selected_ip.as_deref() == Some(d.ip.as_str());
-                        if ui.selectable_label(sel, d.label()).clicked() {
-                            cfg.hpsdr.selected_ip = Some(d.ip.clone());
-                        }
-                    } else {
-                        ui.label(RichText::new(d.label()).weak());
+            ComboBox::from_id_salt("hpsdr_dev").width(320.0).selected_text(shown).show_ui(
+                ui,
+                |ui| {
+                    if devices.is_empty() {
+                        ui.label(RichText::new("no devices — press Discover").weak());
                     }
-                }
-            });
+                    for d in devices {
+                        // Both protocols are drivable; anything else is greyed out.
+                        if d.supported() {
+                            let sel = cfg.hpsdr.selected_ip.as_deref() == Some(d.ip.as_str());
+                            if ui.selectable_label(sel, d.label()).clicked() {
+                                cfg.hpsdr.selected_ip = Some(d.ip.clone());
+                            }
+                        } else {
+                            ui.label(RichText::new(d.label()).weak());
+                        }
+                    }
+                },
+            );
         });
         ui.end_row();
 
@@ -5486,11 +7951,260 @@ fn settings_hpsdr_tab(
             }
         });
         ui.end_row();
+
+        ui.label("LNA gain").on_hover_text(
+            "Front-end gain of a Hermes-Lite 2. Takes effect immediately — no reconnect — \
+             and is remembered as the level the radio starts at. Too high clips the ADC and \
+             the whole band looks distorted; too low and the receiver goes deaf.",
+        );
+        // Applies live as well as being persisted: this is the gain an operator
+        // retunes per band, and making it wait for Apply/reconnect would mean
+        // dropping the stream every time they nudge it.
+        if crate::chrome::slider(
+            ui,
+            Slider::new(
+                &mut cfg.hpsdr.lna_gain_db,
+                HpsdrConfig::LNA_GAIN_MIN_DB..=HpsdrConfig::LNA_GAIN_MAX_DB,
+            )
+            .step_by(1.0)
+            .suffix(" dB"),
+        )
+        .changed()
+        {
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: sdroxide_types::HpsdrConfig::LNA_GAIN_ELEMENT.to_string(),
+                db: cfg.hpsdr.lna_gain_db,
+            });
+        }
+        ui.end_row();
+
+        ui.label("Filter board").on_hover_text(
+            "Accessory board on the Hermes-Lite 2's J16 header. Leave this at \"None\" \
+             unless a filter board is actually fitted: those seven pins are \
+             general-purpose open-collector outputs, and operators also wire them to \
+             amplifier PTT, antenna relays and transverter switching. Driving them from \
+             band data would start operating whatever is connected.",
+        );
+        ComboBox::from_id_salt("hpsdr_filter")
+            .width(220.0)
+            .selected_text(cfg.hpsdr.filter_board.label())
+            .show_ui(ui, |ui| {
+                for b in sdroxide_types::HpsdrFilterBoard::ALL {
+                    if ui.selectable_label(cfg.hpsdr.filter_board == b, b.label()).clicked() {
+                        cfg.hpsdr.filter_board = b;
+                    }
+                }
+            });
+        ui.end_row();
+
+        ui.label("Invert spectrum");
+        ui.checkbox(&mut cfg.hpsdr.invert_spectrum, "Swap I/Q").on_hover_text(
+            "Mirror the board's spectrum about the tuned frequency, on transmit as well \
+             as receive. On by default: a Hermes-Lite 2 needs it. Turn it off only if \
+             signals show up on the wrong side of the dial and nothing decodes — the \
+             giveaway is a waterfall full of convincing traces while SSB lands on the \
+             wrong sideband and FT8 returns no decodes at all.",
+        );
+        ui.end_row();
     });
     ui.add_space(6.0);
     ui.label(
         RichText::new(
             "A manual IP overrides discovery. Press \"Apply / reconnect\" to switch without a restart.",
+        )
+        .weak(),
+    );
+}
+
+/// RTL-SDR interface: which dongle, sample rate, gain/AGC, frequency
+/// correction, HF reception and the bias tee.
+///
+/// Gain, AGC, ppm and the bias tee all apply *live* rather than waiting for
+/// Apply/reconnect — these are the controls an operator moves while listening,
+/// and dropping the stream on every nudge would make them unusable. The dongle
+/// selection and sample rate do need a reconnect, since both are fixed when
+/// the device is opened.
+fn settings_rtlsdr_tab(
+    ui: &mut egui::Ui,
+    devices: &[sdroxide_types::RtlSdrDevice],
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    rescan: &mut bool,
+    cmds: &mut Vec<Command>,
+) {
+    use sdroxide_types::{RtlSdrAgc, RtlSdrConfig, RtlSdrHfMode};
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Radio configuration is only available in the native app.");
+        return;
+    };
+
+    egui::Grid::new("rtlsdr-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Dongle");
+        ui.horizontal(|ui| {
+            if ui
+                .button("Rescan")
+                .on_hover_text(
+                    "Re-list the USB bus. No device is opened, so this is safe \
+                     to press while receiving.",
+                )
+                .clicked()
+            {
+                *rescan = true;
+            }
+            let shown = cfg.rtlsdr.serial.clone().unwrap_or_else(|| "— first one found —".into());
+            ComboBox::from_id_salt("rtlsdr_dev").width(300.0).selected_text(shown).show_ui(
+                ui,
+                |ui| {
+                    if devices.is_empty() {
+                        ui.label(RichText::new("no dongles — press Rescan").weak());
+                    }
+                    if ui
+                        .selectable_label(cfg.rtlsdr.serial.is_none(), "— first one found —")
+                        .clicked()
+                    {
+                        cfg.rtlsdr.serial = None;
+                    }
+                    for d in devices {
+                        // Only a dongle with a serial can be pinned; without
+                        // one there is nothing stable to remember, since bus
+                        // position changes on every replug.
+                        if let Some(sn) = &d.serial {
+                            let sel = cfg.rtlsdr.serial.as_deref() == Some(sn.as_str());
+                            if ui.selectable_label(sel, d.label()).clicked() {
+                                cfg.rtlsdr.serial = Some(sn.clone());
+                            }
+                        } else {
+                            ui.label(RichText::new(d.label()).weak());
+                        }
+                    }
+                },
+            );
+        });
+        ui.end_row();
+
+        ui.label("Sample rate").on_hover_text(
+            "The RTL2832U's resampler reaches 225–300 kHz and 900 kHz–3.2 MHz, \
+             nothing between. Takes effect on Apply.",
+        );
+        let shown = format!("{:.3} Msps", cfg.rtlsdr.sample_rate_hz / 1e6);
+        ComboBox::from_id_salt("rtlsdr_rate").selected_text(shown).show_ui(ui, |ui| {
+            for &r in &RtlSdrConfig::SAMPLE_RATES {
+                let sel = (cfg.rtlsdr.sample_rate_hz - r).abs() < 1.0;
+                let mut label = format!("{:.3} Msps", r / 1e6);
+                if r >= 3_200_000.0 {
+                    label.push_str("  (often drops samples)");
+                }
+                if ui.selectable_label(sel, label).clicked() {
+                    cfg.rtlsdr.sample_rate_hz = r;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("AGC").on_hover_text(
+            "Manual is the setting for measurement and weak-signal digital modes. \
+             The tuner and the demodulator have independent automatic loops.",
+        );
+        let mut agc = cfg.rtlsdr.agc;
+        enum_combo(ui, "rtlsdr_agc", &mut agc, &RtlSdrAgc::ALL, RtlSdrAgc::label);
+        if agc != cfg.rtlsdr.agc {
+            cfg.rtlsdr.agc = agc;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: RtlSdrConfig::AGC_ELEMENT.to_string(),
+                db: agc.code() as f64,
+            });
+        }
+        ui.end_row();
+
+        ui.label("Tuner gain").on_hover_text(
+            "Applies immediately — no reconnect. The tuner has 29 discrete steps, \
+             so the value snaps to the nearest one it can produce. Ignored while \
+             the tuner AGC is running.",
+        );
+        ui.add_enabled_ui(!cfg.rtlsdr.agc.tuner_auto(), |ui| {
+            if crate::chrome::slider(
+                ui,
+                Slider::new(&mut cfg.rtlsdr.tuner_gain_db, 0.0..=RtlSdrConfig::GAIN_MAX_DB)
+                    .step_by(0.1)
+                    .suffix(" dB"),
+            )
+            .changed()
+            {
+                cmds.push(Command::SetGain {
+                    dir: Direction::Rx,
+                    element: RtlSdrConfig::TUNER_GAIN_ELEMENT.to_string(),
+                    db: cfg.rtlsdr.tuner_gain_db,
+                });
+            }
+        });
+        ui.end_row();
+
+        ui.label("Frequency correction").on_hover_text(
+            "Crystal error in parts per million. Run with \
+             RUST_LOG=sdroxide_rtlsdr=debug and the log prints the measured \
+             clock error after about 20 seconds — that is the number to enter. \
+             Applies immediately.",
+        );
+        let mut ppm = cfg.rtlsdr.ppm;
+        if ui.add(egui::DragValue::new(&mut ppm).range(-200..=200).suffix(" ppm")).changed() {
+            cfg.rtlsdr.ppm = ppm;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: RtlSdrConfig::PPM_ELEMENT.to_string(),
+                db: ppm as f64,
+            });
+        }
+        ui.end_row();
+
+        ui.label("HF reception").on_hover_text(
+            "The tuner itself starts at 24 MHz. An RTL-SDR Blog V4 upconverts \
+             below that in hardware; other dongles reach HF only by sampling the \
+             ADC directly, through the V3's HF port. Switching modes briefly \
+             interrupts the stream.",
+        );
+        let mut hf = cfg.rtlsdr.hf_mode;
+        enum_combo(ui, "rtlsdr_hf", &mut hf, &RtlSdrHfMode::ALL, RtlSdrHfMode::label);
+        if hf != cfg.rtlsdr.hf_mode {
+            cfg.rtlsdr.hf_mode = hf;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: RtlSdrConfig::HF_MODE_ELEMENT.to_string(),
+                db: hf as u8 as f64,
+            });
+        }
+        ui.end_row();
+
+        ui.label("Bias tee");
+        let mut bias = cfg.rtlsdr.bias_tee;
+        if ui.checkbox(&mut bias, "Feed ~4.5 V DC up the coax").changed() {
+            cfg.rtlsdr.bias_tee = bias;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: RtlSdrConfig::BIAS_TEE_ELEMENT.to_string(),
+                db: if bias { 1.0 } else { 0.0 },
+            });
+        }
+        ui.end_row();
+    });
+
+    if cfg.rtlsdr.bias_tee {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Bias tee is ON. Never connect a transceiver, a grounded antenna, \
+                 or a preamp powered from elsewhere while this is enabled — the DC \
+                 goes straight down the feedline.",
+            )
+            .color(crate::theme::YELLOW),
+        );
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Receive only. The dongle and sample rate take effect on Apply; \
+             everything else applies as you change it.",
         )
         .weak(),
     );
@@ -5539,7 +8253,9 @@ fn settings_tci_tab(
     });
     match test_result {
         Some(Ok(s)) => {
-            ui.label(RichText::new(format!("Connected: {s}")).color(Color32::from_rgb(90, 200, 110)));
+            ui.label(
+                RichText::new(format!("Connected: {s}")).color(Color32::from_rgb(90, 200, 110)),
+            );
         }
         Some(Err(e)) => {
             ui.label(RichText::new(format!("Failed: {e}")).color(Color32::from_rgb(230, 90, 80)));
@@ -5790,11 +8506,7 @@ struct TciServerStatus {
 
 /// Where the operator's callsign and grid actually live, for the network tabs
 /// that report under them but deliberately do not offer a second copy to edit.
-fn operator_identity_note(
-    ui: &mut egui::Ui,
-    digi: &sdroxide_types::DigiConfig,
-    seeded: bool,
-) {
+fn operator_identity_note(ui: &mut egui::Ui, digi: &sdroxide_types::DigiConfig, seeded: bool) {
     net_heading(ui, "Operator");
     if !seeded {
         ui.label(RichText::new("Callsign and grid are set on the General tab.").weak());
@@ -5855,12 +8567,14 @@ fn settings_freedv_tab(
         });
 
         net_heading(ui, "Reporting");
-        ui.checkbox(&mut c.report_rx, "Report stations I decode")
-            .on_hover_text("Sends an rx_report for each callsign recovered from a RADE \
-                            End-of-Over frame.");
-        ui.checkbox(&mut c.show_spots, "Show other reporter stations as spots")
-            .on_hover_text("Adds them to the panadapter overlay, world map and SPOTS window \
-                            under the FREEDV filter.");
+        ui.checkbox(&mut c.report_rx, "Report stations I decode").on_hover_text(
+            "Sends an rx_report for each callsign recovered from a RADE \
+                            End-of-Over frame.",
+        );
+        ui.checkbox(&mut c.show_spots, "Show other reporter stations as spots").on_hover_text(
+            "Adds them to the panadapter overlay, world map and SPOTS window \
+                            under the FREEDV filter.",
+        );
     });
 
     ui.add_space(8.0);
@@ -5923,9 +8637,8 @@ fn action_combo(
     let mut changed = false;
     ComboBox::from_id_salt(id).width(210.0).selected_text(action.label()).show_ui(ui, |ui| {
         let mut group = "";
-        let all = Action::all()
-            .into_iter()
-            .chain(memories.iter().map(|m| Action::MemoryRecall(m.id)));
+        let all =
+            Action::all().into_iter().chain(memories.iter().map(|m| Action::MemoryRecall(m.id)));
         for a in all {
             if a.group() != group {
                 group = a.group();
@@ -5974,65 +8687,62 @@ fn settings_controls_tab(
     ui.add_space(6.0);
 
     let mut remove: Option<usize> = None;
-    egui::Grid::new("keys-grid").num_columns(6).spacing([10.0, 6.0]).striped(true).show(
-        ui,
-        |ui| {
-            ui.label(RichText::new("Shortcut").small().weak());
-            ui.label(RichText::new("Does").small().weak());
-            ui.label(RichText::new("Step / mode").small().weak());
-            ui.label(RichText::new("Accel").small().weak());
-            ui.label(RichText::new("On").small().weak());
-            ui.label("");
-            ui.end_row();
+    egui::Grid::new("keys-grid").num_columns(6).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
+        ui.label(RichText::new("Shortcut").small().weak());
+        ui.label(RichText::new("Does").small().weak());
+        ui.label(RichText::new("Step / mode").small().weak());
+        ui.label(RichText::new("Accel").small().weak());
+        ui.label(RichText::new("On").small().weak());
+        ui.label("");
+        ui.end_row();
 
-            for (i, b) in cfg.keys.iter_mut().enumerate() {
-                let capturing = *key_capture == Some(i);
-                let label = if capturing { "press a key…".to_string() } else { b.chord.label() };
-                if crate::chrome::chip(ui, capturing, RichText::new(label).monospace()).clicked() {
-                    *key_capture = if capturing { None } else { Some(i) };
-                }
-
-                if action_combo(ui, ("keyact", i), &mut b.action, memories) {
-                    b.tuning.step = b.action.default_step();
-                }
-
-                match b.action.kind() {
-                    ActionKind::Continuous => {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut b.tuning.step)
-                                    .speed(1.0)
-                                    .range(0.0001..=1_000_000.0),
-                            );
-                            // The sign of `value` is the direction, so one
-                            // action can have an up key and a down key.
-                            let mut down = b.value < 0.0;
-                            if ui.checkbox(&mut down, "down").changed() {
-                                b.value = if down { -1.0 } else { 1.0 };
-                            }
-                        });
-                        ui.add(egui::DragValue::new(&mut b.tuning.accel).speed(0.05).range(0.0..=4.0));
-                    }
-                    ActionKind::Momentary => {
-                        ui.horizontal(|ui| {
-                            for m in ButtonMode::ALL {
-                                if crate::chrome::chip(ui, b.button == m, m.label()).clicked() {
-                                    b.button = m;
-                                }
-                            }
-                        });
-                        ui.label("");
-                    }
-                }
-
-                ui.checkbox(&mut b.enabled, "");
-                if ui.small_button("✕").on_hover_text("Remove this binding").clicked() {
-                    remove = Some(i);
-                }
-                ui.end_row();
+        for (i, b) in cfg.keys.iter_mut().enumerate() {
+            let capturing = *key_capture == Some(i);
+            let label = if capturing { "press a key…".to_string() } else { b.chord.label() };
+            if crate::chrome::chip(ui, capturing, RichText::new(label).monospace()).clicked() {
+                *key_capture = if capturing { None } else { Some(i) };
             }
-        },
-    );
+
+            if action_combo(ui, ("keyact", i), &mut b.action, memories) {
+                b.tuning.step = b.action.default_step();
+            }
+
+            match b.action.kind() {
+                ActionKind::Continuous => {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut b.tuning.step)
+                                .speed(1.0)
+                                .range(0.0001..=1_000_000.0),
+                        );
+                        // The sign of `value` is the direction, so one
+                        // action can have an up key and a down key.
+                        let mut down = b.value < 0.0;
+                        if ui.checkbox(&mut down, "down").changed() {
+                            b.value = if down { -1.0 } else { 1.0 };
+                        }
+                    });
+                    ui.add(egui::DragValue::new(&mut b.tuning.accel).speed(0.05).range(0.0..=4.0));
+                }
+                ActionKind::Momentary => {
+                    ui.horizontal(|ui| {
+                        for m in ButtonMode::ALL {
+                            if crate::chrome::chip(ui, b.button == m, m.label()).clicked() {
+                                b.button = m;
+                            }
+                        }
+                    });
+                    ui.label("");
+                }
+            }
+
+            ui.checkbox(&mut b.enabled, "");
+            if ui.small_button("✕").on_hover_text("Remove this binding").clicked() {
+                remove = Some(i);
+            }
+            ui.end_row();
+        }
+    });
     if let Some(i) = remove {
         cfg.keys.remove(i);
         if *key_capture == Some(i) {
@@ -6054,7 +8764,9 @@ fn settings_controls_tab(
         let has_ptt = cfg.keys.iter().any(|b| b.action == Action::Ptt);
         if !has_ptt
             && crate::chrome::chip(ui, false, "Bind hold-to-talk to Space")
-                .on_hover_text("Hold Space to transmit; releasing it — or losing window focus — unkeys")
+                .on_hover_text(
+                    "Hold Space to transmit; releasing it — or losing window focus — unkeys",
+                )
                 .clicked()
         {
             cfg.keys.push(KeyBinding {
@@ -6077,7 +8789,9 @@ fn settings_controls_tab(
         );
     })
     .response
-    .on_hover_text("Backstop against a stuck key or a controller that stops reporting. 0 disables.");
+    .on_hover_text(
+        "Backstop against a stuck key or a controller that stops reporting. 0 disables.",
+    );
 
     ui.add_space(10.0);
     ui.separator();
@@ -6149,7 +8863,9 @@ fn settings_controls_tab(
         ui,
         |ui| {
             for (i, b) in cfg.mouse_buttons.iter_mut().enumerate() {
-                ComboBox::from_id_salt(("mb", i)).width(130.0).selected_text(b.button.label())
+                ComboBox::from_id_salt(("mb", i))
+                    .width(130.0)
+                    .selected_text(b.button.label())
                     .show_ui(ui, |ui| {
                         for m in MouseButton::ALL {
                             if ui.selectable_label(b.button == m, m.label()).clicked() {
@@ -6183,17 +8899,24 @@ fn settings_controls_tab(
 
     ui.add_space(8.0);
     ui.label(
-        RichText::new(
-            "F1 always opens this manual, even while typing, so it is not rebindable.",
-        )
-        .weak(),
+        RichText::new("F1 always opens this manual, even while typing, so it is not rebindable.")
+            .weak(),
     );
 
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(6.0);
-    settings_midi_section(ui, cfg, io.midi_learn, io.midi_rescan, memories, midi_in, midi_out,
-        midi_status, last_midi);
+    settings_midi_section(
+        ui,
+        cfg,
+        io.midi_learn,
+        io.midi_rescan,
+        memories,
+        midi_in,
+        midi_out,
+        midi_status,
+        last_midi,
+    );
 }
 
 /// MIDI control surfaces: port selection, a live message readout, and the
@@ -6373,9 +9096,7 @@ fn settings_midi_section(
             cfg.midi.bindings.push(MidiBinding::default());
             *learn = Some(crate::input::MidiLearn { row: cfg.midi.bindings.len() - 1 });
         }
-        if !cfg.midi.bindings.is_empty()
-            && crate::chrome::chip(ui, false, "Clear all").clicked()
-        {
+        if !cfg.midi.bindings.is_empty() && crate::chrome::chip(ui, false, "Clear all").clicked() {
             cfg.midi.bindings.clear();
             *learn = None;
         }
@@ -6428,6 +9149,544 @@ fn wheel_action_combo(ui: &mut egui::Ui, id: &str, act: &mut sdroxide_types::Whe
 /// The built-in Hamlib rigctld server: the control surface every "NET rigctl"
 /// client speaks.
 /// WSJT-X UDP broadcast: what the logging ecosystem listens for.
+/// The TLE tab: which satellites the tracker follows, and what they are on.
+///
+/// Three sections, in the order an operator gets to them: subscriptions (the
+/// answer for anything they mean to keep tracking, because a TLE goes stale in
+/// days), element sets pasted in by hand (the answer for a one-off), and the
+/// frequency table the pass window shows.
+fn settings_tle_tab(ui: &mut egui::Ui, io: &mut SettingsIo) {
+    use crate::theme;
+
+    ui.label(
+        RichText::new("Satellites: element sets and frequencies")
+            .size(14.0)
+            .strong()
+            .color(theme::CYAN),
+    );
+    ui.add_space(4.0);
+    if cfg!(target_arch = "wasm32") {
+        ui.label(
+            RichText::new(
+                "The tracker runs in the native app; this tab configures it there. The solar \
+                 view in the browser is fed by the server's relay.",
+            )
+            .weak(),
+        );
+        return;
+    }
+    ui.label(
+        RichText::new(
+            "The tracker already fetches CelesTrak's amateur group on its own. This is for \
+             everything else: the NOAA weather birds, a cubesat too new to be in the group, or \
+             a fresher element set than the one that arrived.",
+        )
+        .weak(),
+    );
+    if !io.sat_ui.note.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(&io.sat_ui.note).color(theme::YELLOW).size(11.0));
+    }
+
+    ui.add_space(10.0);
+    settings_tle_subscriptions(ui, io);
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    settings_tle_pasted(ui, io);
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    settings_tle_freqs(ui, io);
+}
+
+/// Subscribed element-set listings, and the one-click CelesTrak groups.
+fn settings_tle_subscriptions(ui: &mut egui::Ui, io: &mut SettingsIo) {
+    use crate::theme;
+
+    ui.label(RichText::new("Subscriptions").strong());
+    ui.label(
+        RichText::new(
+            "Listings fetched and kept current, on the same six-hourly cadence as the amateur \
+             set. Refreshed while the solar window is open, and by UPDATE NOW here.",
+        )
+        .weak()
+        .size(11.0),
+    );
+    ui.add_space(6.0);
+
+    let mut remove = None;
+    for (i, sub) in io.sat_edit.subs.iter_mut().enumerate() {
+        let st = io.sat_subs.iter().find(|s| s.url.trim() == sub.url.trim());
+        ui.push_id(("tle-sub", i), |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut sub.enabled, "").on_hover_text("Fetch and track this listing");
+                ui.add(
+                    egui::TextEdit::singleline(&mut sub.name)
+                        .desired_width(120.0)
+                        .hint_text("name"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut sub.url)
+                        .desired_width(300.0)
+                        .hint_text("https://…"),
+                );
+                if ui.button("✕").on_hover_text("Remove this subscription").clicked() {
+                    remove = Some(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.label(RichText::new("Orbits").color(theme::CYAN_DIM).size(9.5).strong())
+                    .on_hover_text(
+                        "Which satellites in this listing get an orbit ring and a label. A whole \
+                         group wants \"curated\": ninety rings at once is unreadable, and none \
+                         at all leaves ninety anonymous dots.",
+                    );
+                // The middle position keys off sdroxide's own curated list,
+                // which is ten *amateur* satellites — so for a weather or GNSS
+                // listing it would behave exactly like "none". Greyed out once
+                // a fetch has proved this listing has none of them, rather than
+                // left as a chip that quietly does nothing.
+                let no_curated = st.is_some_and(|s| s.fetched_unix > 0 && s.curated == 0);
+                for o in sdroxide_types::OrbitRings::ALL {
+                    let dead = o == sdroxide_types::OrbitRings::Curated && no_curated;
+                    let resp = ui
+                        .add_enabled_ui(!dead, |ui| {
+                            crate::chrome::chip(ui, sub.orbits == o, o.label())
+                        })
+                        .inner;
+                    let hint = if dead {
+                        "Nothing in this listing is in sdroxide's curated list — that list is                          ten amateur satellites, so this would behave exactly like \"none\"."
+                    } else {
+                        o.hint()
+                    };
+                    if resp.on_hover_text(hint).clicked() && !dead {
+                        sub.orbits = o;
+                    }
+                }
+                let mut only = sub.only_text();
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut only)
+                            .desired_width(180.0)
+                            .hint_text("all satellites"),
+                    )
+                    .on_hover_text(
+                        "Catalogue numbers to keep, comma separated. Empty tracks everything the \
+                         listing carries.",
+                    );
+                if resp.changed() {
+                    sub.set_only_text(&only);
+                }
+
+                // Status: what the last fetch actually did. Matched by URL
+                // rather than by position — the two lists are edited apart.
+                let (text, color) = match (sub.problem(), st) {
+                    (Some(p), _) => (p.to_string(), theme::PINK),
+                    (None, None) => ("not fetched yet".to_string(), theme::LINE_LIT),
+                    (None, Some(s)) => match &s.error {
+                        Some(e) => (e.clone(), theme::PINK),
+                        None if s.fetched_unix == 0 => {
+                            ("not fetched yet".to_string(), theme::LINE_LIT)
+                        }
+                        None => (
+                            format!(
+                                "{} satellites · {} old",
+                                s.count,
+                                sdroxide_solar::timefmt::age(now_unix() - s.fetched_unix)
+                            ),
+                            theme::GREEN,
+                        ),
+                    },
+                };
+                ui.label(RichText::new(text).color(color).size(10.5));
+            });
+        });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = remove {
+        io.sat_edit.subs.remove(i);
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("+ Subscription").clicked() {
+            io.sat_edit.subs.push(sdroxide_types::TleSubscription::new("New", ""));
+        }
+        if crate::chrome::chip_accent(
+            ui,
+            false,
+            RichText::new(" UPDATE NOW ").strong(),
+            theme::GREEN,
+            theme::INK_ON_CYAN,
+        )
+        .on_hover_text("Fetch every enabled subscription now")
+        .clicked()
+        {
+            *io.sat_sub_refresh = true;
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("CelesTrak groups").color(theme::CYAN_DIM).size(10.0).strong());
+    ui.horizontal_wrapped(|ui| {
+        for g in sdroxide_types::CELESTRAK_GROUPS {
+            let have = io.sat_edit.has_sub(g.url);
+            if crate::chrome::chip(ui, have, g.name).on_hover_text(g.hint).clicked() && !have {
+                let mut sub = sdroxide_types::TleSubscription::new(g.name, g.url);
+                sub.orbits = g.orbits;
+                io.sat_edit.subs.push(sub);
+                io.sat_ui.note = format!("Subscribed to {}. Press UPDATE NOW to fetch it.", g.name);
+            }
+        }
+    });
+}
+
+/// Element sets pasted in by hand.
+fn settings_tle_pasted(ui: &mut egui::Ui, io: &mut SettingsIo) {
+    use crate::theme;
+
+    ui.label(RichText::new("Pasted element sets").strong());
+    ui.label(
+        RichText::new(
+            "For a one-off. These do not update themselves, and SGP4 stops propagating an \
+             element set once it is a fortnight past its epoch — subscribe instead for anything \
+             you mean to keep.",
+        )
+        .weak()
+        .size(11.0),
+    );
+    ui.add_space(6.0);
+
+    let now = now_unix();
+    let mut remove = None;
+    for (i, t) in io.sat_edit.tles.iter_mut().enumerate() {
+        ui.push_id(("tle-set", i), |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut t.enabled, "").on_hover_text("Track this one");
+                ui.add(
+                    egui::TextEdit::singleline(&mut t.name).desired_width(180.0).hint_text("name"),
+                );
+                match t.problem() {
+                    Some(p) => {
+                        ui.label(RichText::new(p).color(theme::PINK).size(10.5));
+                    }
+                    None => {
+                        let age = tle_epoch_age(t, now);
+                        let (text, color) = match age {
+                            // Past where SGP4 is worth anything, which is the
+                            // whole reason a paste is a stopgap.
+                            Some(a) if a > 14 * 86_400 => (
+                                format!(
+                                    "NORAD {} · {} old — too stale to propagate",
+                                    t.norad_id().unwrap_or(0),
+                                    sdroxide_solar::timefmt::age(a)
+                                ),
+                                theme::PINK,
+                            ),
+                            Some(a) if a > 3 * 86_400 => (
+                                format!(
+                                    "NORAD {} · {} old",
+                                    t.norad_id().unwrap_or(0),
+                                    sdroxide_solar::timefmt::age(a)
+                                ),
+                                theme::YELLOW,
+                            ),
+                            Some(a) => (
+                                format!(
+                                    "NORAD {} · {} old",
+                                    t.norad_id().unwrap_or(0),
+                                    sdroxide_solar::timefmt::age(a)
+                                ),
+                                theme::GREEN,
+                            ),
+                            None => {
+                                (format!("NORAD {}", t.norad_id().unwrap_or(0)), theme::LINE_LIT)
+                            }
+                        };
+                        ui.label(RichText::new(text).color(color).size(10.5));
+                    }
+                }
+                if ui.button("✎").on_hover_text("Show the two element lines").clicked() {
+                    io.sat_ui.open_tle = (io.sat_ui.open_tle != Some(i)).then_some(i);
+                }
+                if ui.button("✕").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if io.sat_ui.open_tle == Some(i) {
+                // Monospace: the format is column-addressed, so a proportional
+                // font makes a misaligned paste impossible to see.
+                for line in [&mut t.line1, &mut t.line2] {
+                    ui.add(
+                        egui::TextEdit::singleline(line)
+                            .desired_width(560.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                }
+            }
+        });
+    }
+    if let Some(i) = remove {
+        io.sat_edit.tles.remove(i);
+        io.sat_ui.open_tle = None;
+    }
+
+    ui.add_space(6.0);
+    ui.add(
+        egui::TextEdit::multiline(&mut io.sat_ui.paste)
+            .desired_rows(3)
+            .desired_width(600.0)
+            .font(egui::TextStyle::Monospace)
+            .hint_text("Paste two- or three-line element sets here"),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("+ Add pasted").clicked() {
+            let found = sdroxide_types::parse_tle_block(&io.sat_ui.paste);
+            io.sat_ui.note =
+                match found.len() {
+                    0 => "Nothing in the paste box looked like an element set.".to_string(),
+                    n => {
+                        // Replace rather than duplicate: pasting a fresher set for
+                        // a satellite already listed is the common case, and a
+                        // second entry for the same catalogue number would leave
+                        // whichever came first winning at random.
+                        let mut replaced = 0;
+                        for t in found {
+                            match io.sat_edit.tles.iter().position(|e| {
+                                e.norad_id().is_some() && e.norad_id() == t.norad_id()
+                            }) {
+                                Some(k) => {
+                                    // Keep the operator's own name and their
+                                    // enabled/disabled choice; take the elements.
+                                    io.sat_edit.tles[k].line1 = t.line1;
+                                    io.sat_edit.tles[k].line2 = t.line2;
+                                    replaced += 1;
+                                }
+                                None => io.sat_edit.tles.push(t),
+                            }
+                        }
+                        io.sat_ui.paste.clear();
+                        match replaced {
+                            0 => format!("Added {n} element set(s)."),
+                            r => format!("Added {} and refreshed {r} element set(s).", n - r),
+                        }
+                    }
+                };
+        }
+        if ui.button("Clear box").clicked() {
+            io.sat_ui.paste.clear();
+        }
+    });
+}
+
+/// Age of a pasted element set, in seconds, from the epoch in columns 19–32 of
+/// line 1.
+///
+/// Its own parse rather than SGP4's, because this has to work on an entry the
+/// propagator would reject — the whole point is to say *why* it is being
+/// rejected.
+fn tle_epoch_age(t: &sdroxide_types::CustomTle, now_unix: i64) -> Option<i64> {
+    let l1 = t.line1.as_bytes();
+    if l1.len() < 32 {
+        return None;
+    }
+    let field = std::str::from_utf8(&l1[18..32]).ok()?.trim();
+    let yy: i64 = field.get(..2)?.parse().ok()?;
+    let doy: f64 = field.get(2..)?.parse().ok()?;
+    // Two-digit years: 57–99 are 1957 onwards, 00–56 are 2000 onwards. That is
+    // the convention the format itself carries.
+    let year = if yy < 57 { 2000 + yy } else { 1900 + yy };
+    let jan1 = sdroxide_types::ymd_hms_to_unix(year, 1, 1, 0, 0, 0);
+    Some(now_unix - (jan1 + ((doy - 1.0) * 86_400.0) as i64))
+}
+
+/// The frequency table the pass window shows: the operator's entries, which
+/// override the built-in one satellite for satellite.
+fn settings_tle_freqs(ui: &mut egui::Ui, io: &mut SettingsIo) {
+    use crate::theme;
+
+    ui.label(RichText::new("Frequencies").strong());
+    ui.label(
+        RichText::new(
+            "Shown under the pass table in the solar window. An entry here replaces the \
+             built-in one for that catalogue number outright, so start from a copy of it unless \
+             you mean to drop the rest.",
+        )
+        .weak()
+        .size(11.0),
+    );
+    ui.add_space(6.0);
+
+    let mut remove = None;
+    for (i, f) in io.sat_edit.freqs.iter_mut().enumerate() {
+        ui.push_id(("sat-freq", i), |ui| {
+            ui.horizontal(|ui| {
+                let open = io.sat_ui.open_freq == Some(i);
+                if ui.button(if open { "▼" } else { "▶" }).clicked() {
+                    io.sat_ui.open_freq = (!open).then_some(i);
+                }
+                ui.label(RichText::new(format!("NORAD {}", f.norad_id)).color(theme::CYAN_DIM));
+                ui.add(
+                    egui::TextEdit::singleline(&mut f.name).desired_width(180.0).hint_text("name"),
+                );
+                ui.label(
+                    RichText::new(format!("{} link(s)", f.links.len()))
+                        .color(theme::LINE_LIT)
+                        .size(10.5),
+                );
+                if ui.button("✕").on_hover_text("Remove this satellite's entry").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if io.sat_ui.open_freq != Some(i) {
+                return;
+            }
+            let mut drop_link = None;
+            egui::Grid::new("sat-links").num_columns(6).spacing([8.0, 4.0]).show(ui, |ui| {
+                for h in ["LINK", "DOWNLINK", "UPLINK", "MODE", "NOTE", ""] {
+                    ui.label(RichText::new(h).color(theme::CYAN_DIM).size(9.5).strong());
+                }
+                ui.end_row();
+                for (k, l) in f.links.iter_mut().enumerate() {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut l.label)
+                            .desired_width(120.0)
+                            .hint_text("FM repeater"),
+                    );
+                    freq_box(ui, (k, "down"), &mut l.downlink, "145.800");
+                    freq_box(ui, (k, "up"), &mut l.uplink, "435.250");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut l.mode).desired_width(90.0).hint_text("FM"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut l.note)
+                            .desired_width(180.0)
+                            .hint_text("CTCSS 67.0 Hz"),
+                    );
+                    if ui.button("✕").clicked() {
+                        drop_link = Some(k);
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(k) = drop_link {
+                f.links.remove(k);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Link").clicked() {
+                    f.links.push(Default::default());
+                }
+                // The built-in row is almost always what you want to start
+                // from: correcting one frequency should not mean retyping the
+                // beacon, the telemetry and the transponder as well.
+                if let Some(b) = sdroxide_solar::satfreq::builtin_for(f.norad_id) {
+                    if ui
+                        .button("Copy built-in")
+                        .on_hover_text(format!(
+                            "Replace these links with the built-in ones for {}",
+                            b.name
+                        ))
+                        .clicked()
+                    {
+                        f.links = b.links.clone();
+                        if f.name.trim().is_empty() {
+                            f.name = b.name.clone();
+                        }
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "A frequency is either one number (145.800) or a transponder passband \
+                     written 145.950-145.970. Leave a direction blank for a beacon.",
+                )
+                .weak()
+                .size(10.0),
+            );
+        });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = remove {
+        io.sat_edit.freqs.remove(i);
+        io.sat_ui.open_freq = None;
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut io.sat_ui.new_freq_id)
+                .desired_width(80.0)
+                .hint_text("NORAD"),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut io.sat_ui.new_freq_name)
+                .desired_width(160.0)
+                .hint_text("name"),
+        );
+        if ui.button("+ Satellite").clicked() {
+            match io.sat_ui.new_freq_id.trim().parse::<u64>() {
+                Ok(id) if id > 0 => {
+                    let name = io.sat_ui.new_freq_name.trim().to_string();
+                    let existed = io.sat_edit.freqs_for(id).is_some();
+                    let entry = io.sat_edit.freqs_for_mut(id, &name);
+                    // Seed from the built-in table when there is one: an entry
+                    // that starts empty shadows it, which reads as the
+                    // frequencies having been deleted.
+                    if !existed {
+                        if let Some(b) = sdroxide_solar::satfreq::builtin_for(id) {
+                            entry.links = b.links.clone();
+                            if entry.name.trim().is_empty() {
+                                entry.name = b.name.clone();
+                            }
+                        } else {
+                            entry.links.push(Default::default());
+                        }
+                    }
+                    io.sat_ui.open_freq = io.sat_edit.freqs.iter().position(|f| f.norad_id == id);
+                    io.sat_ui.new_freq_id.clear();
+                    io.sat_ui.new_freq_name.clear();
+                    io.sat_ui.note.clear();
+                }
+                _ => {
+                    io.sat_ui.note =
+                        "A frequency entry needs the satellite's NORAD catalogue number."
+                            .to_string()
+                }
+            }
+        }
+    });
+}
+
+/// A frequency box that edits an optional passband in place.
+///
+/// Kept as text only while it is being typed into: parsing on every keystroke
+/// would fight a half-typed "145." by turning it into 145.000 under the cursor.
+fn freq_box(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    band: &mut Option<sdroxide_types::Passband>,
+    hint: &str,
+) {
+    let id = ui.id().with(("freqbox", salt));
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| band.map(|b| b.to_string()).unwrap_or_default());
+    let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(110.0).hint_text(hint));
+    if resp.changed() {
+        *band = sdroxide_types::Passband::parse(&text);
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else if resp.lost_focus() {
+        // Drop the in-progress text so the box re-derives from what was
+        // actually stored — a half-typed "145." must not keep showing as if it
+        // were a frequency the table holds.
+        ui.data_mut(|d| d.remove_temp::<String>(id));
+    }
+}
+
 fn settings_wsjtx_tab(
     ui: &mut egui::Ui,
     cfg: &mut sdroxide_types::WsjtxConfig,
@@ -6509,9 +9768,7 @@ fn settings_rigctld_tab(
 ) {
     use sdroxide_types::RigctldConfig;
 
-    ui.label(
-        RichText::new("Hamlib rigctld server").size(14.0).strong().color(crate::theme::CYAN),
-    );
+    ui.label(RichText::new("Hamlib rigctld server").size(14.0).strong().color(crate::theme::CYAN));
     ui.add_space(4.0);
     if !seeded {
         ui.label(
@@ -6594,7 +9851,9 @@ fn settings_rigctld_tab(
         }
         Some(s) => match &s.error {
             Some(e) => {
-                ui.label(RichText::new(format!("Failed: {e}")).color(Color32::from_rgb(230, 90, 80)));
+                ui.label(
+                    RichText::new(format!("Failed: {e}")).color(Color32::from_rgb(230, 90, 80)),
+                );
             }
             None => {
                 ui.label(RichText::new("Not running.").weak());
@@ -6642,9 +9901,11 @@ fn settings_tci_server_tab(
 
     if !seeded {
         ui.label(
-            RichText::new("The TCI server runs alongside the radio engine, so it can only be \
-                           configured from the native app.")
-                .weak(),
+            RichText::new(
+                "The TCI server runs alongside the radio engine, so it can only be \
+                           configured from the native app.",
+            )
+            .weak(),
         );
         return;
     }
@@ -6823,6 +10084,7 @@ impl eframe::App for SdroxideApp {
                     let call = r.call.clone();
                     let adif = auto_upload_adif(&self.net_cfg_edit, &r);
                     self.qso_log.push(r);
+                    self.session_qsos += 1;
                     persist_qso_log(&self.qso_log);
                     // Enrich + optionally upload the freshly logged QSO.
                     self.queue_lookup(call);
@@ -6844,6 +10106,27 @@ impl eframe::App for SdroxideApp {
                         self.fsq_rx_images.truncate(30);
                     }
                 }
+                RadioEvent::HellColumns { seq, rows, cols } => {
+                    self.hell.on_columns(seq, rows, &cols, &self.view.hell, &ctx);
+                }
+                RadioEvent::WefaxLine { image_id, y, gray } => {
+                    self.wefax.push_line(image_id, y, &gray);
+                }
+                RadioEvent::WefaxImage { png, .. } => {
+                    // The engine has already written the file; the gallery entry
+                    // is named by the same rule against the same clock and dial,
+                    // so it carries the date and station the file on disk does.
+                    // A remote client, which has no file, gets the label anyway.
+                    let dial = self.state.rx_freq_hz();
+                    let name = sdroxide_types::WefaxChartMeta {
+                        unix: crate::time::now_unix(),
+                        dial_hz: (dial > 0.0).then_some(dial),
+                    }
+                    .file_name();
+                    self.wefax.add_chart(&ctx, &name, &png);
+                    self.wefax.clear_live();
+                }
+                RadioEvent::WefaxStatus(s) => self.wefax.status = s,
                 RadioEvent::SstvStatus(s) => {
                     // Adopt a *newly* detected RX mode for the next transmit, but
                     // don't re-apply a steady detection every frame — that would
@@ -6856,6 +10139,15 @@ impl eframe::App for SdroxideApp {
                         self.sstv.last_detected = s.detected;
                     }
                     self.sstv.status = s;
+                }
+                RadioEvent::RifpRows { image_id, y, w, h, rows } => {
+                    self.sstv.on_rifp_rows(image_id, y, w, h, &rows, &ctx);
+                }
+                RadioEvent::RifpImage { image_id, meta, png } => {
+                    self.sstv.on_rifp_image(image_id, meta, &png, &ctx);
+                }
+                RadioEvent::RifpStatus(s) => {
+                    self.sstv.rifp = s;
                 }
                 RadioEvent::SkimmerSpots(s) => {
                     // The engine sends the full current set each update; the
@@ -6901,6 +10193,9 @@ impl eframe::App for SdroxideApp {
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.help.open = !self.help.open;
         }
+        // An open manual takes the scrolling keys before the bindings run, so
+        // reading it never tunes the radio at the same time.
+        self.help.grab_keys(&ctx);
         self.control_inputs(&ctx, &mut cmds);
         // Shutting down with a bound key or footswitch still held would
         // otherwise leave the rig transmitting.
@@ -6930,12 +10225,12 @@ impl eframe::App for SdroxideApp {
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new("⚠")
-                                .size(15.0)
-                                .color(Color32::from_rgb(255, 190, 70)),
+                            RichText::new("⚠").size(15.0).color(Color32::from_rgb(255, 190, 70)),
                         );
                         ui.label(
-                            RichText::new(notice).size(13.0).color(Color32::from_rgb(240, 220, 180)),
+                            RichText::new(notice)
+                                .size(13.0)
+                                .color(Color32::from_rgb(240, 220, 180)),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Dismiss").clicked() {
@@ -6947,6 +10242,9 @@ impl eframe::App for SdroxideApp {
         }
         // Network-spot overlay (shared by voice + digital panadapter paths). A
         // clicked spot is captured here and pre-filled into a log entry below.
+        // The broadcast stations are refreshed first, before anything reads
+        // them: the overlay here, the SPOTS list and the world map all do.
+        self.refresh_broadcast_spots(now_unix());
         let (net_spots, net_alpha) = self.net_overlay(now_unix());
         let mut clicked_spot: Option<Spot> = None;
         // Remaining space: the panadapter (+ FT8/FT4 operating panel).
@@ -6987,9 +10285,23 @@ impl eframe::App for SdroxideApp {
                     self.digi_status.as_ref().map(|s| s.config.thor_mode.baud()).unwrap_or(15.625);
                 let bw = 18.0 * baud;
                 vec![audio_hz - bw / 2.0, audio_hz + bw / 2.0]
+            } else if mode == Mode::Js8 {
+                // Worth showing: Turbo's 160 Hz footprint against Slow's 25 Hz
+                // is what decides whether a frequency is actually free.
+                let bw = self
+                    .digi_status
+                    .as_ref()
+                    .and_then(|s| s.js8.as_ref())
+                    .map_or(50.0, |j| j.speed.bandwidth_hz());
+                vec![audio_hz, audio_hz + bw]
             } else if mode == Mode::Fsq {
                 let baud = self.digi_status.as_ref().map(|s| s.config.fsq_baud).unwrap_or(4.5);
                 let bw = 33.0 * baud;
+                vec![audio_hz - bw / 2.0, audio_hz + bw / 2.0]
+            } else if mode == Mode::Hell {
+                let v =
+                    self.digi_status.as_ref().map(|s| s.config.hell_variant).unwrap_or_default();
+                let bw = v.bandwidth_hz() as f32;
                 vec![audio_hz - bw / 2.0, audio_hz + bw / 2.0]
             } else if mode == Mode::RfPaint {
                 // The painting band edges (300..3300 Hz).
@@ -7029,6 +10341,13 @@ impl eframe::App for SdroxideApp {
                     &mut self.spec_smooth,
                     &mut self.trace_cache,
                     Some(audio_hz),
+                    if mode == Mode::Ft8 {
+                        self.digi_status.as_ref().map(|s| s.config.dxped_mode).unwrap_or_default()
+                    } else {
+                        sdroxide_types::DxpedMode::Normal
+                    },
+                    mode.is_slotted()
+                        && self.digi_status.as_ref().map(|s| s.config.auto_tx_freq).unwrap_or(true),
                     &markers,
                     &ft8_spots,
                     &ft8_alpha,
@@ -7041,30 +10360,16 @@ impl eframe::App for SdroxideApp {
                 );
             });
             // Resize handle between the waterfall and the FT8/FT4 panel.
-            let (hrect, hresp) =
-                ui.allocate_exact_size(egui::vec2(width, handle_h), egui::Sense::click_and_drag());
-            if hresp.hovered() || hresp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            }
+            let hresp = crate::chrome::split_handle(
+                ui,
+                egui::vec2(width, handle_h),
+                Some(crate::theme::PANEL),
+            );
             if hresp.dragged() {
                 // Drag down shrinks the panel (waterfall grows), drag up grows it.
                 let d = hresp.drag_delta().y / total;
                 self.view.digi_panel_fraction =
                     (self.view.digi_panel_fraction - d).clamp(0.2, 0.82);
-            }
-            {
-                let p = ui.painter_at(hrect);
-                let hot = hresp.hovered() || hresp.dragged();
-                p.rect_filled(hrect, 0.0, crate::theme::PANEL);
-                let col = if hot { crate::theme::CYAN } else { Color32::from_gray(70) };
-                let cx = hrect.center().x;
-                let cy = hrect.center().y;
-                for dx in [-16.0f32, 0.0, 16.0] {
-                    p.line_segment(
-                        [egui::pos2(cx + dx - 6.0, cy), egui::pos2(cx + dx + 6.0, cy)],
-                        egui::Stroke::new(2.0, col),
-                    );
-                }
             }
             ui.allocate_ui(egui::vec2(width, panel_h), |ui| {
                 egui::Frame::new()
@@ -7074,14 +10379,20 @@ impl eframe::App for SdroxideApp {
                         crate::chrome::angled_frame(ui, crate::theme::PINK, |ui| {
                             if mode.is_rade() {
                                 self.rade_panel(ui, &mut cmds, panel_h);
-                            } else if mode.is_sstv() {
-                                self.sstv_panel(ui, &mut cmds);
+                            } else if mode.is_wefax() {
+                                self.wefax_panel(ui, &mut cmds, panel_h);
+                            } else if mode.is_image() {
+                                self.image_panel(ui, &mut cmds, mode);
                             } else if mode.is_rf_paint() {
                                 self.rf_paint_panel(ui, &mut cmds, panel_h);
                             } else if mode.is_fsq() {
                                 self.fsq_panel(ui, &mut cmds, panel_h);
+                            } else if mode.is_hell() {
+                                self.hell_panel(ui, &mut cmds, panel_h);
                             } else if is_text {
                                 self.text_modem_panel(ui, &mut cmds, panel_h);
+                            } else if mode.is_js8() {
+                                self.js8_panel(ui, &mut cmds, panel_h);
                             } else {
                                 self.digi_panel(ui, &mut cmds);
                             }
@@ -7132,11 +10443,16 @@ impl eframe::App for SdroxideApp {
         self.spots_window(&ctx, &mut cmds);
         self.awards_window(&ctx);
         self.help.ui(&ctx);
+        // Last, so it lands on top of everything else that opened this frame.
+        self.oob_tx_window(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let grid = self.my_grid();
             let traffic = self.digi_traffic(ctx.input(|i| i.time));
-            self.solar.viewport(&ctx, &grid, traffic);
+            // Only while the window is open: walking the whole logbook is not
+            // free, and the closed window has nothing to paint it on.
+            let awards = if self.solar.open { self.award_heat() } else { Default::default() };
+            self.solar.viewport(&ctx, &grid, traffic, awards, std::sync::Arc::clone(&self.sat_cfg));
             self.view.solar3d = self.solar.persisted();
         }
 
@@ -7244,6 +10560,48 @@ fn persist_ui_settings(_ui: &sdroxide_types::UiSettings) {
     // Written by eframe's periodic `save()` into localStorage.
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn load_sat_config() -> sdroxide_types::SatConfig {
+    sdroxide_config::load_sat_config()
+}
+/// The browser tab has no satellite tracker of its own — the solar view there
+/// is fed by the server's relay — so there is nothing to configure and nothing
+/// to load.
+#[cfg(target_arch = "wasm32")]
+fn load_sat_config() -> sdroxide_types::SatConfig {
+    Default::default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_sat_config(cfg: &sdroxide_types::SatConfig) {
+    if let Err(e) = sdroxide_config::save_sat_config(cfg) {
+        eprintln!("failed to save the satellite config: {e}");
+    }
+}
+
+// ── Broadcast stations (native: seeded config-dir JSON; wasm: the bundled table)
+#[cfg(not(target_arch = "wasm32"))]
+fn load_broadcast_stations() -> Vec<sdroxide_types::BroadcastStation> {
+    sdroxide_config::load_broadcast_stations()
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn restore_bundled_broadcast_stations() {
+    if let Err(e) = sdroxide_config::restore_bundled_broadcast_stations() {
+        eprintln!("failed to restore the bundled broadcast station list: {e}");
+    }
+}
+
+/// The browser tab has no config directory to seed, so it gets the table
+/// compiled into the wasm bundle — the same data, just not editable there.
+#[cfg(target_arch = "wasm32")]
+fn load_broadcast_stations() -> Vec<sdroxide_types::BroadcastStation> {
+    sdroxide_types::broadcast::builtin().to_vec()
+}
+#[cfg(target_arch = "wasm32")]
+fn restore_bundled_broadcast_stations() {}
+#[cfg(target_arch = "wasm32")]
+fn persist_sat_config(_cfg: &sdroxide_types::SatConfig) {}
+
 use crate::time::{now_unix, now_unix_f64};
 
 /// Parse `"YYYY-MM-DD"` + `"HH:MM"` (UTC) to a Unix timestamp, falling back to
@@ -7285,8 +10643,89 @@ fn fmt_age(secs: i64) -> String {
     }
 }
 
+/// The broadcast-station block on the Spots settings tab: where the list lives,
+/// and the two things that can be done to it from here.
+#[cfg(not(target_arch = "wasm32"))]
+fn broadcast_stations_settings(ui: &mut egui::Ui, reload: &mut bool, restore: &mut bool) {
+    let path = sdroxide_config::broadcast_stations_path();
+    ui.label(
+        RichText::new(
+            "The longwave and shortwave stations labelled on the waterfall. Seeded from the \
+             bundled list on first run, then yours to edit — sdroxide never overwrites it.",
+        )
+        .weak(),
+    );
+    if let Ok(p) = &path {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(p.display().to_string()).monospace().size(10.5).color(
+                        Color32::from_gray(150),
+                    ),
+                )
+                .truncate(),
+            );
+        });
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("Reload")
+            .on_hover_text("Re-read the file after editing it")
+            .clicked()
+        {
+            *reload = true;
+        }
+        if ui
+            .button("Restore bundled list")
+            .on_hover_text("Replace the file with the one shipped in this build (the old one is kept as .json.bak)")
+            .clicked()
+        {
+            *restore = true;
+        }
+    });
+}
+
+/// The browser client reads the table compiled into the wasm bundle, so there is
+/// no file to point at and nothing to reload.
+#[cfg(target_arch = "wasm32")]
+fn broadcast_stations_settings(ui: &mut egui::Ui, _reload: &mut bool, _restore: &mut bool) {
+    ui.label(
+        RichText::new(
+            "The broadcast stations labelled on the waterfall come from the list built into \
+             this build. Editing them needs the desktop app.",
+        )
+        .weak(),
+    );
+}
+
+/// Everything about a spot the search box should be able to find it by.
+///
+/// The frequency goes in twice, as kHz and as MHz, because a shortwave listener
+/// thinks in `9420` and a ham in `9.420` and both should work. The kind label is
+/// in there too, so typing `bc` narrows to the broadcast stations without having
+/// to reach for the chips.
+fn spot_haystack(s: &Spot) -> String {
+    let mut h = String::with_capacity(96);
+    h.push_str(&s.call);
+    for extra in [
+        s.kind.label(),
+        &s.mode,
+        &s.comment,
+        s.reference.as_deref().unwrap_or(""),
+        &s.spotter,
+        s.grid.as_deref().unwrap_or(""),
+    ] {
+        if !extra.is_empty() {
+            h.push(' ');
+            h.push_str(extra);
+        }
+    }
+    h.push_str(&format!(" {:.0} {:.4}", s.freq_hz / 1e3, s.freq_hz / 1e6));
+    h
+}
+
 /// One clickable spot row for the spots window: kind badge, call, frequency,
-/// mode, age, and the park/summit reference or comment.
+/// mode, age or schedule, and the park/summit/transmitter reference or comment.
 fn spot_row(ui: &mut egui::Ui, s: &Spot, now_utc: i64, needed: bool) -> egui::Response {
     let (r, g, b) = s.kind.color();
     let kind_col = Color32::from_rgb(r, g, b);
@@ -7308,10 +10747,16 @@ fn spot_row(ui: &mut egui::Ui, s: &Spot, now_utc: i64, needed: bool) -> egui::Re
                     )
                     .add(lbl);
                 };
-                col(ui, 44.0, egui::Label::new(RichText::new(s.kind.label()).size(10.0).strong().color(kind_col)));
                 col(
                     ui,
-                    90.0,
+                    44.0,
+                    egui::Label::new(
+                        RichText::new(s.kind.label()).size(10.0).strong().color(kind_col),
+                    ),
+                );
+                col(
+                    ui,
+                    132.0,
                     egui::Label::new(
                         RichText::new(&s.call).size(14.0).strong().color(crate::theme::TEXT_STRONG),
                     )
@@ -7321,11 +10766,29 @@ fn spot_row(ui: &mut egui::Ui, s: &Spot, now_utc: i64, needed: bool) -> egui::Re
                     ui,
                     78.0,
                     egui::Label::new(
-                        RichText::new(format!("{:.4}", s.freq_hz / 1e6)).monospace().size(12.0).color(gray),
+                        RichText::new(format!("{:.4}", s.freq_hz / 1e6))
+                            .monospace()
+                            .size(12.0)
+                            .color(gray),
                     ),
                 );
-                col(ui, 46.0, egui::Label::new(RichText::new(&s.mode).monospace().size(11.0).color(gray)));
-                col(ui, 34.0, egui::Label::new(RichText::new(fmt_age(now_utc - s.when_utc)).size(10.5).color(Color32::from_gray(120))));
+                col(
+                    ui,
+                    46.0,
+                    egui::Label::new(RichText::new(&s.mode).monospace().size(11.0).color(gray)),
+                );
+                // A broadcast station is not a report that ages: it carries its
+                // schedule (`"24h"`, `"1800-2100"`) in this column instead.
+                let when = if s.kind == SpotKind::Broadcast {
+                    s.spotter.clone()
+                } else {
+                    fmt_age(now_utc - s.when_utc)
+                };
+                col(
+                    ui,
+                    76.0,
+                    egui::Label::new(RichText::new(when).size(10.5).color(Color32::from_gray(120))),
+                );
                 if needed {
                     col(
                         ui,
@@ -7405,6 +10868,18 @@ fn digi_freq_for_band(mode: Mode, band: Band) -> Option<f64> {
 
 fn digi_dial_freqs(mode: Mode) -> &'static [(&'static str, f64)] {
     match mode {
+        // JS8 conventional dials; signals sit in the ~3 kHz above each.
+        Mode::Js8 => &[
+            ("160m", 1_842_000.0),
+            ("80m", 3_578_000.0),
+            ("40m", 7_078_000.0),
+            ("30m", 10_130_000.0),
+            ("20m", 14_078_000.0),
+            ("17m", 18_104_000.0),
+            ("15m", 21_078_000.0),
+            ("12m", 24_922_000.0),
+            ("10m", 28_078_000.0),
+        ],
         // PSK31 activity centres (USB dial; signals sit ~1 kHz above).
         Mode::Psk => &[
             ("80m", 3_580_000.0),
@@ -7483,8 +10958,45 @@ fn digi_dial_freqs(mode: Mode) -> &'static [(&'static str, f64)] {
             ("15m", 21_105_000.0),
             ("10m", 28_105_000.0),
         ],
+        // Hellschreiber (USB dial), from hellschreiber.com's narrow-band digimode
+        // band plan of 18 March 2019 — its "common calling & operating" column,
+        // taking IARU Region 1 where that column is split, to match the Region 1
+        // defaults `Band::edges` already uses.
+        //
+        // Two deliberate departures, on 15 m and 10 m: that table's own calling
+        // frequencies there (21074 / 28074) fall *outside* the operating ranges
+        // it lists in the same cell, and both sit exactly on the FT8 sub-band.
+        // The range starts are used instead — internally consistent, clear of
+        // FT8, and what the Feld Hell Club lists. 6 m is not in that table at
+        // all, so it keeps the club's figure.
+        Mode::Hell => &[
+            ("160m", 1_840_000.0),
+            ("80m", 3_574_000.0),
+            ("60m", 5_351_500.0),
+            ("40m", 7_040_000.0),
+            ("30m", 10_144_000.0),
+            ("20m", 14_073_000.0),
+            ("17m", 18_104_000.0),
+            ("15m", 21_063_000.0),
+            ("12m", 24_924_000.0),
+            ("10m", 28_063_000.0),
+            ("6m", 50_286_000.0),
+        ],
         // RF Paint has no defined calling frequency — offer no band presets.
         Mode::RfPaint => &[],
+        // RIFP assigns no frequency at all: 433.92 MHz is the deployment
+        // example the draft names, and the others are the middle of the
+        // segments where a 25 kHz channel is a realistic thing to ask for
+        // (10 m FM and the 6 m all-modes part). The dial is the signal's
+        // *centre* here, not its lower edge as in every mode above.
+        Mode::Rifp => &[
+            ("10m", 29_600_000.0),
+            ("6m", 51_250_000.0),
+            // The 2 m image/facsimile corner: 144.700 is the FAX calling
+            // frequency, inside the all-modes segment.
+            ("2m", 144_700_000.0),
+            ("70cm", sdroxide_types::RIFP_CALLING_HZ),
+        ],
         // FT8 (and default).
         _ => &[
             ("160m", 1_840_000.0),
@@ -7535,6 +11047,132 @@ fn pick_levels(bins: &[u8], db_floor: f32, db_ceil: f32) -> Option<(f32, f32)> {
         ceil = (floor + 10.0).min(20.0);
     }
     Some((floor, ceil))
+}
+
+/// The hover card behind a decode row: everything the entity file, the log and
+/// the operator's own grid already know about this station, said in full.
+///
+/// The row can only afford a callsign, a grid and two numbers; all of this is
+/// resolved for it anyway, so the card costs nothing but the space to show it.
+#[allow(clippy::too_many_arguments)]
+fn station_card(
+    ui: &mut egui::Ui,
+    d: &Decode,
+    entity: Option<sdroxide_types::EntityInfo>,
+    dist_km: Option<f64>,
+    my_grid: &str,
+    novelty: sdroxide_types::Novelty,
+    band: &str,
+    queued: bool,
+    cq_for_us: bool,
+) {
+    ui.set_max_width(300.0);
+    let dim = Color32::from_gray(140);
+    match d.from.as_deref() {
+        Some(call) => {
+            ui.label(RichText::new(call).size(16.0).strong().color(crate::theme::TEXT_STRONG));
+        }
+        None if d.free_text => {
+            ui.label(RichText::new("free text").size(13.0).italics().color(dim));
+        }
+        // A hashed callsign nobody on this receiver has heard in full yet.
+        None => {
+            ui.label(RichText::new("hashed callsign, not yet heard in full").size(13.0).color(dim));
+        }
+    }
+
+    match entity {
+        Some(e) => {
+            ui.label(
+                RichText::new(e.name)
+                    .size(13.0)
+                    .strong()
+                    .color(crate::theme::continent_color(e.continent)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} · CQ zone {} · ITU zone {}",
+                    e.continent, e.cq_zone, e.itu_zone
+                ))
+                .size(11.5)
+                .color(dim),
+            );
+        }
+        None if d.from.is_some() => {
+            ui.label(RichText::new("entity unknown").size(11.5).color(dim));
+        }
+        None => {}
+    }
+
+    // Where they are, from their grid: distance and the beam heading to point.
+    if let Some(g) = d.grid.as_deref() {
+        let bearing =
+            (!my_grid.is_empty()).then(|| sdroxide_types::grid_bearing(my_grid, g)).flatten();
+        let mut line = g.to_string();
+        if let Some(km) = dist_km {
+            line.push_str(&format!(" · {km:.0} km"));
+        }
+        if let Some(b) = bearing {
+            line.push_str(&format!(" · {b:.0}°"));
+        }
+        ui.label(RichText::new(line).size(12.0).color(crate::theme::YELLOW));
+    }
+
+    ui.separator();
+    // Worked before? The one thing that decides whether this decode is worth
+    // acting on, spelled out rather than compressed into a four-letter badge.
+    let band_label = if band.is_empty() { "this band".to_string() } else { band.to_string() };
+    let (worked, col) = if novelty.new_dxcc {
+        ("New entity — never worked, on any band".to_string(), crate::theme::PINK)
+    } else if novelty.new_dxcc_band {
+        (format!("New entity on {band_label}"), crate::theme::YELLOW)
+    } else if novelty.new_grid {
+        ("New grid square".to_string(), crate::theme::CYAN)
+    } else if novelty.new_call {
+        ("Not worked before".to_string(), crate::theme::CYAN_DIM)
+    } else if novelty.dupe {
+        (format!("Worked before on {band_label}"), Color32::from_gray(130))
+    } else {
+        ("Worked before, but not on this band".to_string(), Color32::from_gray(150))
+    };
+    ui.label(RichText::new(worked).size(12.0).color(col));
+
+    if let Some(target) = d.cq_to.as_deref() {
+        ui.label(
+            RichText::new(if cq_for_us {
+                format!("Calling CQ {target} — that includes you")
+            } else {
+                format!("Calling CQ {target} — not aimed at you")
+            })
+            .size(11.5)
+            .color(if cq_for_us { crate::theme::GREEN } else { dim }),
+        );
+    }
+    if queued {
+        ui.label(RichText::new("In the call queue").size(11.5).color(crate::theme::GREEN));
+    }
+    ui.label(
+        RichText::new(format!("{:+} dB · {:.0} Hz · DT {:+.1} s", d.snr_db, d.audio_hz, d.dt))
+            .size(11.0)
+            .monospace()
+            .color(dim),
+    );
+}
+
+/// One fixed-width column of a station row, shared by the FT8 decode list and
+/// the JS8 heard list so the two line up field for field.
+///
+/// The width is *reserved*, not requested: a plain `allocate_ui` shrinks to its
+/// content, so a short callsign would collapse the column and shift everything
+/// after it out of alignment down the list.
+fn row_cell(ui: &mut egui::Ui, w: f32, h: f32, align_right: bool, lbl: egui::Label) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout)).add(lbl);
 }
 
 /// Colour a decode's SNR: green for strong, cyan mid, dimmed for weak.
@@ -7602,13 +11240,30 @@ struct SstvSlot {
 #[allow(dead_code)] // not used on wasm
 struct SstvRecv {
     mode: Option<SstvMode>,
+    /// Where a RIFP picture came from and how it was carried, for the caption
+    /// under the enlarged view. `None` for SSTV, which carries no metadata.
+    rifp: Option<RifpMeta>,
     tex: egui::TextureHandle,
 }
 
-/// SSTV panel state: received gallery, in-progress incoming image, transmit
-/// slots, the overlay message, the current mode, and cached textures.
+/// Image-panel state, shared by SSTV and RIFP: received gallery, in-progress
+/// incoming picture, transmit slots, the overlay message, the current mode, and
+/// cached textures.
+///
+/// One workspace for both modes on purpose. The pictures an operator wants to
+/// send, the captions on them, and the pictures that came back are the same
+/// things whichever protocol carried them; only the control strip and the
+/// transmit sizing differ.
 struct SstvUi {
     tx_mode: SstvMode,
+    /// Latest RIFP engine status (transfer progress, sessions, counters).
+    rifp: RifpStatus,
+    /// Size of the picture currently arriving, so the live canvas can be built
+    /// before the whole object is in. `(0, 0)` when nothing is arriving.
+    rx_dims: (u16, u16),
+    /// Size the cached preview was composed at, so a change of transmit size
+    /// rebuilds it.
+    preview_dims: (u16, u16),
     /// Operator callsign for the transmit-image header (mirrors the digi config).
     callsign: String,
     /// Auto mode: RX auto-detects the mode; TX defaults to Martin 1 until a mode
@@ -7643,6 +11298,9 @@ impl Default for SstvUi {
     fn default() -> Self {
         SstvUi {
             tx_mode: SstvMode::Martin1,
+            rifp: RifpStatus::default(),
+            rx_dims: (0, 0),
+            preview_dims: (0, 0),
             callsign: String::new(),
             auto: true,
             slot_messages: vec![String::new(); 5],
@@ -7671,7 +11329,8 @@ impl SstvUi {
         let (w, h) = mode.dimensions();
         if self.rx_id != id || self.rx_color.is_none() {
             self.rx_id = id;
-            self.rx_color = Some(crate::sstv::color_image(&vec![0u8; w as usize * h as usize * 3], w, h));
+            self.rx_color =
+                Some(crate::sstv::color_image(&vec![0u8; w as usize * h as usize * 3], w, h));
         }
         let Some(ci) = self.rx_color.as_mut() else { return };
         let (w, h) = (w as usize, h as usize);
@@ -7681,20 +11340,64 @@ impl SstvUi {
                 ci.pixels[row + x] = Color32::from_rgb(rgb[x * 3], rgb[x * 3 + 1], rgb[x * 3 + 2]);
             }
         }
-        self.rx_tex =
-            Some(ctx.load_texture("sstv_rx", ci.clone(), egui::TextureOptions::NEAREST));
+        self.rx_tex = Some(ctx.load_texture("sstv_rx", ci.clone(), egui::TextureOptions::NEAREST));
     }
 
     /// A completed image arrived: decode and add it to the gallery.
-    fn on_image(&mut self, _id: u32, mode: SstvMode, _w: u16, _h: u16, png: &[u8], ctx: &egui::Context) {
+    fn on_image(
+        &mut self,
+        _id: u32,
+        mode: SstvMode,
+        _w: u16,
+        _h: u16,
+        png: &[u8],
+        ctx: &egui::Context,
+    ) {
         if let Some((rgb, w, h)) = crate::sstv::decode_image(png) {
             let ci = crate::sstv::color_image(&rgb, w, h);
             let tex = ctx.load_texture("sstv_recv", ci, egui::TextureOptions::NEAREST);
-            self.received.insert(0, SstvRecv { mode: Some(mode), tex });
+            self.received.insert(0, SstvRecv { mode: Some(mode), rifp: None, tex });
             self.received.truncate(60);
         }
         self.rx_color = None;
         self.rx_tex = None;
+    }
+
+    /// RIFP: reassembled raster rows arrived — paint them into the live
+    /// picture. Only the unencoded raster gets here; everything else appears
+    /// whole in [`SstvUi::on_rifp_image`].
+    fn on_rifp_rows(&mut self, id: u32, y: u16, w: u16, h: u16, gray: &[u8], ctx: &egui::Context) {
+        if self.rx_id != id || self.rx_color.is_none() || self.rx_dims != (w, h) {
+            self.rx_id = id;
+            self.rx_dims = (w, h);
+            self.rx_color =
+                Some(crate::sstv::color_image(&vec![0u8; w as usize * h as usize * 3], w, h));
+        }
+        let Some(ci) = self.rx_color.as_mut() else { return };
+        let (wu, hu) = (w as usize, h as usize);
+        for (row, pixels) in gray.chunks_exact(wu).enumerate() {
+            let y = y as usize + row;
+            if y >= hu {
+                break;
+            }
+            for (x, &g) in pixels.iter().enumerate() {
+                ci.pixels[y * wu + x] = Color32::from_gray(g);
+            }
+        }
+        self.rx_tex = Some(ctx.load_texture("rifp_rx", ci.clone(), egui::TextureOptions::NEAREST));
+    }
+
+    /// RIFP: a complete, digest-verified picture arrived.
+    fn on_rifp_image(&mut self, _id: u32, meta: RifpMeta, png: &[u8], ctx: &egui::Context) {
+        if let Some((rgb, w, h)) = crate::sstv::decode_image(png) {
+            let ci = crate::sstv::color_image(&rgb, w, h);
+            let tex = ctx.load_texture("rifp_recv", ci, egui::TextureOptions::NEAREST);
+            self.received.insert(0, SstvRecv { mode: None, rifp: Some(meta), tex });
+            self.received.truncate(60);
+        }
+        self.rx_color = None;
+        self.rx_tex = None;
+        self.rx_dims = (0, 0);
     }
 
     /// The overlay message for the slot currently being edited.
@@ -7707,8 +11410,10 @@ impl SstvUi {
         sstv_save_messages(&self.slot_messages);
     }
 
-    /// Rebuild the transmit preview when the mode, slot, or message changed.
-    fn ensure_preview(&mut self, ctx: &egui::Context) {
+    /// Rebuild the transmit preview when the size, slot, or message changed.
+    /// `dims` is the transmitted picture size — the SSTV line format's, or the
+    /// operator's chosen RIFP size.
+    fn ensure_preview(&mut self, dims: (u16, u16), ctx: &egui::Context) {
         if !self.preview_dirty {
             return;
         }
@@ -7717,7 +11422,8 @@ impl SstvUi {
         match self.slots.get(self.selected_slot).and_then(|s| s.as_ref()) {
             Some(slot) => {
                 let (rgb, w, h) = crate::sstv::compose(
-                    self.tx_mode,
+                    dims.0,
+                    dims.1,
                     &slot.src_rgb,
                     slot.sw,
                     slot.sh,
@@ -7733,10 +11439,11 @@ impl SstvUi {
     }
 
     /// The composed PNG for the current selection, for transmit.
-    fn compose_png(&self) -> Option<Vec<u8>> {
+    fn compose_png(&self, dims: (u16, u16)) -> Option<Vec<u8>> {
         let slot = self.slots.get(self.selected_slot).and_then(|s| s.as_ref())?;
         let (rgb, w, h) = crate::sstv::compose(
-            self.tx_mode,
+            dims.0,
+            dims.1,
             &slot.src_rgb,
             slot.sw,
             slot.sh,
@@ -7761,8 +11468,12 @@ impl SstvUi {
 }
 
 impl SdroxideApp {
-    fn sstv_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+    /// The image panel, shared by SSTV and RIFP: a live picture and a gallery
+    /// on the left, a transmit compositor on the right, and a control strip
+    /// that is the only part either mode owns alone.
+    fn image_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, mode: Mode) {
         let ctx = ui.ctx().clone();
+        let rifp = mode.is_rifp();
         self.sstv_load_disk_once(&ctx);
         // Drain a completed file-pick (only consume the target once bytes arrive).
         let picked = self.sstv.inbox.lock().ok().and_then(|mut g| g.take());
@@ -7776,11 +11487,26 @@ impl SdroxideApp {
             self.sstv.callsign = self.digi_cfg_edit.my_call.clone();
             self.sstv.preview_dirty = true;
         }
-        self.sstv.ensure_preview(&ctx);
+        // The transmitted size: SSTV's line format fixes it, RIFP leaves it to
+        // the operator. Changing it invalidates the composed preview.
+        let dims = if rifp {
+            self.digi_cfg_edit.rifp_size.dimensions()
+        } else {
+            self.sstv.tx_mode.dimensions()
+        };
+        if self.sstv.preview_dims != dims {
+            self.sstv.preview_dims = dims;
+            self.sstv.preview_dirty = true;
+        }
+        self.sstv.ensure_preview(dims, &ctx);
         ctx.request_repaint_after(Duration::from_millis(120));
 
         let st = self.sstv.status;
-        let tx_active = st.tx_active;
+        let (signal, tx_active, progress) = if rifp {
+            (self.sstv.rifp.signal, self.sstv.rifp.tx_active, self.sstv.rifp.tx_progress)
+        } else {
+            (st.signal, st.tx_active, st.progress)
+        };
 
         // Whole-panel size. The mode/signal/slant controls sit in a boxed strip
         // on the left above LIVE + RECEIVED; the transmit compositor spans the
@@ -7816,6 +11542,10 @@ impl SdroxideApp {
                         .show(ui, |ui| {
                             ui.set_min_width(left_w - 16.0);
                             ui.set_max_width(left_w - 16.0);
+                            if rifp {
+                                self.rifp_controls(ui, cmds);
+                                return;
+                            }
 
                             // Mode selection: Auto + the per-mode chips.
                             ui.horizontal_wrapped(|ui| {
@@ -7825,6 +11555,7 @@ impl SdroxideApp {
                                         .strong()
                                         .color(crate::theme::CYAN),
                                 );
+                                self.digi_freq_chip(ui, cmds);
                                 let auto_label = if self.sstv.auto {
                                     format!("Auto ({})", self.sstv.tx_mode.label())
                                 } else {
@@ -7851,10 +11582,10 @@ impl SdroxideApp {
                             // Signal meter + activity, and the TX-slant trim.
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Signal").size(10.0).weak());
-                                sstv_level_bar(ui, st.signal);
+                                sstv_level_bar(ui, signal);
                                 if tx_active {
                                     ui.label(
-                                        RichText::new(format!("● TX {:.0}%", st.progress * 100.0))
+                                        RichText::new(format!("● TX {:.0}%", progress * 100.0))
                                             .size(11.0)
                                             .strong()
                                             .color(crate::theme::PINK),
@@ -7920,7 +11651,11 @@ impl SdroxideApp {
                                             .max_width(live_w - 16.0),
                                     );
                                 } else {
-                                    let msg = if st.signal > 0.0008 {
+                                    let msg = if rifp {
+                                        // RIFP only paints live from the raw
+                                        // raster; anything else appears whole.
+                                        "waiting for a picture…"
+                                    } else if signal > 0.0008 {
                                         "waiting for a signal…"
                                     } else {
                                         "no / low audio"
@@ -7930,30 +11665,13 @@ impl SdroxideApp {
                             });
                         });
                         // Draggable vertical divider between LIVE and RECEIVED.
-                        let (hrect, hresp) = ui.allocate_exact_size(
-                            egui::vec2(handle_w, row_h),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if hresp.hovered() || hresp.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        }
+                        let hresp =
+                            crate::chrome::split_handle(ui, egui::vec2(handle_w, row_h), None);
                         if hresp.dragged() {
                             // Dragging right shrinks the gallery (grows LIVE).
                             let d = hresp.drag_delta().x / left_w.max(1.0);
                             self.view.sstv_gallery_fraction =
                                 (self.view.sstv_gallery_fraction - d).clamp(0.2, 0.6);
-                        }
-                        {
-                            let p = ui.painter_at(hrect);
-                            let hot = hresp.hovered() || hresp.dragged();
-                            let col = if hot { crate::theme::CYAN } else { Color32::from_gray(70) };
-                            let (cx, cy) = (hrect.center().x, hrect.center().y);
-                            for dy in [-16.0f32, 0.0, 16.0] {
-                                p.line_segment(
-                                    [egui::pos2(cx, cy + dy - 6.0), egui::pos2(cx, cy + dy + 6.0)],
-                                    egui::Stroke::new(2.0, col),
-                                );
-                            }
                         }
 
                         // RECEIVED: narrow multi-column gallery of decoded pictures.
@@ -7996,27 +11714,11 @@ impl SdroxideApp {
 
             // Draggable vertical divider between the receive side and the
             // TRANSMIT (send) column — mirrors the FT8 decode/QSO splitter.
-            let (hrect, hresp) =
-                ui.allocate_exact_size(egui::vec2(handle_w, full_h), egui::Sense::click_and_drag());
-            if hresp.hovered() || hresp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
+            let hresp = crate::chrome::split_handle(ui, egui::vec2(handle_w, full_h), None);
             if hresp.dragged() {
                 // Dragging right shrinks the TX column (grows the receive side).
                 let d = hresp.drag_delta().x / avail.x.max(1.0);
                 self.view.sstv_tx_fraction = (self.view.sstv_tx_fraction - d).clamp(0.22, 0.6);
-            }
-            {
-                let p = ui.painter_at(hrect);
-                let hot = hresp.hovered() || hresp.dragged();
-                let col = if hot { crate::theme::CYAN } else { Color32::from_gray(70) };
-                let (cx, cy) = (hrect.center().x, hrect.center().y);
-                for dy in [-16.0f32, 0.0, 16.0] {
-                    p.line_segment(
-                        [egui::pos2(cx, cy + dy - 6.0), egui::pos2(cx, cy + dy + 6.0)],
-                        egui::Stroke::new(2.0, col),
-                    );
-                }
             }
 
             // ── RIGHT: transmit compositor, full height ──
@@ -8188,8 +11890,12 @@ impl SdroxideApp {
                             .inner;
                         if tx.clicked() {
                             self.sstv.save_messages(); // capture any unfocused edit
-                            if let Some(png) = self.sstv.compose_png() {
-                                cmds.push(Command::SstvTx { mode: self.sstv.tx_mode, png });
+                            if let Some(png) = self.sstv.compose_png(dims) {
+                                cmds.push(if rifp {
+                                    Command::RifpTx { png }
+                                } else {
+                                    Command::SstvTx { mode: self.sstv.tx_mode, png }
+                                });
                             }
                         }
                         ui.add_space(8.0);
@@ -8230,6 +11936,33 @@ impl SdroxideApp {
                         let avail_w = ui.available_width().min(1000.0);
                         let scale = (avail_w / native.x.max(1.0)).clamp(1.0, 4.0);
                         ui.add(egui::Image::new(&r.tex).fit_to_exact_size(native * scale));
+                        // RIFP knows where a picture came from and how it was
+                        // carried; SSTV knows none of that, and says nothing.
+                        if let Some(m) = &r.rifp {
+                            ui.add_space(4.0);
+                            let from = m.sender.as_deref().unwrap_or("unidentified");
+                            ui.label(
+                                RichText::new(format!(
+                                    "{from} · {} · {}×{} {}-bit · {} / {} · {} octets in {} chunks \
+                                     ({} first pass) · session {}",
+                                    m.filename,
+                                    m.width,
+                                    m.height,
+                                    m.bits_per_pixel,
+                                    m.media_type,
+                                    m.content_encoding,
+                                    m.encoded_size,
+                                    m.chunk_count,
+                                    m.chunks_first_pass,
+                                    m.session,
+                                ))
+                                .size(10.5)
+                                .weak(),
+                            );
+                            if let Some(hint) = &m.hint {
+                                ui.label(RichText::new(hint).size(11.0).italics());
+                            }
+                        }
                     });
             } else {
                 open = false;
@@ -8237,6 +11970,239 @@ impl SdroxideApp {
             if !open {
                 self.sstv.enlarged = None;
             }
+        }
+    }
+
+    /// The RIFP half of the image panel's control strip: profile, picture size
+    /// and encoding, robustness, the transfer readout, and the sessions being
+    /// reassembled.
+    fn rifp_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let st = self.sstv.rifp.clone();
+        let seeded = self.digi_cfg_seeded;
+        let mut changed = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("RIFP").size(12.0).strong().color(crate::theme::CYAN));
+            // Outside the enabled scope: which frequency to sit on has nothing
+            // to do with whether the operator's digi config has loaded yet.
+            self.digi_freq_chip(ui, cmds);
+            ui.add_enabled_ui(seeded, |ui| {
+                for p in RifpProfile::ALL {
+                    let active = self.digi_cfg_edit.rifp_profile == p;
+                    if crate::chrome::chip(ui, active, p.label())
+                        .on_hover_text(format!(
+                            "{} — {:.0} baud CPFSK, ±{:.0} Hz, {:.0} kHz occupied bandwidth",
+                            p.name(),
+                            p.symbol_rate(),
+                            p.deviation_hz(),
+                            p.bandwidth_hz() / 1000.0,
+                        ))
+                        .clicked()
+                        && !active
+                    {
+                        self.digi_cfg_edit.rifp_profile = p;
+                        changed = true;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Size").size(10.0).weak());
+                for s in RifpSize::ALL {
+                    let active = self.digi_cfg_edit.rifp_size == s;
+                    if crate::chrome::chip(ui, active, s.label()).clicked() && !active {
+                        self.digi_cfg_edit.rifp_size = s;
+                        self.sstv.preview_dirty = true;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // The bandwidth warning, and a jump to the calling frequency. RIFP
+        // itself is band-agnostic; what is legal is not.
+        let dial = self.state.rx_freq_hz();
+        ui.horizontal_wrapped(|ui| {
+            let profile = self.digi_cfg_edit.rifp_profile;
+            if profile.fits_at(dial) {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · ~{:.0} kHz occupied · dial is the channel centre",
+                        profile.name(),
+                        profile.bandwidth_hz() / 1000.0,
+                    ))
+                    .size(10.5)
+                    .weak(),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "⚠ {} occupies ~{:.0} kHz — too wide for a narrow-band segment",
+                        profile.name(),
+                        profile.bandwidth_hz() / 1000.0,
+                    ))
+                    .size(10.5)
+                    .strong()
+                    .color(crate::theme::PINK),
+                )
+                .on_hover_text(format!(
+                    "RIFP assigns no frequency, and sdroxide will transmit it wherever you tune. \
+                     A {:.0} kHz channel only fits where wideband or FM operation is allowed — \
+                     {} — and not in a narrow-band segment, least of all on HF. Even inside those \
+                     your own licence conditions may be narrower. You are the operator; check \
+                     your own rules.",
+                    profile.bandwidth_hz() / 1000.0,
+                    profile.wide_segments_text(),
+                ));
+            }
+            if (dial - sdroxide_types::RIFP_CALLING_HZ).abs() > 1.0
+                && crate::chrome::chip(ui, false, "433.920")
+                    .on_hover_text("The calling frequency the draft names")
+                    .clicked()
+            {
+                cmds.push(Command::SetVfo {
+                    vfo: self.state.active_vfo,
+                    hz: sdroxide_types::RIFP_CALLING_HZ,
+                });
+            }
+        });
+        ui.add_space(5.0);
+
+        // Encoding and depth: what the picture is turned into before framing.
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(seeded, |ui| {
+                ui.label(RichText::new("Encode").size(10.0).weak()).on_hover_text(
+                    "How the picture is encoded into the object RIFP carries. Auto tries each and \
+                 sends the smallest.",
+                );
+                for e in RifpEncoding::TX_MENU {
+                    let active = self.digi_cfg_edit.rifp_encoding == e;
+                    let hover = match e.manifest_pair() {
+                        Some((mt, ce)) => format!("{mt} / {ce}"),
+                        None => "Try every encoding, send the smallest (never lossy)".into(),
+                    };
+                    if crate::chrome::chip(ui, active, e.label()).on_hover_text(hover).clicked()
+                        && !active
+                    {
+                        self.digi_cfg_edit.rifp_encoding = e;
+                        changed = true;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Gray").size(10.0).weak()).on_hover_text(
+                "Grayscale depth. RIFP's raster is grayscale by definition — colour has no place \
+                 in its manifest.",
+            );
+                for bits in [1u8, 2, 4, 8] {
+                    let active = self.digi_cfg_edit.rifp_bits_per_pixel == bits;
+                    if crate::chrome::chip(ui, active, &format!("{bits}b")).clicked() && !active {
+                        self.digi_cfg_edit.rifp_bits_per_pixel = bits;
+                        changed = true;
+                    }
+                }
+                let mut dither = self.digi_cfg_edit.rifp_dither;
+                if crate::chrome::chip(ui, dither, "Dither")
+                    .on_hover_text("Diffuse quantisation error — worth it below 8 bits")
+                    .clicked()
+                {
+                    dither = !dither;
+                    self.digi_cfg_edit.rifp_dither = dither;
+                    changed = true;
+                }
+            });
+        });
+        ui.add_space(5.0);
+
+        // Robustness: RIFP has no repair requests, so repetition is the only
+        // recovery there is.
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(seeded, |ui| {
+                ui.label(RichText::new("Repeat data").size(10.0).weak()).on_hover_text(
+                    "Send every data frame this many times. RIFP is one-way with no repair \
+                     requests, so this is the only recovery a receiver gets.",
+                );
+                ui.spacing_mut().slider_width = 90.0;
+                changed |= ui
+                    .add(egui::Slider::new(&mut self.digi_cfg_edit.rifp_data_repeats, 1..=4))
+                    .drag_stopped();
+                ui.label(RichText::new("Chunk").size(10.0).weak())
+                    .on_hover_text("Payload octets per data frame (the profile recommends 192)");
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.digi_cfg_edit.rifp_chunk_size, 32..=1024)
+                            .step_by(16.0),
+                    )
+                    .drag_stopped();
+            });
+            ui.separator();
+            if st.tx_active {
+                ui.label(
+                    RichText::new(format!(
+                        "● TX frame {}/{} · {} s left",
+                        st.tx_frame, st.tx_frames, st.tx_remaining_s
+                    ))
+                    .size(11.0)
+                    .strong()
+                    .color(crate::theme::PINK),
+                );
+            }
+            if let Some(enc) = st.tx_encoding {
+                ui.label(
+                    RichText::new(format!("sent as {} · {} octets", enc.label(), st.tx_bytes))
+                        .size(10.0)
+                        .weak(),
+                );
+            }
+        });
+        ui.add_space(5.0);
+
+        // Counters and the sessions being reassembled.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "frames {} · bad {} · pictures {}",
+                    st.rx_frames, st.rx_bad_frames, st.rx_objects
+                ))
+                .size(10.0)
+                .weak(),
+            )
+            .on_hover_text("Valid frames, frames that failed CRC, and complete verified pictures");
+            if st.sessions.is_empty() {
+                ui.label(RichText::new("no transfer in progress").size(10.0).weak());
+            }
+            for s in &st.sessions {
+                ui.separator();
+                let from = s.sender.as_deref().unwrap_or_else(|| shorten(&s.session, 8));
+                let label = if s.total > 0 {
+                    format!("{from} {}/{}", s.have, s.total)
+                } else {
+                    format!("{from} {}", s.have)
+                };
+                let colour =
+                    if s.have_manifest { crate::theme::GREEN } else { crate::theme::YELLOW };
+                ui.label(RichText::new(label).size(10.5).strong().color(colour)).on_hover_text(
+                    if s.have_manifest {
+                        format!("session {} · idle {} s", s.session, s.idle_s)
+                    } else {
+                        format!(
+                            "session {} · chunks held, still waiting for the manifest · idle {} s",
+                            s.session, s.idle_s
+                        )
+                    },
+                );
+                rifp_chunk_map(ui, s);
+                if crate::chrome::chip(ui, false, "✕")
+                    .on_hover_text("Forget this incomplete transfer")
+                    .clicked()
+                {
+                    cmds.push(Command::RifpDropSession(s.session.clone()));
+                }
+            }
+        });
+        if let Some(err) = &st.last_error {
+            ui.label(RichText::new(err).size(10.0).color(crate::theme::YELLOW));
+        }
+        if changed && seeded {
+            cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
         }
     }
 
@@ -8265,7 +12231,7 @@ impl SdroxideApp {
         for (rgb, w, h) in sstv_load_gallery() {
             let ci = crate::sstv::color_image(&rgb, w, h);
             let tex = ctx.load_texture("sstv_recv", ci, egui::TextureOptions::NEAREST);
-            self.sstv.received.push(SstvRecv { mode: None, tex });
+            self.sstv.received.push(SstvRecv { mode: None, rifp: None, tex });
         }
     }
 }
@@ -8334,13 +12300,15 @@ impl RfPaintUi {
                     self.img_prev = Some(load_scroll_tex(ctx, "rfpaint_img_prev", ci));
                     // Natural grayscale for the image box.
                     let (iw, ih) = (*w as usize, *h as usize);
-                    let mut disp =
-                        egui::ColorImage::new([iw, ih], vec![Color32::BLACK; iw * ih]);
+                    let mut disp = egui::ColorImage::new([iw, ih], vec![Color32::BLACK; iw * ih]);
                     for (px, &v) in disp.pixels.iter_mut().zip(gray.iter()) {
                         *px = Color32::from_gray(v);
                     }
-                    self.img_disp =
-                        Some(ctx.load_texture("rfpaint_img_disp", disp, egui::TextureOptions::LINEAR));
+                    self.img_disp = Some(ctx.load_texture(
+                        "rfpaint_img_disp",
+                        disp,
+                        egui::TextureOptions::LINEAR,
+                    ));
                 }
                 None => {
                     self.img_prev = None;
@@ -8457,6 +12425,667 @@ impl SdroxideApp {
     /// There is no text or image to show and no tone offset to tune: the whole
     /// operating surface is "am I locked to the far end, how good is the link,
     /// and am I talking".
+    /// The weather-fax panel: the chart as it arrives, the controls that decide
+    /// its geometry, and the gallery of ones already saved.
+    ///
+    /// Receive only, so there is no transmit half — the space goes to the
+    /// picture instead, which is the whole point of the mode.
+    fn wefax_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, panel_h: f32) {
+        use crate::theme;
+
+        let st = self.wefax.status;
+        let ctx = ui.ctx().clone();
+        self.wefax_load_disk_once(&ctx);
+        // A chart arrives at two lines a second; there is no need to chase it
+        // any faster than the eye can follow.
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("WEFAX").size(12.0).strong().color(theme::CYAN));
+            self.wefax_station_chip(ui, cmds);
+
+            // START / STOP. Starting by hand is the normal way in: a chart runs
+            // for a quarter of an hour and you will almost always have tuned to
+            // it after the start tone went by.
+            let (face, hint) = if st.receiving {
+                (" ■ STOP ", "End the chart now and save what has arrived")
+            } else {
+                (" ● START ", "Start a chart now, without waiting for a start tone")
+            };
+            if crate::chrome::chip_accent(
+                ui,
+                st.receiving,
+                RichText::new(face).strong(),
+                if st.receiving { theme::PINK } else { theme::GREEN },
+                theme::INK_ON_CYAN,
+            )
+            .on_hover_text(hint)
+            .clicked()
+            {
+                cmds.push(if st.receiving { Command::WefaxStop } else { Command::WefaxStart });
+            }
+
+            // What the receiver is making of the signal.
+            let (text, colour) = if st.phasing {
+                ("phasing…".to_string(), theme::YELLOW)
+            } else if st.receiving {
+                (format!("{} lines", st.lines), theme::GREEN)
+            } else if self.wefax.has_live() {
+                (format!("{} lines held", self.wefax.live_size().1), theme::CYAN_DIM)
+            } else {
+                ("listening".to_string(), theme::LINE_LIT)
+            };
+            ui.label(RichText::new(text).color(colour).size(11.0));
+
+            // The tuning readout. A correctly tuned receiver puts the
+            // subcarrier's excursions around 1900 Hz; several hundred hertz off
+            // and the picture is all black or all white.
+            let off = st.subcarrier_hz - 1900.0;
+            ui.label(
+                RichText::new(format!("{:+.0} Hz", off))
+                    .color(if off.abs() < 120.0 { theme::GREEN } else { theme::YELLOW })
+                    .size(11.0)
+                    .monospace(),
+            )
+            .on_hover_text(
+                "Subcarrier offset from 1900 Hz. Tune for roughly zero: the fax carrier is \
+                 1500 Hz black to 2300 Hz white, and a receiver a few hundred hertz off clips \
+                 the picture to solid black or solid white.",
+            );
+            self.digi_squelch_slider(ui, cmds);
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let seeded = self.digi_cfg_seeded;
+            let mut changed = false;
+
+            ui.label(RichText::new("LPM").color(theme::CYAN_DIM).size(9.5).strong());
+            for l in sdroxide_types::WefaxLpm::ALL {
+                let on = self.digi_cfg_edit.wefax_lpm == l;
+                if crate::chrome::chip(ui, on, l.label()).clicked() && !on {
+                    self.digi_cfg_edit.wefax_lpm = l;
+                    changed = true;
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("IOC").color(theme::CYAN_DIM).size(9.5).strong());
+            for i in sdroxide_types::WefaxIoc::ALL {
+                let on = self.digi_cfg_edit.wefax_ioc == i;
+                if crate::chrome::chip(ui, on, i.value().to_string())
+                    .on_hover_text(format!("{} pixels per line", i.width()))
+                    .clicked()
+                    && !on
+                {
+                    self.digi_cfg_edit.wefax_ioc = i;
+                    changed = true;
+                }
+            }
+
+            ui.add_space(8.0);
+            let auto_start = self.digi_cfg_edit.wefax_auto_start;
+            if crate::chrome::chip(ui, auto_start, "AUTO START")
+                .on_hover_text(
+                    "Begin a chart when the 300 Hz (IOC 576) or 675 Hz start tone is heard",
+                )
+                .clicked()
+            {
+                self.digi_cfg_edit.wefax_auto_start = !auto_start;
+                changed = true;
+            }
+            let auto_stop = self.digi_cfg_edit.wefax_auto_stop;
+            if crate::chrome::chip(ui, auto_stop, "AUTO STOP")
+                .on_hover_text(
+                    "End it on the 450 Hz stop tone. Turn off to keep recording through a \
+                     station that sends several charts back to back.",
+                )
+                .clicked()
+            {
+                self.digi_cfg_edit.wefax_auto_stop = !auto_stop;
+                changed = true;
+            }
+
+            ui.add_space(8.0);
+            // Phase nudge: for a chart whose phasing pulse was missed, which is
+            // every chart you tune into halfway through.
+            ui.label(RichText::new("PHASE").color(theme::CYAN_DIM).size(9.5).strong());
+            for (face, px) in [("⏪", -100), ("◀", -10), ("▶", 10), ("⏩", 100)] {
+                if crate::chrome::chip(ui, false, face)
+                    .on_hover_text(format!("Shift the picture {px} pixels"))
+                    .clicked()
+                {
+                    cmds.push(Command::WefaxNudge(px));
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("SLANT").color(theme::CYAN_DIM).size(9.5).strong());
+            let mut ppm = self.digi_cfg_edit.wefax_slant_ppm;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut ppm)
+                        .speed(0.5)
+                        .range(-500.0..=500.0)
+                        .suffix(" ppm")
+                        .fixed_decimals(1),
+                )
+                .on_hover_text(
+                    "Sample-clock trim. If the chart leans to the left, increase this; to the \
+                     right, decrease it. A sound card a hundred ppm off walks a quarter-hour \
+                     chart most of a line sideways.",
+                )
+                .changed()
+            {
+                self.digi_cfg_edit.wefax_slant_ppm = ppm;
+                changed = true;
+            }
+
+            // How the chart in progress is displayed. Nothing here touches the
+            // decoder — a chart takes a quarter of an hour, and waiting for it
+            // to finish before being allowed to look at the top of it is the
+            // single most irritating thing about receiving fax.
+            ui.add_space(8.0);
+            ui.label(RichText::new("VIEW").color(theme::CYAN_DIM).size(9.5).strong());
+            use crate::wefax::Zoom;
+            let zoom = self.wefax.zoom;
+            for (face, z, hint) in [
+                ("FIT", Zoom::FitWidth, "Scale the chart to the panel width"),
+                ("WHOLE", Zoom::Whole, "Shrink the chart until all of it is in view at once"),
+                ("50%", Zoom::Fixed(0.5), "Half size"),
+                ("1:1", Zoom::Fixed(1.0), "One screen pixel per fax pixel — scroll for detail"),
+                ("2×", Zoom::Fixed(2.0), "Twice size; scroll to move around the chart"),
+            ] {
+                if crate::chrome::chip(ui, zoom == z, face).on_hover_text(hint).clicked() {
+                    self.wefax.zoom = z;
+                }
+            }
+
+            // Vertical stretch. A chart comes out the wrong shape when the line
+            // rate is not what the station is actually sending — 90 taken for
+            // 120 makes it a third too tall — and this pulls it back while the
+            // operator works out which rate that is.
+            ui.label(RichText::new("HEIGHT").color(theme::CYAN_DIM).size(9.5).strong());
+            let mut aspect = self.wefax.aspect;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut aspect)
+                        .speed(0.01)
+                        .range(crate::wefax::MIN_ASPECT..=crate::wefax::MAX_ASPECT)
+                        .prefix("×")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text(
+                    "Stretch the picture vertically. A chart that came out squashed or stretched \
+                     is usually being decoded at the wrong line rate — this makes it readable, \
+                     and the LPM chips fix it properly. Double-click to type a value.",
+                )
+                .changed()
+            {
+                self.wefax.aspect = aspect;
+            }
+            if (aspect - 1.0).abs() > 0.001
+                && crate::chrome::chip(ui, false, "RESET")
+                    .on_hover_text("Back to the picture's own proportions")
+                    .clicked()
+            {
+                self.wefax.aspect = 1.0;
+            }
+
+            let follow = self.wefax.follow;
+            if crate::chrome::chip(ui, follow, "FOLLOW")
+                .on_hover_text(
+                    "Keep the newest lines in view. Scrolling up turns this off so you can read \
+                     what has already arrived; scrolling back to the bottom turns it on again.",
+                )
+                .clicked()
+            {
+                self.wefax.follow = !follow;
+            }
+
+            if changed && seeded {
+                cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+            }
+        });
+
+        ui.add_space(6.0);
+
+        // The picture. Everything left of the gallery strip, scrollable, with
+        // the newest rows kept in view while a chart is being received.
+        //
+        // Height from what is actually left rather than a fixed subtraction, so
+        // the control rows wrapping in a narrow window shortens the picture
+        // instead of pushing it out of the panel.
+        let avail_h = ui.available_height().max(80.0).min(panel_h);
+        let handle_w = 7.0;
+        ui.horizontal_top(|ui| {
+            // The gallery takes a user-draggable fraction of the width, the
+            // chart the rest; each keeps enough to stay useful. The strip is
+            // worth widening to read the labels that tell a morning's
+            // identical-looking surface analyses apart, and worth shrinking
+            // back out of the way while a chart is being read at 1:1.
+            let total_w = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let gallery_w = (total_w * self.view.wefax_gallery_fraction)
+                .clamp(120.0, (total_w - handle_w - 2.0 * gap - 200.0).max(120.0));
+            let img_w = (total_w - gallery_w - handle_w - 2.0 * gap).max(120.0);
+            // Both columns are explicitly top-down: `allocate_ui` inherits the
+            // surrounding layout, which is the horizontal one that puts the two
+            // columns side by side, and a gallery laid out left-to-right walks
+            // its thumbnails off the edge of the window.
+            ui.allocate_ui_with_layout(
+                egui::vec2(img_w, avail_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let receiving = st.receiving;
+                    let (w, h) = self.wefax.live_size();
+                    // Cloned rather than borrowed: the follow flag is updated from
+                    // the scroll position afterwards, which needs the state back.
+                    let tex = self.wefax.live_texture(&ctx).cloned();
+                    match tex {
+                        Some(tex) => {
+                            // The scroll area's own width, less the bar it will
+                            // put down the side, is what the picture has to fit
+                            // into; using the column width would leave a chart
+                            // fitted "to the width" a scrollbar too wide.
+                            let bar = ui.spacing().scroll.bar_width + 4.0;
+                            let view = (img_w - bar, avail_h - bar);
+                            let size = crate::wefax::live_size(
+                                self.wefax.zoom,
+                                self.wefax.aspect,
+                                view,
+                                (w, h),
+                            );
+                            let out = egui::ScrollArea::both()
+                                .id_salt("wefax-live")
+                                .auto_shrink([false, false])
+                                // Follow the newest rows only while the operator is
+                                // at the bottom. Sticking regardless would snap the
+                                // view back every time a line arrived, which is
+                                // exactly what makes a chart unreadable until it has
+                                // finished.
+                                .stick_to_bottom(receiving && self.wefax.follow)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Image::new(&tex)
+                                            .fit_to_exact_size(egui::vec2(size.0, size.1))
+                                            // The size above already carries the
+                                            // aspect the operator asked for;
+                                            // preserving the texture's own would
+                                            // undo the stretch control.
+                                            .maintain_aspect_ratio(false),
+                                    );
+                                });
+                            // Where they left the view decides whether we keep
+                            // following: at the bottom means "show me the new
+                            // lines", anywhere else means "I am reading".
+                            let slack = (out.content_size.y - out.inner_rect.height()).max(0.0);
+                            self.wefax.follow = out.state.offset.y >= slack - 8.0;
+                        }
+                        None => {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "Tune a fax schedule in USB and wait for a start tone, or \
+                                     press START to begin mid-chart.",
+                                    )
+                                    .color(theme::LINE_LIT)
+                                    .size(11.5),
+                                );
+                            });
+                        }
+                    }
+                },
+            );
+
+            // Draggable vertical divider between the chart and the gallery.
+            let hresp = crate::chrome::split_handle(ui, egui::vec2(handle_w, avail_h), None);
+            if hresp.dragged() {
+                // Dragging right shrinks the gallery (grows the chart).
+                let d = hresp.drag_delta().x / total_w.max(1.0);
+                self.view.wefax_gallery_fraction =
+                    (self.view.wefax_gallery_fraction - d).clamp(0.1, 0.5);
+            }
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(gallery_w, avail_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(gallery_w);
+                    self.wefax_gallery(ui, gallery_w);
+                },
+            );
+        });
+
+        self.wefax_viewer(&ctx);
+    }
+
+    /// The gallery of saved charts: a thumbnail per chart, labelled with when it
+    /// was received and which station it came from, and clickable to open it
+    /// full size.
+    ///
+    /// The labels are the point. A quarter of a station's daily output is
+    /// surface analyses that look identical at thumbnail size, and picking out
+    /// "yesterday's 06Z from Pinneberg" without a date on it means opening them
+    /// one at a time.
+    fn wefax_gallery(&mut self, ui: &mut egui::Ui, width: f32) {
+        use crate::theme;
+
+        let dir = self.wefax.dir.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("SAVED").color(theme::CYAN_DIM).size(9.5).strong());
+            let n = self.wefax.gallery.len() + self.wefax.disk_extra;
+            if n > 0 {
+                ui.label(RichText::new(format!("{n}")).color(theme::LINE_LIT).size(9.5));
+            }
+            if !dir.is_empty()
+                && crate::chrome::chip(ui, false, RichText::new("PATH").size(9.5))
+                    .on_hover_text(format!("Charts are saved in\n{dir}\n\nClick to copy the path"))
+                    .clicked()
+            {
+                ui.ctx().copy_text(dir.clone());
+            }
+        });
+
+        if self.wefax.gallery.is_empty() {
+            ui.label(
+                RichText::new(if dir.is_empty() {
+                    "Finished charts collect here.".to_string()
+                } else {
+                    format!("Finished charts are saved in {dir} and collect here.")
+                })
+                .color(theme::LINE_LIT)
+                .size(10.0),
+            );
+            return;
+        }
+
+        let thumb_w = (width - 20.0).max(60.0);
+        // A chart is about three times wider than it is tall, so a thumbnail
+        // that keeps its shape is roughly a third of its width; charts cut short
+        // are shorter still and simply take less room.
+        let thumb_h = thumb_w * 0.36;
+        let mut open = None;
+        egui::ScrollArea::vertical().id_salt("wefax-gallery").auto_shrink([false, false]).show(
+            ui,
+            |ui| {
+                for (i, c) in self.wefax.gallery.iter().enumerate() {
+                    let selected = self.wefax.viewing == Some(i);
+                    // The whole card — picture and label together — is the
+                    // target, so a click near the date is not a miss.
+                    let card = ui.scope_builder(
+                        egui::UiBuilder::new().sense(egui::Sense::click()),
+                        |ui| {
+                            ui.set_width(thumb_w);
+                            ui.add(
+                                egui::Image::new(&c.texture)
+                                    .fit_to_exact_size(egui::vec2(thumb_w, thumb_h))
+                                    .maintain_aspect_ratio(true),
+                            );
+                            match c.meta {
+                                Some(m) => {
+                                    ui.label(
+                                        RichText::new(m.when_label())
+                                            .color(if selected { theme::CYAN } else { theme::TEXT })
+                                            .size(10.0)
+                                            .monospace(),
+                                    );
+                                    // A chart saved before the name carried a
+                                    // frequency has nothing to say about where
+                                    // it came from; its size is at least true.
+                                    ui.label(
+                                        RichText::new(m.where_label().unwrap_or_else(|| {
+                                            format!("{} × {}", c.size.0, c.size.1)
+                                        }))
+                                        .color(theme::CYAN_DIM)
+                                        .size(9.5),
+                                    );
+                                }
+                                // Something in the directory that this program
+                                // did not name: show what there is rather than
+                                // inventing a date for it.
+                                None => {
+                                    ui.label(RichText::new(&c.name).color(theme::TEXT).size(9.5));
+                                }
+                            }
+                        },
+                    );
+                    let resp = card.response;
+                    if selected || resp.hovered() {
+                        ui.painter().rect_stroke(
+                            resp.rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(
+                                1.0,
+                                if selected { theme::CYAN } else { theme::LINE_LIT },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if resp
+                        .on_hover_text(format!(
+                            "{}\n{} × {} pixels\n{}",
+                            c.meta.map_or_else(|| c.name.clone(), |m| m.when_full()),
+                            c.size.0,
+                            c.size.1,
+                            c.name
+                        ))
+                        .clicked()
+                    {
+                        open = Some(i);
+                    }
+                    ui.add_space(6.0);
+                }
+                // Charts beyond the ones held as textures are still on disk;
+                // saying so stops the gallery looking like it lost them.
+                if self.wefax.disk_extra > 0 {
+                    ui.label(
+                        RichText::new(format!("+{} older on disk", self.wefax.disk_extra))
+                            .color(theme::LINE_LIT)
+                            .size(9.5),
+                    );
+                }
+            },
+        );
+        if open.is_some() {
+            self.wefax.viewing = open;
+        }
+    }
+
+    /// The radiofax schedules, as a chip that opens a station picker.
+    ///
+    /// These transmitters are not on any band plan and their frequencies are
+    /// not the kind anyone remembers, so without this the mode starts with a
+    /// trip to a web page. Picking one tunes the **dial**, which is 1.9 kHz
+    /// below the published carrier — the subtraction that otherwise produces a
+    /// blank page and no clue why.
+    fn wefax_station_chip(&self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        use sdroxide_types::{WEFAX_STATIONS, WefaxStation};
+        let dial = self.state.active_freq_hz();
+        // The station we are on, if any, so the chip reads as a position.
+        let here = WefaxStation::at_dial(dial);
+        // No emoji in the face: the default fonts have no radio-mast glyph and
+        // it comes out as an empty box.
+        let face = match &here {
+            Some((s, f)) => {
+                format!("{} · {:.1}", s.name.split_whitespace().next().unwrap_or(""), f)
+            }
+            None => "STATIONS".to_string(),
+        };
+        let btn = crate::chrome::chip(ui, here.is_some(), RichText::new(face).size(11.0))
+            .on_hover_text("Broadcast radiofax schedules — picking one tunes the dial");
+
+        let mut pick = None;
+        let resp = egui::Popup::from_toggle_button_response(&btn)
+            .frame(crate::chrome::window_frame())
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                ui.set_max_width(420.0);
+                for s in WEFAX_STATIONS {
+                    ui.label(
+                        RichText::new(s.name).color(crate::theme::CYAN_DIM).size(10.0).strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for &f in s.carriers_khz {
+                            let d = WefaxStation::dial_hz(f);
+                            let on = (d - dial).abs() < WefaxStation::NEAR_HZ;
+                            if crate::chrome::chip(ui, on, format!("{f:.1}"))
+                                .on_hover_text(format!(
+                                    "Published carrier {f:.1} kHz → dial {:.1} kHz USB",
+                                    d / 1000.0
+                                ))
+                                .clicked()
+                            {
+                                pick = Some(d);
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.label(
+                    RichText::new(
+                        "Frequencies are the published carrier; the dial goes 1.9 kHz below it, \
+                         which is done for you. Schedules change and stations close — treat this \
+                         as where to start looking, not a timetable.",
+                    )
+                    .color(crate::theme::LINE_LIT)
+                    .size(10.0),
+                );
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, 1.0);
+        }
+        if let Some(hz) = pick {
+            cmds.push(Command::SetVfo { vfo: self.state.active_vfo, hz });
+        }
+    }
+
+    /// A saved chart, full size, in its own window.
+    ///
+    /// A weather chart is unreadable at gallery size — the whole value of it is
+    /// the fronts and the isobars — so opening one properly is not optional.
+    /// Stepping between charts from inside the window matters for the same
+    /// reason: comparing this run against the last one is most of what the
+    /// charts are for.
+    fn wefax_viewer(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.wefax.viewing else { return };
+        let n = self.wefax.gallery.len();
+        let Some(chart) = self.wefax.gallery.get(i) else {
+            self.wefax.viewing = None;
+            return;
+        };
+        let (name, size, tex) = (chart.name.clone(), chart.size, chart.texture.clone());
+        let title = chart.title();
+        let mut open = true;
+        let mut step = 0i32;
+        let resp = egui::Window::new(format!("{title}  ·  {}×{}", size.0, size.1))
+            .id(egui::Id::new("wefax-viewer"))
+            .open(&mut open)
+            .frame(crate::chrome::window_frame())
+            .default_size([900.0, 640.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Newer is up the list, older is down it.
+                    if crate::chrome::chip(ui, false, "◀ NEWER")
+                        .on_hover_text("The chart received after this one")
+                        .clicked()
+                    {
+                        step = -1;
+                    }
+                    ui.label(
+                        RichText::new(format!("{} of {n}", i + 1))
+                            .color(crate::theme::CYAN_DIM)
+                            .size(10.0),
+                    );
+                    if crate::chrome::chip(ui, false, "OLDER ▶")
+                        .on_hover_text("The chart received before this one")
+                        .clicked()
+                    {
+                        step = 1;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(&name).color(crate::theme::LINE_LIT).size(10.0))
+                        .on_hover_text("The file this chart was saved as");
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::both()
+                    .id_salt("wefax-viewer-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(egui::Image::new(&tex).maintain_aspect_ratio(true));
+                    });
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_window_border(ctx, &r.response);
+        }
+        if step != 0 && n > 0 {
+            self.wefax.viewing = Some((i as i32 + step).clamp(0, n as i32 - 1) as usize);
+        }
+        if !open {
+            self.wefax.viewing = None;
+        }
+    }
+
+    /// Load previously saved charts into the gallery, once per session.
+    ///
+    /// Reads the legacy config-directory store as well as the pictures one, so
+    /// a collection saved before charts moved to `<Pictures>/sdroxide/wefax`
+    /// still shows up rather than looking as though it had been thrown away.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wefax_load_disk_once(&mut self, ctx: &egui::Context) {
+        if self.wefax.loaded_disk {
+            return;
+        }
+        self.wefax.loaded_disk = true;
+        let Ok(dir) = sdroxide_config::wefax_rx_dir() else { return };
+        self.wefax.dir = dir.display().to_string();
+
+        // Newest first, and only the most recent few: a chart is two megapixels
+        // as a texture, and a season of them would be gigabytes of VRAM.
+        const KEEP: usize = 24;
+        let mut files: Vec<(i64, std::path::PathBuf)> = Vec::new();
+        let dirs = std::iter::once(dir).chain(sdroxide_config::wefax_legacy_rx_dir());
+        for d in dirs {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            files.extend(
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+                    .map(|p| {
+                        // Order by the timestamp the name carries; a file this
+                        // program did not write has none, and sorts oldest.
+                        let when = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .and_then(sdroxide_types::WefaxChartMeta::from_file_name)
+                            .map_or(0, |m| m.unix);
+                        (when, p)
+                    }),
+            );
+        }
+        files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        self.wefax.disk_extra = files.len().saturating_sub(KEEP);
+        for (_, path) in files.iter().take(KEEP) {
+            let Ok(bytes) = std::fs::read(path) else { continue };
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            self.wefax.add_chart(ctx, &name, &bytes);
+        }
+        // `add_chart` prepends, so reading newest-first leaves the list oldest
+        // first; sorting puts it back the way the gallery is browsed.
+        self.wefax.sort_gallery();
+        // Nothing is open yet — `add_chart` shifted the viewer index for each
+        // chart it prepended, and there was no chart to shift.
+        self.wefax.viewing = None;
+    }
+
+    /// The browser tab has no config directory to read a gallery out of; the
+    /// charts it receives this session are all it shows.
+    #[cfg(target_arch = "wasm32")]
+    fn wefax_load_disk_once(&mut self, _ctx: &egui::Context) {
+        self.wefax.loaded_disk = true;
+    }
+
     fn rade_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, _panel_h: f32) {
         let status = self.digi_status.clone();
         let rade = status.as_ref().and_then(|s| s.rade).unwrap_or_default();
@@ -8465,9 +13094,7 @@ impl SdroxideApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RADE").size(11.0).strong().color(crate::theme::CYAN));
             ui.label(
-                RichText::new("FreeDV V1 digital voice")
-                    .size(10.5)
-                    .color(crate::theme::CYAN_DIM),
+                RichText::new("FreeDV V1 digital voice").size(10.5).color(crate::theme::CYAN_DIM),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if transmitting {
@@ -8476,8 +13103,7 @@ impl SdroxideApp {
                 }
                 // Silence the raw signal, leaving only decoded speech audible.
                 let muted = self.digi_cfg_edit.rade_mute_analog;
-                let resp =
-                    crate::chrome::chip(ui, muted, RichText::new("MUTE ANALOG").size(10.5));
+                let resp = crate::chrome::chip(ui, muted, RichText::new("MUTE ANALOG").size(10.5));
                 if resp.clicked() && self.digi_cfg_seeded {
                     self.digi_cfg_edit.rade_mute_analog = !muted;
                     cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
@@ -8494,8 +13120,7 @@ impl SdroxideApp {
 
         // Sync lamp + link readouts.
         ui.horizontal(|ui| {
-            let (lamp, _) =
-                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            let (lamp, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             let lit = rade.sync && !transmitting;
             ui.painter_at(lamp).circle_filled(
                 lamp.center(),
@@ -8512,7 +13137,11 @@ impl SdroxideApp {
                 })
                 .size(12.0)
                 .strong()
-                .color(if lit { crate::theme::GREEN } else { Color32::from_gray(130) }),
+                .color(if lit {
+                    crate::theme::GREEN
+                } else {
+                    Color32::from_gray(130)
+                }),
             );
             ui.add_space(16.0);
             let dim = Color32::from_gray(150);
@@ -8770,9 +13399,8 @@ impl SdroxideApp {
 #[cfg(not(target_arch = "wasm32"))]
 fn pick_image(inbox: Arc<Mutex<Option<Vec<u8>>>>) {
     std::thread::spawn(move || {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg"])
-            .pick_file()
+        if let Some(path) =
+            rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file()
         {
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(mut g) = inbox.lock() {
@@ -8919,6 +13547,52 @@ fn sstv_section<R>(
 
 /// A small horizontal signal-activity meter (level ~0..1), so the operator can
 /// confirm receive audio is reaching the SSTV decoder.
+/// First `n` characters of `text` — a short label that cannot panic on a
+/// string shorter than it expects.
+fn shorten(text: &str, n: usize) -> &str {
+    match text.char_indices().nth(n) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
+/// One incoming RIFP transfer's chunk map: a lit cell per chunk received, dark
+/// per chunk still missing. Beyond what fits, it degrades to a plain bar — the
+/// point is to see *where* the holes are, and a thousand one-pixel cells show
+/// nothing.
+fn rifp_chunk_map(ui: &mut egui::Ui, session: &sdroxide_types::RifpSession) {
+    let cells = session.total.max(session.have) as usize;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, Color32::from_gray(20));
+    let have = |i: usize| session.map.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 != 0);
+    if cells > 0 && cells <= rect.width() as usize {
+        let cw = rect.width() / cells as f32;
+        for i in 0..cells {
+            if !have(i) {
+                continue;
+            }
+            let x = rect.left() + i as f32 * cw;
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(cw.max(1.0), 10.0)),
+                0.0,
+                crate::theme::GREEN,
+            );
+        }
+    } else if session.total > 0 {
+        let mut fill = rect;
+        fill.set_width(rect.width() * (session.have as f32 / session.total as f32).clamp(0.0, 1.0));
+        p.rect_filled(fill, 2.0, crate::theme::GREEN);
+    }
+    p.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, Color32::from_gray(60)),
+        egui::StrokeKind::Inside,
+    );
+    resp.on_hover_text("Chunks received (lit) and still missing (dark)");
+}
+
 fn sstv_level_bar(ui: &mut egui::Ui, level: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
     let p = ui.painter();
@@ -8936,4 +13610,295 @@ fn sstv_level_bar(ui: &mut egui::Ui, level: f32) {
         egui::Stroke::new(1.0, Color32::from_gray(60)),
         egui::StrokeKind::Inside,
     );
+}
+
+/// Roughly how many JS8 frames a message will take.
+///
+/// The panel shows this before the operator presses send, because JS8's most
+/// surprising property to someone new is that a sentence can occupy a minute of
+/// air time. It is an estimate: the real encoder chooses per frame between
+/// Huffman and dictionary compression, so the true count is often lower. Being
+/// pessimistic here is the right way round — a message that finishes early is a
+/// pleasant surprise, one that runs long is not.
+fn js8_frame_estimate(text: &str) -> u8 {
+    const PER_FRAME: usize = 13;
+    let n = text.trim().len();
+    (n.div_ceil(PER_FRAME).max(1)).min(255) as u8
+}
+
+/// How long a JS8 station stays lit on the maps after it was last heard.
+///
+/// The mode's own convention is a heartbeat every ten or fifteen minutes, so
+/// FT8's two-minute fade would leave the map blank between them.
+const JS8_STATION_FADE_S: f64 = 900.0;
+
+/// Least time between two locator lookups driven by the JS8 heard list.
+const JS8_LOOKUP_INTERVAL_S: f64 = 1.5;
+
+/// True when a message was aimed at *us* — our callsign, or a group we joined —
+/// as opposed to at the whole band.
+///
+/// `@ALLCALL` reaches us and the assembler marks it `to_me` accordingly, but a
+/// heartbeat is not addressed to anyone in particular: colouring every one of
+/// them gold would leave nothing for a real call to stand out against.
+fn js8_personally_addressed(m: &sdroxide_types::Js8Msg) -> bool {
+    m.to_me && !m.to.eq_ignore_ascii_case("@ALLCALL")
+}
+
+/// What the composer can quote about our own station when it drafts a reply.
+struct Js8Me {
+    grid: String,
+    status: String,
+    /// Callsigns heard recently, most recent first — the answer to `HEARING?`.
+    hearing: Vec<String>,
+    /// The last thing we transmitted, which is what `AGN?` is asking for.
+    last_sent: String,
+}
+
+/// One heard station as a [`Decode`], so the FT8 hover card can describe it
+/// without learning a second station type.
+fn js8_station_decode(
+    h: &sdroxide_types::Js8Heard,
+    grid: Option<String>,
+    msg: Option<&sdroxide_types::Js8Msg>,
+) -> Decode {
+    Decode {
+        slot_utc: h.last_utc,
+        snr_db: h.snr_db,
+        dt: 0.0,
+        audio_hz: h.audio_hz,
+        message: msg.map(js8_msg_summary).unwrap_or_default(),
+        to: msg.map(|m| m.to.clone()).filter(|t| !t.is_empty()),
+        from: Some(h.call.clone()),
+        grid,
+        is_cq: msg.is_some_and(|m| m.cmd.as_deref() == Some("CQ")),
+        cq_to: None,
+        rr73_to: None,
+        free_text: false,
+    }
+}
+
+/// A heard station's last transmission on one line: the command, then the text.
+fn js8_msg_summary(m: &sdroxide_types::Js8Msg) -> String {
+    let mut s = String::new();
+    if let Some(c) = &m.cmd {
+        s.push_str(c);
+    }
+    let text = m.text.trim();
+    if !text.is_empty() {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(text);
+    }
+    if !m.complete {
+        s.push('…');
+    }
+    s
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    let t = s.trim();
+    (!t.is_empty()).then_some(t)
+}
+
+/// The reply a standard JS8 exchange expects to this message, if there is one.
+///
+/// JS8 carries a conversation, so this only ever *offers*: it fills the
+/// composer and the operator is free to rewrite it before pressing send. What
+/// it encodes is the handful of turns that are the same in every contact — a
+/// heartbeat or a CQ is asking "can anyone hear me?" and wants a report back, a
+/// question wants its answer, `HW CPY?` wants a report — so the routine part is
+/// one click and everything else is still a text box.
+///
+/// `None` means "nothing standard to say", which is the answer for free text
+/// and therefore for most of a rag-chew. The caller still selects the station,
+/// so the composer is aimed at them with nothing typed in it.
+fn js8_reply_for(msg: &sdroxide_types::Js8Msg, me: &Js8Me) -> Option<String> {
+    let snr = msg.snr_db;
+    Some(match msg.cmd.as_deref()? {
+        // A heartbeat is answered with a heartbeat report, which is a distinct
+        // command from a plain report: it says "this is an answer to your
+        // beacon", not "we are in a QSO".
+        "HB" => format!("HEARTBEAT SNR {snr}"),
+        "CQ" | "SNR?" | "HW CPY?" | "HEARTBEAT SNR" => format!("SNR {snr}"),
+        "GRID?" => format!("GRID {}", non_empty(&me.grid)?),
+        "STATUS?" | "INFO?" => format!("STATUS {}", non_empty(&me.status)?),
+        "HEARING?" => format!("HEARING {}", non_empty(&me.hearing.join(" "))?),
+        // They answered us. Acknowledge, and from here it is a conversation.
+        "SNR" | "GRID" | "STATUS" | "INFO" | "HEARING" | "FB" | "ACK" => "RR".into(),
+        "QSL?" => "QSL".into(),
+        "QSL" | "RR" => "73".into(),
+        "73" | "SK" => "73".into(),
+        // "Say again" wants the same words back, not a new sentence.
+        "AGN?" => non_empty(&me.last_sent)?.to_string(),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod js8_panel_tests {
+    use super::js8_frame_estimate;
+
+    #[test]
+    fn short_messages_take_one_frame() {
+        assert_eq!(js8_frame_estimate("HELLO"), 1);
+        assert_eq!(js8_frame_estimate("HI"), 1);
+    }
+
+    #[test]
+    fn the_estimate_grows_with_the_message() {
+        let short = js8_frame_estimate("HELLO WORLD");
+        let long = js8_frame_estimate(
+            "HELLO WORLD THIS IS A CONSIDERABLY LONGER MESSAGE THAT WILL SPAN SEVERAL FRAMES",
+        );
+        assert!(long > short, "{long} should exceed {short}");
+    }
+
+    #[test]
+    fn an_empty_message_still_reads_as_one_frame_not_zero() {
+        // The label is only shown for non-empty input, but a zero here would
+        // render "0f · 0s" if that ever changed.
+        assert_eq!(js8_frame_estimate(""), 1);
+        assert_eq!(js8_frame_estimate("   "), 1);
+    }
+
+    use super::{Js8Me, js8_msg_summary, js8_personally_addressed, js8_reply_for};
+    use sdroxide_types::Js8Msg;
+
+    fn me() -> Js8Me {
+        Js8Me {
+            grid: "FN42".into(),
+            status: "PORTABLE".into(),
+            hearing: vec!["KN4CRD".into(), "VK3ABC".into()],
+            last_sent: "KN4CRD HELLO FROM THE HILLS".into(),
+        }
+    }
+
+    fn msg(cmd: Option<&str>, to: &str) -> Js8Msg {
+        Js8Msg {
+            from: "KN4CRD".into(),
+            to: to.into(),
+            text: String::new(),
+            cmd: cmd.map(str::to_string),
+            snr_db: -12,
+            audio_hz: 1500.0,
+            first_slot_utc: 1000,
+            last_slot_utc: 1000,
+            frames: 1,
+            complete: true,
+            to_me: true,
+        }
+    }
+
+    #[test]
+    fn an_announcement_drafts_the_report_it_is_asking_for() {
+        // A heartbeat and a CQ are both "can anyone hear me?"; JS8's answer is
+        // a signal report, and a heartbeat gets the report command that says
+        // "this answers your beacon".
+        assert_eq!(
+            js8_reply_for(&msg(Some("HB"), "@ALLCALL"), &me()).as_deref(),
+            Some("HEARTBEAT SNR -12")
+        );
+        assert_eq!(js8_reply_for(&msg(Some("CQ"), "@ALLCALL"), &me()).as_deref(), Some("SNR -12"));
+        assert_eq!(
+            js8_reply_for(&msg(Some("HW CPY?"), "N0JDS"), &me()).as_deref(),
+            Some("SNR -12")
+        );
+    }
+
+    #[test]
+    fn a_question_drafts_its_answer() {
+        for (cmd, want) in [
+            ("SNR?", "SNR -12"),
+            ("GRID?", "GRID FN42"),
+            ("STATUS?", "STATUS PORTABLE"),
+            ("HEARING?", "HEARING KN4CRD VK3ABC"),
+            // "Say again" wants the same words back, not a new sentence.
+            ("AGN?", "KN4CRD HELLO FROM THE HILLS"),
+        ] {
+            assert_eq!(
+                js8_reply_for(&msg(Some(cmd), "N0JDS"), &me()).as_deref(),
+                Some(want),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contact_winds_itself_down() {
+        for (cmd, want) in
+            [("SNR", "RR"), ("QSL?", "QSL"), ("RR", "73"), ("73", "73"), ("SK", "73")]
+        {
+            assert_eq!(
+                js8_reply_for(&msg(Some(cmd), "N0JDS"), &me()).as_deref(),
+                Some(want),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_drafts_nothing_so_the_composer_is_left_alone() {
+        // The point of JS8 is the rag-chew: there is no standard answer to
+        // "GOOD MORNING FROM VIENNA", and guessing one would be in the way.
+        assert_eq!(js8_reply_for(&msg(None, "N0JDS"), &me()), None);
+        // Nor to traffic this station deliberately does not handle.
+        for cmd in [">", "MSG TO:", "QUERY MSGS", "YES", "NO"] {
+            assert_eq!(js8_reply_for(&msg(Some(cmd), "N0JDS"), &me()), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_draft_is_dropped_rather_than_sent_empty() {
+        // "GRID" with no grid says "I am here" and answers nothing, at the cost
+        // of a full transmission.
+        let blank = Js8Me { grid: String::new(), status: String::new(), ..me() };
+        assert_eq!(js8_reply_for(&msg(Some("GRID?"), "N0JDS"), &blank), None);
+        assert_eq!(js8_reply_for(&msg(Some("STATUS?"), "N0JDS"), &blank), None);
+        let deaf = Js8Me { hearing: Vec::new(), last_sent: String::new(), ..me() };
+        assert_eq!(js8_reply_for(&msg(Some("HEARING?"), "N0JDS"), &deaf), None);
+        assert_eq!(js8_reply_for(&msg(Some("AGN?"), "N0JDS"), &deaf), None);
+    }
+
+    #[test]
+    fn a_broadcast_is_not_a_message_addressed_to_us() {
+        // Every heartbeat on the band is `to_me`; colouring them all gold would
+        // leave nothing for a station actually calling us to stand out against.
+        assert!(!js8_personally_addressed(&msg(Some("HB"), "@ALLCALL")));
+        assert!(js8_personally_addressed(&msg(Some("SNR?"), "N0JDS")));
+        assert!(js8_personally_addressed(&msg(Some("STATUS?"), "@JS8NET")));
+    }
+
+    #[test]
+    fn a_stations_last_word_reads_as_one_line() {
+        let mut m = msg(Some("HB"), "@ALLCALL");
+        m.text = "EM73".into();
+        assert_eq!(js8_msg_summary(&m), "HB EM73");
+        m.cmd = None;
+        assert_eq!(js8_msg_summary(&m), "EM73");
+        // Still arriving, and the row has to say so.
+        m.complete = false;
+        assert_eq!(js8_msg_summary(&m), "EM73…");
+    }
+}
+
+impl SdroxideApp {
+    /// The slot length of the current mode, in seconds.
+    ///
+    /// FT8 and FT4 have theirs fixed by the mode; JS8's is an operator setting,
+    /// so it has to come from the engine's status. The decode list groups rows
+    /// into turns by this, and getting it wrong for JS8 Turbo would draw one
+    /// "EVEN/ODD" header per two and a half turns.
+    fn slot_period_s(&self) -> f64 {
+        match self.state.rx[0].mode {
+            Mode::Ft4 => 7.5,
+            Mode::Js8 => self
+                .digi_status
+                .as_ref()
+                .and_then(|s| s.js8.as_ref())
+                .map_or(15.0, |j| j.speed.slot_s()),
+            _ => 15.0,
+        }
+    }
 }

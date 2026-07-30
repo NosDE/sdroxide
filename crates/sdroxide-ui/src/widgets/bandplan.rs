@@ -146,7 +146,7 @@ static FINE: &[Seg] = &[
 //
 // When zoomed into a band, the coarse "Digi" allocation is broken out into the
 // individual modes that actually live there (FT8, FT4, JS8, WSPR, QRSS, PSK,
-// RTTY, SSTV). Many of these overlap in frequency, so they're partitioned into
+// RTTY, SSTV, RIFP). Many of these overlap in frequency, so they're partitioned into
 // non-overlapping rows and stacked above the allocation strip.
 
 const C_FT8: Color32 = Color32::from_rgb(0x4D, 0x8C, 0xFF);
@@ -157,6 +157,7 @@ const C_QRSS: Color32 = Color32::from_rgb(0x76, 0x6A, 0xD6);
 const C_PSK: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x3D);
 const C_RTTY: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x4B);
 const C_SSTV: Color32 = Color32::from_rgb(0xF0, 0x5A, 0x9C);
+const C_RIFP: Color32 = Color32::from_rgb(0x5A, 0xE0, 0xD0);
 
 // Below this view span, draw the explicit digi-mode detail rows; above it they'd
 // be sub-pixel and only clutter the strip.
@@ -179,7 +180,8 @@ const fn dg(lo: f64, hi: f64, label: &'static str, color: Color32) -> DigiSeg {
 /// frequency tables so they stay consistent with the skimmer gating.
 fn digi_segments() -> Vec<DigiSeg> {
     use sdroxide_types::{
-        FT4_DIALS, FT8_DIALS, JS8_DIALS, PSK_RANGES, RTTY_RANGES, SSTV_CALLING, WSPR_DIALS,
+        FT4_DIALS, FT8_DIALS, JS8_DIALS, PSK_RANGES, RIFP_CALLING, RTTY_RANGES, SSTV_CALLING,
+        WSPR_DIALS,
     };
     let mut v = Vec::with_capacity(64);
     for &f in FT8_DIALS {
@@ -204,6 +206,12 @@ fn digi_segments() -> Vec<DigiSeg> {
     }
     for &f in SSTV_CALLING {
         v.push(dg(f, f + 2700.0, "SSTV", C_SSTV));
+    }
+    // RIFP is the one entry centred on its frequency rather than starting at
+    // it: its CPFSK channel straddles the dial.
+    for &f in RIFP_CALLING {
+        let half = 12_500.0;
+        v.push(dg(f - half, f + half, "RIFP", C_RIFP));
     }
     v
 }
@@ -283,7 +291,9 @@ fn draw_seg(
     }
 }
 
-/// Draw the bandplan strip over the bottom of the waterfall rect.
+/// Draw the bandplan strip along the oldest edge of the waterfall rect — its
+/// bottom normally, its top when the waterfall is flipped — so the strip never
+/// covers the newest rows.
 pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect) {
     let span = view.span();
     if span <= 0.0 || wf.height() < 24.0 {
@@ -301,12 +311,16 @@ pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect) {
     let n_digi = digi_rows.len().min(MAX_DIGI_ROWS).min(fit);
 
     let total_h = base_h + n_digi as f32 * digi_h;
-    let base_top = wf.bottom() - base_h;
-    let strip_top = wf.bottom() - total_h;
+    // The allocation row sits outermost, on the waterfall's oldest edge, with
+    // the digi rows stacked inwards from it.
+    let flip = view.waterfall_flip;
+    let base_top = if flip { wf.top() } else { wf.bottom() - base_h };
+    let (strip_top, strip_bottom) =
+        if flip { (wf.top(), wf.top() + total_h) } else { (wf.bottom() - total_h, wf.bottom()) };
 
     // Subtle base so the strip reads as one band even between segments.
     p.rect_filled(
-        Rect::from_min_max(pos2(wf.left(), strip_top), wf.max),
+        Rect::from_min_max(pos2(wf.left(), strip_top), pos2(wf.right(), strip_bottom)),
         0.0,
         Color32::from_rgba_unmultiplied(0, 0, 0, 80),
     );
@@ -317,14 +331,22 @@ pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect) {
         draw_seg(p, view, wf, seg.lo, seg.hi, seg.kind.color(), seg.label, base_top, base_h, 10.5);
     }
 
-    // Digi-mode rows stacked above the allocation row.
+    // Digi-mode rows stacked inwards from the allocation row.
     for (i, row) in digi_rows.iter().take(n_digi).enumerate() {
-        let row_top = base_top - (i as f32 + 1.0) * digi_h;
+        let row_top = if flip {
+            base_top + base_h + i as f32 * digi_h
+        } else {
+            base_top - (i as f32 + 1.0) * digi_h
+        };
         for d in row {
             draw_seg(p, view, wf, d.lo, d.hi, d.color, d.label, row_top, digi_h, 9.5);
         }
     }
 
-    // Top border of the strip.
-    p.hline(wf.x_range(), strip_top, Stroke::new(1.0, theme::LINE_LIT));
+    // Border along the strip's inner edge.
+    p.hline(
+        wf.x_range(),
+        if flip { strip_bottom } else { strip_top },
+        Stroke::new(1.0, theme::LINE_LIT),
+    );
 }

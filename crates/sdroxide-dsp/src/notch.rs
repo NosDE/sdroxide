@@ -17,12 +17,12 @@ const TAPS: usize = 64;
 const DELAY: usize = 24;
 
 pub struct AutoNotch {
-    w: Vec<f32>,     // adaptive taps (predict the tonal component)
-    hist: Vec<f32>,  // input history ring (DELAY + TAPS long)
+    w: Vec<f32>,    // adaptive taps (predict the tonal component)
+    hist: Vec<f32>, // input history ring (DELAY + TAPS long)
     pos: usize,
-    mu: f32,         // NLMS step size
-    leak: f32,       // tap leakage (keeps weights from drifting)
-    power: f32,      // running input power for NLMS normalization
+    mu: f32,    // NLMS step size
+    leak: f32,  // tap leakage (keeps weights from drifting)
+    power: f32, // running input power for NLMS normalization
 }
 
 impl AutoNotch {

@@ -16,31 +16,39 @@
 pub mod aurora;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cache;
+pub mod clouds;
 pub mod data;
 pub mod donki;
+pub mod ephem;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod feed;
-pub mod ephem;
 pub mod helio;
 pub mod imagery;
-pub mod indices;
 pub mod impact;
+pub mod indices;
 pub mod planets;
 pub mod satellites;
+pub mod satfreq;
 pub mod swpc;
 pub mod timefmt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tlesub;
 pub mod vec3;
 
 pub use aurora::{AuroraOval, HemisphericPower, KpPoint};
+pub use clouds::{Band, CloudField, ConvCell};
 pub use data::{SolarData, Source, SourceStatus};
 pub use donki::{CmeAnalysis, CmeEvent, FlareEvent};
 pub use ephem::{AU, EARTH_R, MOON_R, SUN_R, SunFrame};
-pub use imagery::{SdoChannel, SunImage};
-pub use indices::{GeomagneticIndex, MufEstimate, SolarFlux, SpaceWeather, XrayLevel};
-pub use impact::{Impact, earth_impact};
-pub use planets::{Moon, Planet, Surface};
 #[cfg(not(target_arch = "wasm32"))]
 pub use feed::{FeedCmd, RawUpdate, SolarFeed};
+pub use imagery::{SdoChannel, SunImage};
+pub use impact::{Impact, earth_impact};
+pub use indices::{GeomagneticIndex, MufEstimate, SolarFlux, SpaceWeather, XrayLevel};
+pub use planets::{Moon, Planet, Surface};
 pub use satellites::{Pass, PassSearch, SatState, Satellite};
+pub use satfreq::{Passband, SatFreqs, SatLink};
 pub use swpc::ActiveRegion;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tlesub::SubStatus;
 pub use vec3::{Basis, Vec3, vec3};

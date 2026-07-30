@@ -334,8 +334,7 @@ impl Hub {
             // *even when it changed nothing*, which is what the reference
             // ExpertSDR3 server does. If the engine then clamps or refuses the
             // value, the state diff corrects it a tick later.
-            let echo =
-                if args.is_empty() { format!("{cmd};") } else { format!("{cmd}:{args};") };
+            let echo = if args.is_empty() { format!("{cmd};") } else { format!("{cmd}:{args};") };
             let snap = self.state.read().unwrap().clone();
             let Some(req) = text::translate(&cmd, &args, &snap) else {
                 debug!(id, cmd, args, "TCI server: unhandled command");
@@ -369,10 +368,8 @@ impl Hub {
                     if let Some(slot) = self.clients.get(&id) {
                         slot.subs.audio_on.store(on, Ordering::Relaxed);
                     }
-                    let any = self
-                        .clients
-                        .values()
-                        .any(|s| s.subs.audio_on.load(Ordering::Relaxed));
+                    let any =
+                        self.clients.values().any(|s| s.subs.audio_on.load(Ordering::Relaxed));
                     self.shared.audio_on.store(any, Ordering::Relaxed);
                     self.send_to(id, echo);
                 }

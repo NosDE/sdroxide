@@ -20,7 +20,9 @@ fn blackman_harris_f64(n: usize, i: usize) -> f64 {
 pub fn lowpass_taps(ntaps: usize, cutoff: f64) -> Vec<f32> {
     let center = (ntaps - 1) as f64 / 2.0;
     let mut taps: Vec<f64> = (0..ntaps)
-        .map(|i| 2.0 * cutoff * sinc(2.0 * cutoff * (i as f64 - center)) * blackman_harris_f64(ntaps, i))
+        .map(|i| {
+            2.0 * cutoff * sinc(2.0 * cutoff * (i as f64 - center)) * blackman_harris_f64(ntaps, i)
+        })
         .collect();
     let sum: f64 = taps.iter().sum();
     taps.iter_mut().for_each(|t| *t /= sum);
@@ -92,6 +94,52 @@ impl FirDecim {
         for o in 0..count {
             let base = o * self.factor;
             let mut acc = Complex32::default();
+            for (k, &t) in self.taps.iter().enumerate() {
+                acc += self.buf[base + k] * t;
+            }
+            out.push(acc);
+        }
+        self.buf.drain(..count * self.factor);
+    }
+}
+
+/// Real-valued decimating FIR: the counterpart to [`FirDecim`] for audio.
+///
+/// Only the kept outputs are computed, so a long anti-alias filter costs
+/// `ntaps / factor` multiply-accumulates per output sample — which is what
+/// makes the two 15 kHz low-passes of the WFM stereo decoder cheaper than the
+/// single non-decimating one they replace.
+///
+/// The cutoff is given in Hz at the *input* rate; the caller is responsible for
+/// keeping it below the output Nyquist.
+pub struct RealFirDecim {
+    taps: Vec<f32>,
+    factor: usize,
+    buf: Vec<f32>,
+}
+
+impl RealFirDecim {
+    pub fn new(ntaps: usize, cutoff_hz: f64, sample_rate: f64, factor: usize) -> Self {
+        assert!(factor >= 1);
+        RealFirDecim { taps: lowpass_taps(ntaps, cutoff_hz / sample_rate), factor, buf: Vec::new() }
+    }
+
+    /// Group delay in samples at the *output* rate.
+    pub fn delay(&self) -> f64 {
+        (self.taps.len() - 1) as f64 / 2.0 / self.factor as f64
+    }
+
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        self.buf.extend_from_slice(input);
+        let n = self.taps.len();
+        if self.buf.len() < n {
+            return;
+        }
+        let count = (self.buf.len() - n) / self.factor + 1;
+        out.reserve(count);
+        for o in 0..count {
+            let base = o * self.factor;
+            let mut acc = 0.0f32;
             for (k, &t) in self.taps.iter().enumerate() {
                 acc += self.buf[base + k] * t;
             }

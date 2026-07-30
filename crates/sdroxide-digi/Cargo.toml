@@ -10,6 +10,24 @@ license = "GPL-3.0-or-later"
 sdroxide-types.workspace = true
 sdroxide-dsp.workspace = true
 sdroxide-rade.workspace = true
+# The JS8 candidate loop hands complex baseband between mfsk-core primitives.
+num-complex.workspace = true
 mfsk-core = { version = "0.7.4", default-features = false, features = ["std", "ft8", "ft4", "parallel", "fft-rustfft"] }
 crossbeam-channel.workspace = true
 tracing.workspace = true
+# RIFP: the manifest is JSON, the object is verified with SHA-256, and its
+# content-encodings are ZLIB, PNG/JPEG, and CCITT Group 4 facsimile in a TIFF
+# wrapper. All pure Rust. `flate2` is shared with JS8, whose word dictionary
+# ships deflated (src/js8/jsc_dict.bin) and is inflated once on first use.
+serde.workspace = true
+serde_json = "1"
+sha2 = "0.11"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+fax = "0.2"
+# Session IDs: the draft asks for a CSPRNG, which is all this is used for.
+getrandom = "0.3"
+
+[dev-dependencies]
+# WAV in and out for the JS8 interop bridge and the decoder corpus tests.
+hound = "3"

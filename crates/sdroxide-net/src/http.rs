@@ -14,12 +14,7 @@ fn agent() -> ureq::Agent {
 
 /// GET `url`, returning the response body as a string.
 pub fn get(url: &str) -> Result<String, String> {
-    agent()
-        .get(url)
-        .call()
-        .map_err(err_string)?
-        .into_string()
-        .map_err(|e| e.to_string())
+    agent().get(url).call().map_err(err_string)?.into_string().map_err(|e| e.to_string())
 }
 
 /// POST `fields` as `application/x-www-form-urlencoded`.

@@ -252,7 +252,12 @@ pub const MAX_SOUNDING_KM: f64 = 4000.0;
 /// across the day/night terminator, so a number interpolated from sounders on
 /// the other side of it is a guess. [`MufEstimate::confidence`] says which case
 /// you are in rather than hiding it.
-pub fn estimate_muf(stations: &[Ionosonde], lat: f64, lon: f64, now_unix: i64) -> Option<MufEstimate> {
+pub fn estimate_muf(
+    stations: &[Ionosonde],
+    lat: f64,
+    lon: f64,
+    now_unix: i64,
+) -> Option<MufEstimate> {
     let mut sum_w = 0.0;
     let mut sum_muf = 0.0;
     let mut sum_fof2 = 0.0;

@@ -290,11 +290,7 @@ impl CwSkimmer {
             let k = (t.bin.rem_euclid(n as i64)) as usize;
             let floor = self.noise[k].max(1e-12);
             t.env = ENV_A * t.env + (1.0 - ENV_A) * self.power[k];
-            let on = if t.key_on {
-                t.env > floor * OFF_RATIO
-            } else {
-                t.env > floor * ON_RATIO
-            };
+            let on = if t.key_on { t.env > floor * OFF_RATIO } else { t.env > floor * ON_RATIO };
             if on {
                 t.hits = t.hits.saturating_add(1);
                 t.last_on_ms = now;
@@ -332,11 +328,7 @@ impl CwSkimmer {
         // Prune stale tracks.
         self.tracks.retain(|t| {
             let age = now - t.last_on_ms;
-            if t.dec.text().is_empty() {
-                age < PRUNE_EMPTY_MS
-            } else {
-                age < PRUNE_DECODED_MS
-            }
+            if t.dec.text().is_empty() { age < PRUNE_EMPTY_MS } else { age < PRUNE_DECODED_MS }
         });
     }
 
@@ -361,11 +353,8 @@ impl CwSkimmer {
                 // gives a sub-bin carrier offset in [-0.5, 0.5].
                 let [a, b, c] = t.pk;
                 let denom = a - 2.0 * b + c;
-                let delta = if denom < 0.0 {
-                    (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
-                } else {
-                    0.0
-                };
+                let delta =
+                    if denom < 0.0 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
                 let callsign = find_callsign(text);
                 let meaty = text
                     .chars()
@@ -392,13 +381,7 @@ impl CwSkimmer {
     pub fn debug_dump(&self) {
         for t in &self.tracks {
             if t.hits >= 3 {
-                eprintln!(
-                    "bin{} hits{} wpm{} text={:?}",
-                    t.bin,
-                    t.hits,
-                    t.dec.wpm(),
-                    t.dec.text()
-                );
+                eprintln!("bin{} hits{} wpm{} text={:?}", t.bin, t.hits, t.dec.wpm(), t.dec.text());
             }
         }
     }

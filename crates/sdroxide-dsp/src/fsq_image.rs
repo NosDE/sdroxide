@@ -190,11 +190,8 @@ impl FsqImageRx {
                         self.pix_acc = 0.0;
                         self.pix_n = 0;
                         if self.img.len() >= IMG_W * IMG_H {
-                            result = Some((
-                                std::mem::take(&mut self.img),
-                                IMG_W as u16,
-                                IMG_H as u16,
-                            ));
+                            result =
+                                Some((std::mem::take(&mut self.img), IMG_W as u16, IMG_H as u16));
                             self.reset();
                         }
                     }
@@ -241,12 +238,9 @@ mod tests {
         let (img, w, h) = got.expect("image should decode");
         assert_eq!((w, h), (IMG_W as u16, IMG_H as u16));
         // Mean absolute error should be small (discriminator is approximate).
-        let mae: f64 = img
-            .iter()
-            .zip(&src)
-            .map(|(&a, &b)| (a as f64 - b as f64).abs())
-            .sum::<f64>()
-            / img.len() as f64;
+        let mae: f64 =
+            img.iter().zip(&src).map(|(&a, &b)| (a as f64 - b as f64).abs()).sum::<f64>()
+                / img.len() as f64;
         assert!(mae < 30.0, "mean abs error too high: {mae}");
     }
 }

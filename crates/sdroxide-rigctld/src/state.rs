@@ -101,7 +101,8 @@ impl RigState {
 /// Every mode driven by the digital engine (FT8/FT4, the keyboard modems,
 /// SSTV, RF Paint, RADE) reports `PKTUSB`, because that is what they are on the
 /// air: upper sideband with data in the audio. See [`from_hamlib_mode`] for why
-/// that matters.
+/// that matters. RIFP is the exception — its CPFSK profile keys the carrier —
+/// so it reports `PKTFM`.
 pub fn to_hamlib_mode(m: Mode) -> &'static str {
     match m {
         Mode::Lsb => "LSB",
@@ -110,6 +111,8 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         Mode::Am => "AM",
         Mode::Sam => "SAM",
         Mode::Nfm => "FM",
+        // RIFP is data on an FM carrier, not on a sideband.
+        Mode::Rifp => "PKTFM",
         Mode::Wfm => "WFM",
         Mode::Digu => "PKTUSB",
         Mode::Digl => "PKTLSB",
@@ -117,12 +120,15 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         Mode::Spec => "SPEC",
         Mode::Rtty => "RTTY",
         Mode::Ft8
+        | Mode::Js8
         | Mode::Ft4
         | Mode::Psk
         | Mode::Sstv
+        | Mode::Wefax
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
+        | Mode::Hell
         | Mode::RfPaint
         | Mode::Rade => "PKTUSB",
     }
@@ -180,7 +186,7 @@ mod tests {
     /// mode must therefore parse back to something we treat as unchanged.
     #[test]
     fn digital_modes_report_pktusb() {
-        for m in [Mode::Ft8, Mode::Ft4, Mode::Psk, Mode::Sstv, Mode::Fsq, Mode::Rade] {
+        for m in [Mode::Ft8, Mode::Ft4, Mode::Psk, Mode::Sstv, Mode::Fsq, Mode::Hell, Mode::Rade] {
             assert_eq!(to_hamlib_mode(m), "PKTUSB", "{m:?}");
         }
     }

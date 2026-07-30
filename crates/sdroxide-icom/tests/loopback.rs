@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sdroxide_icom::IcomUpdate;
 use sdroxide_icom::packet::{self, kind};
 use sdroxide_icom::payload;
-use sdroxide_icom::IcomUpdate;
 
 /// Every datagram the stand-in received, tagged with the stream it arrived on.
 type Received = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
@@ -75,9 +75,7 @@ impl FakeRadio {
                     if i == 2 {
                         *peer.lock().unwrap() = Some(from);
                     }
-                    state.handle(
-                        &sock, from, pkt, i, &user, &pass, &civ, &tx_audio, &logged_in,
-                    );
+                    state.handle(&sock, from, pkt, i, &user, &pass, &civ, &tx_audio, &logged_in);
                 }
             });
         }
@@ -143,13 +141,15 @@ impl Stream {
             kind::ARE_YOU_THERE => {
                 self.remote_sid = h.local_sid;
                 self.local_sid = 0xAAAA_0000 + stream as u32;
-                let mut answer = packet::control(kind::I_AM_HERE, 0, self.local_sid, self.remote_sid);
+                let mut answer =
+                    packet::control(kind::I_AM_HERE, 0, self.local_sid, self.remote_sid);
                 answer[6..8].copy_from_slice(&h.seq.to_le_bytes());
                 let _ = sock.send_to(&answer, from);
                 return;
             }
             kind::ARE_YOU_READY => {
-                let answer = packet::control(kind::ARE_YOU_READY, 1, self.local_sid, self.remote_sid);
+                let answer =
+                    packet::control(kind::ARE_YOU_READY, 1, self.local_sid, self.remote_sid);
                 let _ = sock.send_to(&answer, from);
                 return;
             }
@@ -235,7 +235,11 @@ fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
 
 /// The stand-in listens on ephemeral ports, so the client is pointed at them
 /// through the same entry point the real one uses.
-fn connect(radio: &FakeRadio, user: &str, pass: &str) -> sdroxide_icom::Result<sdroxide_icom::IcomHandle> {
+fn connect(
+    radio: &FakeRadio,
+    user: &str,
+    pass: &str,
+) -> sdroxide_icom::Result<sdroxide_icom::IcomHandle> {
     sdroxide_icom::IcomHandle::connect_to(
         Ipv4Addr::LOCALHOST,
         radio.ports,

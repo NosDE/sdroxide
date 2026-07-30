@@ -45,6 +45,25 @@ pub trait IqSource: Send {
     fn center_hz(&self) -> f64;
     fn set_center_hz(&mut self, hz: f64) -> Result<()>;
 
+    /// How far above the operator's VFO this front end wants its LO parked, or
+    /// `0.0` to tune the LO straight to the VFO.
+    ///
+    /// Zero-IF hardware leaves LO leakage, converter offset and flicker noise
+    /// piled up at DC, which is exactly where the VFO would otherwise sit. A
+    /// DC blocker takes out the static part, but not the flicker noise or the
+    /// signal's own IQ image folding onto it — measured on a HackRF One at
+    /// 2 Msps, an FM broadcast station on the LO recovers a 19 kHz pilot 12 dB
+    /// above the noise floor with the offset removed, against 26 dB once the
+    /// station is moved off DC. So the LO is parked clear of the VFO and the
+    /// DDC brings the signal back down; the offset is the engine's business
+    /// because it owns retuning (see `keep_vfo_in_span`).
+    ///
+    /// Default: `0.0`, which is right for low-IF and direct-sampling front ends
+    /// (RTL-SDR, HPSDR, TCI) and for demod-audio rigs that have no DDC at all.
+    fn lo_offset_hz(&self) -> f64 {
+        0.0
+    }
+
     /// Blocking read. Returns the number of samples written to `buf`;
     /// 0 means a timeout (caller should just retry).
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
@@ -203,6 +222,30 @@ pub trait IqSource: Send {
     fn needs_reopen(&self) -> bool {
         false
     }
+
+    /// Give up any hardware held exclusively, ahead of the engine building this
+    /// front-end's replacement.
+    ///
+    /// A USB dongle is claimed by exactly one handle at a time, and the kernel
+    /// does not care that the second claim comes from the same process: opening
+    /// the replacement while the outgoing source still holds the interface
+    /// fails as "device busy", which reaches the operator as the rather
+    /// alarming claim that another program has taken their radio. Pressing
+    /// Apply in Settings → Radio with an RTL-SDR running did exactly that. So
+    /// the engine tells the outgoing source to stand down first.
+    ///
+    /// Called only on the reopen paths, where the source is on its way out
+    /// regardless. Implementations must be idempotent, and must leave the
+    /// source inert but still callable — `read` delivering nothing rather than
+    /// panicking — and reporting [`IqSource::needs_reopen`], so that a reopen
+    /// which then fails leaves the engine retrying in the background rather
+    /// than holding a corpse it will never replace.
+    ///
+    /// Default: nothing to release. That is right for file, signal-generator
+    /// and network sources, and it is the better behaviour where it applies —
+    /// a replacement built alongside the source it replaces means a bad new
+    /// config leaves the working interface on air.
+    fn release(&mut self) {}
 }
 
 /// Paces reads so a non-hardware source delivers samples in real time.
@@ -298,10 +341,12 @@ impl IqSource for SigGenSource {
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         use std::f64::consts::TAU;
         for s in buf.iter_mut() {
-            let mut acc = Complex32::new(self.noise_amp * self.white(), self.noise_amp * self.white());
+            let mut acc =
+                Complex32::new(self.noise_amp * self.white(), self.noise_amp * self.white());
             for (i, &(offset, amp)) in self.tones.iter().enumerate() {
                 let ph = self.phases[i];
-                acc += Complex32::new((ph.cos() * amp as f64) as f32, (ph.sin() * amp as f64) as f32);
+                acc +=
+                    Complex32::new((ph.cos() * amp as f64) as f32, (ph.sin() * amp as f64) as f32);
                 self.phases[i] = (ph + TAU * offset / self.sample_rate) % TAU;
             }
             *s = acc;
@@ -311,11 +356,7 @@ impl IqSource for SigGenSource {
     }
 
     fn describe(&self) -> String {
-        format!(
-            "signal generator ({} tones, {:.3} Msps)",
-            self.tones.len(),
-            self.sample_rate / 1e6
-        )
+        format!("signal generator ({} tones, {:.3} Msps)", self.tones.len(), self.sample_rate / 1e6)
     }
 }
 

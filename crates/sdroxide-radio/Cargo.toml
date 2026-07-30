@@ -18,17 +18,17 @@ soapysdr = { version = "0.5.1", optional = true }
 triple_buffer = "9.0.0"
 crossbeam-channel.workspace = true
 rtrb.workspace = true
-sdroxide-config = { version = "0.6.0", path = "../sdroxide-config" }
-sdroxide-digi = { version = "0.6.0", path = "../sdroxide-digi" }
-sdroxide-skimmer = { version = "0.6.0", path = "../sdroxide-skimmer" }
-sdroxide-net = { version = "0.6.0", path = "../sdroxide-net" }
+sdroxide-config = { path = "../sdroxide-config" }
+sdroxide-digi = { path = "../sdroxide-digi" }
+sdroxide-skimmer = { path = "../sdroxide-skimmer" }
+sdroxide-net = { path = "../sdroxide-net" }
 # The built-in TCI server, which the engine owns and feeds. (The TCI *client*
 # in the same crate is built by the binary, not from here.)
 sdroxide-tci.workspace = true
 # The built-in rigctld server: control-only, so unlike TCI it carries no
 # streams — the engine just publishes state and drains requests.
-sdroxide-rigctld = { version = "0.6.0", path = "../sdroxide-rigctld" }
-sdroxide-wsjtx = { version = "0.6.0", path = "../sdroxide-wsjtx" }
+sdroxide-rigctld = { path = "../sdroxide-rigctld" }
+sdroxide-wsjtx = { path = "../sdroxide-wsjtx" }
 # SSTV: encode received images to PNG for the config store, decode composed
 # TX images (PNG) back to RGB. Minimal formats to keep the build lean.
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -80,7 +80,10 @@ pub fn set_span_frame(radio: u8, span_hz: f64) -> Vec<u8> {
         .iter()
         .copied()
         .min_by(|a, b| {
-            (a - span_hz).abs().partial_cmp(&(b - span_hz).abs()).unwrap_or(std::cmp::Ordering::Equal)
+            (a - span_hz)
+                .abs()
+                .partial_cmp(&(b - span_hz).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or(50_000.0);
     let mut data = vec![0x15];

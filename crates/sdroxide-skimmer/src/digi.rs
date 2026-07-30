@@ -443,8 +443,7 @@ impl DigiSkimmer {
     #[cfg(test)]
     fn debug_dump(&self) {
         let mx = self.smooth_power.iter().cloned().fold(0.0f32, f32::max);
-        let floor_avg =
-            self.floor.iter().sum::<f32>() / self.floor.len().max(1) as f32;
+        let floor_avg = self.floor.iter().sum::<f32>() / self.floor.len().max(1) as f32;
         eprintln!(
             "floor(avg)={:.2e} maxsmooth/floor={:.1} tracks={} confirm={:?}",
             floor_avg,

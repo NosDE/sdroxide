@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use tungstenite::{HandshakeError, Message, WebSocket};
 
-pub use net::{TciError, TciHandle, TciUpdate, TX_RATE_HZ};
+pub use net::{TX_RATE_HZ, TciError, TciHandle, TciUpdate};
 
 /// Default TCI port (ExpertSDR3).
 pub const DEFAULT_PORT: u16 = 50001;

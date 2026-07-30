@@ -125,9 +125,8 @@ pub(crate) fn apply_action(
         };
         // Resolve an absolute position into this action's range up front, so
         // each arm below only has to deal with "here is the new value".
-        let target = abs.and_then(|p| {
-            absolute_range(act, state).map(|(lo, hi)| lo + p * (hi - lo))
-        });
+        let target =
+            abs.and_then(|p| absolute_range(act, state).map(|(lo, hi)| lo + p * (hi - lo)));
         if abs.is_some() && target.is_none() {
             return;
         }
@@ -291,12 +290,8 @@ pub(crate) fn apply_action(
         }
         SubRx => cmds.push(Command::SetSubRx(!state.sub_rx_enabled)),
         Split => cmds.push(Command::SetSplit(!state.split)),
-        RitEnable => {
-            cmds.push(Command::SetRit { enabled: !state.rit.enabled, hz: state.rit.hz })
-        }
-        XitEnable => {
-            cmds.push(Command::SetXit { enabled: !state.xit.enabled, hz: state.xit.hz })
-        }
+        RitEnable => cmds.push(Command::SetRit { enabled: !state.rit.enabled, hz: state.rit.hz }),
+        XitEnable => cmds.push(Command::SetXit { enabled: !state.xit.enabled, hz: state.xit.hz }),
         RitClear => cmds.push(Command::SetRit { enabled: state.rit.enabled, hz: 0 }),
         XitClear => cmds.push(Command::SetXit { enabled: state.xit.enabled, hz: 0 }),
         VfoSelect(v) => cmds.push(Command::SelectVfo(v)),
@@ -341,6 +336,7 @@ pub(crate) fn apply_action(
         }
         PeakHold => ui.view.peak_hold = !ui.view.peak_hold,
         SpectrumCollapse => ui.view.spectrum_collapsed = !ui.view.spectrum_collapsed,
+        WaterfallFlip => ui.view.waterfall_flip = !ui.view.waterfall_flip,
         ToggleHelp => *ui.help = !*ui.help,
         ToggleSettings => *ui.settings = !*ui.settings,
         ToggleLogbook => *ui.logbook = !*ui.logbook,
@@ -636,8 +632,7 @@ impl InputRuntime {
                     } else if self.release(src).is_none() {
                         continue;
                     }
-                    let sample =
-                        if down { ActionInput::Press } else { ActionInput::Release };
+                    let sample = if down { ActionInput::Press } else { ActionInput::Release };
                     apply_action(action, sample, mode, state, ui, cmds);
                 }
             }
@@ -859,9 +854,8 @@ impl InputRuntime {
     pub fn midi_ports(&self) -> (Vec<MidiPort>, Vec<MidiPort>) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let map = |v: Vec<sdroxide_midi::PortInfo>| {
-                v.into_iter().map(|p| (p.id, p.name)).collect()
-            };
+            let map =
+                |v: Vec<sdroxide_midi::PortInfo>| v.into_iter().map(|p| (p.id, p.name)).collect();
             (map(sdroxide_midi::input_ports()), map(sdroxide_midi::output_ports()))
         }
         #[cfg(target_arch = "wasm32")]
@@ -933,6 +927,7 @@ fn indicator(act: Action, state: &RadioState, view: &ViewState) -> Option<u8> {
         RecordToggle => on(state.recording),
         PeakHold => on(view.peak_hold),
         SpectrumCollapse => on(view.spectrum_collapsed),
+        WaterfallFlip => on(view.waterfall_flip),
         VfoSelect(v) => on(state.active_vfo == v),
         Volume => frac(state.rx[0].volume),
         SubVolume => frac(state.rx[1].volume),
@@ -1033,8 +1028,22 @@ mod tests {
         let mut flags = [false; 6];
         let mut ui = sink(&mut view, &mut flags);
         let mut cmds = Vec::new();
-        apply_action(Action::Ptt, ActionInput::Press, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
-        apply_action(Action::Ptt, ActionInput::Release, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        apply_action(
+            Action::Ptt,
+            ActionInput::Press,
+            ButtonMode::Momentary,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
+        apply_action(
+            Action::Ptt,
+            ActionInput::Release,
+            ButtonMode::Momentary,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
         assert_eq!(cmds, vec![Command::SetPtt(true), Command::SetPtt(false)]);
     }
 
@@ -1049,11 +1058,25 @@ mod tests {
         let mut flags = [false; 6];
         let mut ui = sink(&mut view, &mut flags);
         let mut cmds = Vec::new();
-        apply_action(Action::Ptt, ActionInput::Press, ButtonMode::Toggle, &mut state, &mut ui, &mut cmds);
+        apply_action(
+            Action::Ptt,
+            ActionInput::Press,
+            ButtonMode::Toggle,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
         assert_eq!(cmds, vec![Command::SetPtt(false)]);
         // Release on a toggle does nothing.
         cmds.clear();
-        apply_action(Action::Ptt, ActionInput::Release, ButtonMode::Toggle, &mut state, &mut ui, &mut cmds);
+        apply_action(
+            Action::Ptt,
+            ActionInput::Release,
+            ButtonMode::Toggle,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
         assert!(cmds.is_empty());
     }
 
@@ -1065,8 +1088,22 @@ mod tests {
         let mut flags = [false; 6];
         let mut ui = sink(&mut view, &mut flags);
         let mut cmds = Vec::new();
-        apply_action(Action::SwapVfos, ActionInput::Press, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
-        apply_action(Action::SwapVfos, ActionInput::Release, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        apply_action(
+            Action::SwapVfos,
+            ActionInput::Press,
+            ButtonMode::Momentary,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
+        apply_action(
+            Action::SwapVfos,
+            ActionInput::Release,
+            ButtonMode::Momentary,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
         assert_eq!(cmds, vec![Command::SwapVfos]);
     }
 
@@ -1138,10 +1175,12 @@ mod tests {
     fn band_stepping_skips_general_coverage() {
         assert_eq!(step_band(Band::M20, true), Some(Band::M17));
         assert_eq!(step_band(Band::M20, false), Some(Band::M30));
-        assert_eq!(step_band(Band::M2, true), Some(Band::Cm70));
-        // Wraps within the ham bands only — round the top end, past GEN.
-        assert_eq!(step_band(Band::Cm23, true), Some(Band::M160));
-        assert_eq!(step_band(Band::M160, false), Some(Band::Cm23));
+        assert_eq!(step_band(Band::M2, true), Some(Band::M70));
+        assert_eq!(step_band(Band::M70, true), Some(Band::M23));
+        // Wraps within the ham bands only, from the highest to the lowest —
+        // round the top end, past GEN.
+        assert_eq!(step_band(Band::M23, true), Some(Band::M160));
+        assert_eq!(step_band(Band::M160, false), Some(Band::M23));
         assert_eq!(step_band(Band::Gen, true), None);
     }
 
@@ -1153,8 +1192,22 @@ mod tests {
         let mut cmds = Vec::new();
         {
             let mut ui = sink(&mut view, &mut flags);
-            apply_action(Action::FitSpan, ActionInput::Press, ButtonMode::Toggle, &mut state, &mut ui, &mut cmds);
-            apply_action(Action::ToggleHelp, ActionInput::Press, ButtonMode::Toggle, &mut state, &mut ui, &mut cmds);
+            apply_action(
+                Action::FitSpan,
+                ActionInput::Press,
+                ButtonMode::Toggle,
+                &mut state,
+                &mut ui,
+                &mut cmds,
+            );
+            apply_action(
+                Action::ToggleHelp,
+                ActionInput::Press,
+                ButtonMode::Toggle,
+                &mut state,
+                &mut ui,
+                &mut cmds,
+            );
         }
         assert!(cmds.is_empty());
         assert!(flags[0], "help window should have toggled open");

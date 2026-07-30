@@ -119,8 +119,12 @@ impl FakeRadio {
                     }
                 }
                 // A radio that has run out of panadapters or slices.
-                let refused =
-                    refuse.lock().unwrap().iter().find(|(pre, _)| cmd.starts_with(pre)).map(|(_, c)| *c);
+                let refused = refuse
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(pre, _)| cmd.starts_with(pre))
+                    .map(|(_, c)| *c);
                 if let Some(code) = refused {
                     let _ = writer.write_all(format!("R{seq}|{code:08X}|\n").as_bytes());
                     let _ = writer.flush();
@@ -446,15 +450,9 @@ fn transmits_paced_dax_audio() {
 #[test]
 fn shares_the_radios_objects_when_it_has_none_left() {
     let radio = FakeRadio::start_with(FakeOpts {
-        refuse: vec![
-            ("display pan c".into(), 0x5000_0009),
-            ("slice create".into(), 0x5000_0003),
-        ],
+        refuse: vec![("display pan c".into(), 0x5000_0009), ("slice create".into(), 0x5000_0003)],
         on_sub: vec![
-            (
-                "pan all".into(),
-                "display pan 0x40000000 center=14.100000 bandwidth=0.200000".into(),
-            ),
+            ("pan all".into(), "display pan 0x40000000 center=14.100000 bandwidth=0.200000".into()),
             (
                 "slice all".into(),
                 "slice 0 in_use=1 pan=0x40000000 RF_frequency=14.100000 mode=USB".into(),
@@ -477,10 +475,8 @@ fn shares_the_radios_objects_when_it_has_none_left() {
     drop(handle);
     // Our own streams go back; the borrowed objects stay.
     assert!(
-        wait_for(Duration::from_secs(2), || radio
-            .saw("stream remove 0x04000001")
-            .then_some(()))
-        .is_some(),
+        wait_for(Duration::from_secs(2), || radio.saw("stream remove 0x04000001").then_some(()))
+            .is_some(),
         "the IQ stream was never removed"
     );
     // The id matters: `display pan rfgain_info` starts the same way, and a
@@ -521,10 +517,8 @@ fn replaces_a_shared_panadapter_that_disappears() {
     // What it created this time is its own, so it goes back on the way out.
     drop(handle);
     assert!(
-        wait_for(Duration::from_secs(2), || radio
-            .saw("display pan r 0x40000002")
-            .then_some(()))
-        .is_some(),
+        wait_for(Duration::from_secs(2), || radio.saw("display pan r 0x40000002").then_some(()))
+            .is_some(),
         "the replacement panadapter was left behind"
     );
 }
@@ -583,7 +577,10 @@ fn reclaims_its_own_leftovers_and_nobody_elses() {
         wait_for(Duration::from_secs(2), || radio.saw("slice r 3").then_some(())).is_some(),
         "a leftover slice of ours was not released"
     );
-    assert!(radio.saw("display pan r 0x40000009"), "a leftover panadapter of ours was not released");
+    assert!(
+        radio.saw("display pan r 0x40000009"),
+        "a leftover panadapter of ours was not released"
+    );
     // …and another client's objects are untouched.
     assert!(!radio.saw("slice r 5"), "removed a slice belonging to another client");
     assert!(!radio.saw("display pan r 0x4000000F"), "removed another client's panadapter");
@@ -628,7 +625,10 @@ fn follows_a_shared_slice_instead_of_moving_it() {
     let handle = connect(&radio); // asked for 14.100 MHz
 
     assert!(!radio.saw("slice t 4"), "moved another operator's slice");
-    assert!(radio.saw("display pan s 0x40000000 center=7.074000"), "did not follow the shared slice");
+    assert!(
+        radio.saw("display pan s 0x40000000 center=7.074000"),
+        "did not follow the shared slice"
+    );
     assert!(
         (handle.center_hz - 7_074_000.0).abs() < 1.0,
         "the session did not adopt the shared slice's frequency: {}",
@@ -725,10 +725,8 @@ fn tears_down_what_it_created() {
     // Drop joins the net thread, but the stand-in still has to read what it
     // wrote.
     assert!(
-        wait_for(Duration::from_secs(2), || radio
-            .saw("display pan r 0x40000000")
-            .then_some(()))
-        .is_some(),
+        wait_for(Duration::from_secs(2), || radio.saw("display pan r 0x40000000").then_some(()))
+            .is_some(),
         "the panadapter was never removed"
     );
     assert!(radio.saw("stream remove 0x04000001"), "IQ stream left behind");

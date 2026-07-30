@@ -1,9 +1,8 @@
 //! OpenHPSDR device discovery over UDP port 1024.
 //!
 //! Broadcasts both a Protocol 1 and a Protocol 2 discovery request so we can
-//! enumerate every board on the LAN and report which protocol each speaks (only
-//! Protocol 2 is drivable today; Protocol 1 boards such as the Hermes-Lite 2 are
-//! surfaced but flagged unsupported).
+//! enumerate every board on the LAN and report which protocol each speaks. Both
+//! protocols are drivable, so every responder is selectable.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};

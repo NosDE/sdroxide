@@ -525,8 +525,7 @@ mod tests {
 
             let f1 = sun_frame(jd + 1.0);
             let (lat1, lon1) = f1.stonyhurst_of(dir1);
-            let expected =
-                sidereal_rotation_deg_per_day(lat) - EARTH_MEAN_MOTION_DEG_PER_DAY;
+            let expected = sidereal_rotation_deg_per_day(lat) - EARTH_MEAN_MOTION_DEG_PER_DAY;
             assert!((lat1 - lat).abs() < 0.05, "latitude drifted: {lat} → {lat1}");
             assert!(
                 (wrap180(lon1 - start_lon) - expected).abs() < 0.05,
@@ -648,4 +647,3 @@ mod tests {
         assert!((geodetic_to_body(90.0, 0.0) - vec3(0.0, 0.0, 1.0)).len() < 1e-12);
     }
 }
-

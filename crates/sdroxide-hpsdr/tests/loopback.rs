@@ -84,10 +84,18 @@ fn p1_loopback_rx() {
     });
 
     // Open the handle: discovery must detect Protocol 1, then RX must flow.
-    let mut handle = sdroxide_hpsdr::HpsdrHandle::open(Ipv4Addr::LOCALHOST, 48_000.0)
-        .expect("open loopback handle");
+    let mut handle = sdroxide_hpsdr::HpsdrHandle::open(
+        Ipv4Addr::LOCALHOST,
+        48_000.0,
+        sdroxide_hpsdr::LNA_GAIN_DEFAULT_DB,
+        sdroxide_types::HpsdrFilterBoard::None,
+        false,
+    )
+    .expect("open loopback handle");
     assert_eq!(handle.protocol, 1, "detected as Protocol 1");
     assert_eq!(handle.board, "Hermes-Lite 2");
+    // An HL2 is a board whose front-end gain we can command.
+    assert!(handle.has_lna_gain());
 
     let mut out = vec![0f32; 4096];
     let mut got = 0usize;

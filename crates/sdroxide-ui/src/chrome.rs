@@ -243,12 +243,7 @@ pub fn module_bare<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -
 }
 
 /// Like [`module_bare`] but with an explicit box `height`.
-pub fn module_bare_h<R>(
-    ui: &mut Ui,
-    width: f32,
-    height: f32,
-    add: impl FnOnce(&mut Ui) -> R,
-) -> R {
+pub fn module_bare_h<R>(ui: &mut Ui, width: f32, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.allocate_ui_with_layout(
         egui::vec2(width, height),
         egui::Layout::top_down(egui::Align::Min),
@@ -353,6 +348,48 @@ pub fn slider(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
     .inner
 }
 
+/// The draggable divider between two regions of a panel: allocates the strip,
+/// shows the resize cursor over it, and paints three grip marks so it reads as
+/// something that can be moved. Returns the response for the caller's own drag
+/// arithmetic.
+///
+/// One helper for every splitter in the program because the grip marks are the
+/// only thing that says a divider exists at all — a handle that paints nothing
+/// until the pointer is already on it is a control nobody finds.
+///
+/// Orientation comes from the shape: a tall, narrow strip divides two columns
+/// (grips stacked down it, horizontal resize cursor); a wide, short one divides
+/// two rows. `bg` fills the strip first, for handles that sit on the page
+/// background rather than inside a panel.
+pub fn split_handle(ui: &mut Ui, size: egui::Vec2, bg: Option<Color32>) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    // A strip taller than it is wide separates left from right.
+    let columns = size.y >= size.x;
+    let hot = resp.hovered() || resp.dragged();
+    if hot {
+        ui.ctx().set_cursor_icon(if columns {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::ResizeVertical
+        });
+    }
+    let p = ui.painter_at(rect);
+    if let Some(bg) = bg {
+        p.rect_filled(rect, 0.0, bg);
+    }
+    let col = if hot { theme::CYAN } else { Color32::from_gray(70) };
+    let (cx, cy) = (rect.center().x, rect.center().y);
+    for d in [-16.0f32, 0.0, 16.0] {
+        let seg = if columns {
+            [pos2(cx, cy + d - 6.0), pos2(cx, cy + d + 6.0)]
+        } else {
+            [pos2(cx + d - 6.0, cy), pos2(cx + d + 6.0, cy)]
+        };
+        p.line_segment(seg, Stroke::new(2.0, col));
+    }
+    resp
+}
+
 /// Angled chip: a selectable button with cut top-left and bottom-right corners.
 /// Selected chips fill cyan with dark ink, like the reference nav pills.
 pub fn chip(ui: &mut Ui, selected: bool, text: impl Into<RichText>) -> Response {
@@ -406,8 +443,7 @@ fn chip_impl(
         } else {
             (v.bg_fill, v.bg_stroke, v.fg_stroke.color)
         };
-        ui.painter()
-            .add(Shape::convex_polygon(outline, fill, stroke));
+        ui.painter().add(Shape::convex_polygon(outline, fill, stroke));
 
         let text_pos = Pos2 {
             x: rect.center().x - galley.size().x / 2.0,

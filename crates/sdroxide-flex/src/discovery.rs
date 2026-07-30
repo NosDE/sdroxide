@@ -125,10 +125,7 @@ pub fn discover(timeout: Duration) -> Vec<FlexDevice> {
         if found.is_empty() {
             String::new()
         } else {
-            format!(
-                ": {}",
-                found.iter().map(|d| d.label()).collect::<Vec<_>>().join(", ")
-            )
+            format!(": {}", found.iter().map(|d| d.label()).collect::<Vec<_>>().join(", "))
         }
     );
     found
@@ -164,9 +161,8 @@ mod tests {
         let payload = "discovery_protocol_version=3.0.0.2 model=FLEX-8600 \
                        serial=1234-5678-9012-3456 version=4.0.7.42 nickname=Shack_Radio \
                        callsign=DL1ABC ip=192.168.1.50 port=4992 status=Available";
-        let dev =
-            parse_payload(&payload_str(&discovery_datagram(payload)).expect("payload"), None)
-                .expect("device");
+        let dev = parse_payload(&payload_str(&discovery_datagram(payload)).expect("payload"), None)
+            .expect("device");
         assert_eq!(dev.ip, "192.168.1.50");
         assert_eq!(dev.model, "FLEX-8600");
         assert_eq!(dev.name, "Shack Radio");

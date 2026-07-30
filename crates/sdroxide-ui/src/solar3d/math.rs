@@ -27,11 +27,7 @@ impl V3 {
     }
 
     pub fn cross(self, o: V3) -> V3 {
-        v3(
-            self.y * o.z - self.z * o.y,
-            self.z * o.x - self.x * o.z,
-            self.x * o.y - self.y * o.x,
-        )
+        v3(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
     }
 
     pub fn len(self) -> f32 {
@@ -171,7 +167,13 @@ mod tests {
 
     #[test]
     fn identity_is_a_multiplicative_unit() {
-        let m = M4::from_basis(v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0), v3(1.0, 0.0, 0.0), v3(3.0, 4.0, 5.0), 2.0);
+        let m = M4::from_basis(
+            v3(0.0, 1.0, 0.0),
+            v3(0.0, 0.0, 1.0),
+            v3(1.0, 0.0, 0.0),
+            v3(3.0, 4.0, 5.0),
+            2.0,
+        );
         let p = m.mul(&M4::IDENTITY);
         for c in 0..4 {
             for r in 0..4 {
@@ -230,9 +232,9 @@ mod tests {
         // viewing distance — the whole-system overhead shot, an Earth-framing
         // shot, and a close pass where 100 km must still be distinguishable.
         for (dist, sep) in [
-            (360.0f32, 0.127f32),  // 2.4 AU out, across the exaggerated Earth
-            (1.0, 0.006_371),      // Earth framed, across its true diameter
-            (0.05, 0.000_1),       // 50 000 km out, resolving 100 km
+            (360.0f32, 0.127f32), // 2.4 AU out, across the exaggerated Earth
+            (1.0, 0.006_371),     // Earth framed, across its true diameter
+            (0.05, 0.000_1),      // 50 000 km out, resolving 100 km
         ] {
             let near = (dist * 0.0015).clamp(1e-5, 0.5);
             let p = M4::perspective_reversed_z(45f32.to_radians(), 1.6, near, 1.0e6);

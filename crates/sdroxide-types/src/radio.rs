@@ -18,6 +18,9 @@ pub enum Backend {
     Hpsdr,
     /// TCI (Transceiver Control Interface) over WebSocket — ExpertSDR3, Thetis, …
     Tci,
+    /// RTL2832U dongle driven directly over USB by the native driver — no
+    /// SoapySDR, no libusb, nothing to install.
+    RtlSdr,
     /// FlexRadio SmartSDR (FLEX-6000 / FLEX-8000) over its TCP API + VITA-49.
     Flex,
     /// Icom over LAN/WLAN (IC-705, IC-7610, IC-9700) — CI-V and audio over UDP.
@@ -25,12 +28,13 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub const ALL: [Backend; 7] = [
+    pub const ALL: [Backend; 8] = [
         Backend::Auto,
         Backend::Soapy,
         Backend::Cat,
         Backend::Hpsdr,
         Backend::Tci,
+        Backend::RtlSdr,
         Backend::Flex,
         Backend::Icom,
     ];
@@ -41,6 +45,7 @@ impl Backend {
             Backend::Cat => "CAT / Audio",
             Backend::Hpsdr => "HPSDR (network)",
             Backend::Tci => "TCI (network)",
+            Backend::RtlSdr => "RTL-SDR (USB)",
             Backend::Flex => "FlexRadio (network)",
             Backend::Icom => "Icom (network)",
         }
@@ -157,7 +162,8 @@ pub enum PttMethod {
 }
 
 impl PttMethod {
-    pub const ALL: [PttMethod; 4] = [PttMethod::Cat, PttMethod::Dtr, PttMethod::Rts, PttMethod::Vox];
+    pub const ALL: [PttMethod; 4] =
+        [PttMethod::Cat, PttMethod::Dtr, PttMethod::Rts, PttMethod::Vox];
     pub fn label(self) -> &'static str {
         match self {
             PttMethod::Vox => "VOX",
@@ -273,6 +279,35 @@ impl Default for CatConfig {
     }
 }
 
+/// Which accessory filter board is wired to a Hermes-Lite 2's J16 header, and
+/// therefore how its seven open-collector outputs should be driven.
+///
+/// Those pins are general-purpose openHPSDR outputs, not filter-only: operators
+/// also wire them to amplifier PTT, antenna relays and transverter switching.
+/// Driving them from band data would start operating that hardware, so the
+/// default leaves every one of them off and the operator says what is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HpsdrFilterBoard {
+    /// Leave all seven outputs off — the safe default, and correct for a bare
+    /// board with nothing on J16.
+    #[default]
+    None,
+    /// N2ADR filter board: one-hot relay select, forwarded by the gateware over
+    /// I2C to the board's MCP23008.
+    N2adr,
+}
+
+impl HpsdrFilterBoard {
+    pub const ALL: [HpsdrFilterBoard; 2] = [HpsdrFilterBoard::None, HpsdrFilterBoard::N2adr];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HpsdrFilterBoard::None => "None — outputs stay off",
+            HpsdrFilterBoard::N2adr => "N2ADR filter board",
+        }
+    }
+}
+
 /// OpenHPSDR (ethernet SDR) backend configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -284,15 +319,66 @@ pub struct HpsdrConfig {
     pub selected_ip: Option<String>,
     /// DDC sample rate in Hz (48k, 96k, 192k, 384k, 768k, 1536k).
     pub sample_rate_hz: f64,
+    /// Front-end LNA gain in dB applied when the radio is opened, on boards
+    /// that have one (Hermes-Lite 2: −12…+48 dB). Adjust it live in
+    /// Settings → Device; this is the value the rig starts at.
+    #[serde(default = "HpsdrConfig::default_lna_gain_db")]
+    pub lna_gain_db: f64,
+    /// Accessory board on the Hermes-Lite 2's J16 header. Defaults to `None`,
+    /// which leaves the open-collector outputs untouched.
+    #[serde(default)]
+    pub filter_board: HpsdrFilterBoard,
+    /// Conjugate the board's I/Q, mirroring the spectrum about the tuned
+    /// frequency, on transmit as well as receive so the two directions cannot
+    /// disagree about which sideband they are on.
+    ///
+    /// **On by default**: a Hermes-Lite 2 needs it — verified on air, where
+    /// without it FT8 produces no decodes at all and SSB comes out on the wrong
+    /// sideband. A board that turns out not to need it can turn it off.
+    ///
+    /// Deliberately *not* named `swap_iq`, which is what the one release that
+    /// defaulted it to off called it. Ignoring that older key is the migration:
+    /// whether an operator had found the setting and switched it on, or had it
+    /// saved as off without ever knowing it existed, they all land on the value
+    /// that works.
+    #[serde(default = "HpsdrConfig::default_invert_spectrum")]
+    pub invert_spectrum: bool,
 }
 
 impl Default for HpsdrConfig {
     fn default() -> Self {
-        HpsdrConfig { manual_ip: None, selected_ip: None, sample_rate_hz: 1_536_000.0 }
+        HpsdrConfig {
+            manual_ip: None,
+            selected_ip: None,
+            sample_rate_hz: 1_536_000.0,
+            lna_gain_db: Self::default_lna_gain_db(),
+            filter_board: HpsdrFilterBoard::None,
+            invert_spectrum: Self::default_invert_spectrum(),
+        }
     }
 }
 
 impl HpsdrConfig {
+    /// Range of the Hermes-Lite 2 front-end gain, in dB.
+    pub const LNA_GAIN_MIN_DB: f64 = -12.0;
+    pub const LNA_GAIN_MAX_DB: f64 = 48.0;
+    /// Name of the RX gain element the backend exposes for that gain. Lives here
+    /// rather than in `sdroxide-hpsdr` so the (wasm-safe) settings UI can address
+    /// the same element without depending on the native backend crate.
+    pub const LNA_GAIN_ELEMENT: &'static str = "LNA";
+
+    /// Mid-scale default: sensitive enough on a quiet band without clipping the
+    /// ADC on a real antenna.
+    pub fn default_lna_gain_db() -> f64 {
+        20.0
+    }
+
+    /// Hermes-Lite 2 boards deliver a conjugated stream, so inversion is the
+    /// working default. See [`HpsdrConfig::invert_spectrum`].
+    pub fn default_invert_spectrum() -> bool {
+        true
+    }
+
     /// Supported DDC sample rates (Hz) for Protocol 2 boards.
     pub const SAMPLE_RATES: [f64; 6] =
         [48_000.0, 96_000.0, 192_000.0, 384_000.0, 768_000.0, 1_536_000.0];
@@ -302,20 +388,13 @@ impl HpsdrConfig {
 
     /// The sample rates valid for a given protocol (1 or 2).
     pub fn rates_for(protocol: u8) -> &'static [f64] {
-        if protocol == 1 {
-            &Self::P1_SAMPLE_RATES
-        } else {
-            &Self::SAMPLE_RATES
-        }
+        if protocol == 1 { &Self::P1_SAMPLE_RATES } else { &Self::SAMPLE_RATES }
     }
 
     /// Resolve the IP to connect to: manual override, else the persisted pick.
     /// `None` means "discover and use the first responder".
     pub fn target_ip(&self) -> Option<&str> {
-        self.manual_ip
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or(self.selected_ip.as_deref())
+        self.manual_ip.as_deref().filter(|s| !s.trim().is_empty()).or(self.selected_ip.as_deref())
     }
 }
 
@@ -375,6 +454,224 @@ impl TciConfig {
     pub const IQ_RATES: [f64; 3] = [48_000.0, 96_000.0, 192_000.0];
 }
 
+/// How an RTL-SDR reaches HF. The R82xx tuner itself starts at 24 MHz, so
+/// anything below that needs help from the dongle's hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RtlSdrHfMode {
+    /// Tuner only — nothing below 24 MHz.
+    Off,
+    /// Use whatever this dongle has: the V4's built-in upconverter, or
+    /// direct sampling on a V3. Switched automatically at the crossover.
+    #[default]
+    Auto,
+    /// Force direct sampling on the ADC's Q branch (the V3's HF port). Has no
+    /// meaning on a Blog V4, which upconverts instead.
+    DirectQ,
+}
+
+impl RtlSdrHfMode {
+    pub const ALL: [RtlSdrHfMode; 3] =
+        [RtlSdrHfMode::Auto, RtlSdrHfMode::Off, RtlSdrHfMode::DirectQ];
+
+    /// Paired with [`RtlSdrHfMode::from_code`] so the mode can ride the
+    /// `HFMODE` pseudo-element; keep the two in step.
+    pub fn code(self) -> u8 {
+        match self {
+            RtlSdrHfMode::Off => 0,
+            RtlSdrHfMode::Auto => 1,
+            RtlSdrHfMode::DirectQ => 2,
+        }
+    }
+
+    pub fn from_code(code: u8) -> RtlSdrHfMode {
+        match code {
+            0 => RtlSdrHfMode::Off,
+            2 => RtlSdrHfMode::DirectQ,
+            _ => RtlSdrHfMode::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RtlSdrHfMode::Off => "Off (tuner only, 24 MHz up)",
+            RtlSdrHfMode::Auto => "Automatic",
+            RtlSdrHfMode::DirectQ => "Direct sampling (Q branch)",
+        }
+    }
+}
+
+/// Which automatic gain loops to enable. The tuner AGC lives in the R82xx; the
+/// RTL AGC is the demod's digital one. They are independent and can both run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RtlSdrAgc {
+    /// Manual tuner gain, no automatic loops — the setting for measurement and
+    /// for weak-signal digital modes.
+    #[default]
+    Manual,
+    Tuner,
+    Rtl,
+    Both,
+}
+
+impl RtlSdrAgc {
+    pub const ALL: [RtlSdrAgc; 4] =
+        [RtlSdrAgc::Manual, RtlSdrAgc::Tuner, RtlSdrAgc::Rtl, RtlSdrAgc::Both];
+    pub fn label(self) -> &'static str {
+        match self {
+            RtlSdrAgc::Manual => "Manual (no AGC)",
+            RtlSdrAgc::Tuner => "Tuner AGC",
+            RtlSdrAgc::Rtl => "RTL digital AGC",
+            RtlSdrAgc::Both => "Tuner + RTL AGC",
+        }
+    }
+
+    /// Whether the R82xx runs its own LNA/mixer gain loop.
+    pub fn tuner_auto(self) -> bool {
+        matches!(self, RtlSdrAgc::Tuner | RtlSdrAgc::Both)
+    }
+
+    /// Whether the demod's digital AGC runs.
+    pub fn rtl_auto(self) -> bool {
+        matches!(self, RtlSdrAgc::Rtl | RtlSdrAgc::Both)
+    }
+
+    /// AGC mode as a number, so it can ride the existing `SetGain` command on
+    /// the `AGC` pseudo-element instead of needing a new `Command` variant.
+    /// Paired with [`RtlSdrAgc::from_code`]; keep the two in step.
+    pub fn code(self) -> u8 {
+        match self {
+            RtlSdrAgc::Manual => 0,
+            RtlSdrAgc::Tuner => 1,
+            RtlSdrAgc::Rtl => 2,
+            RtlSdrAgc::Both => 3,
+        }
+    }
+
+    pub fn from_code(code: u8) -> RtlSdrAgc {
+        match code {
+            1 => RtlSdrAgc::Tuner,
+            2 => RtlSdrAgc::Rtl,
+            3 => RtlSdrAgc::Both,
+            _ => RtlSdrAgc::Manual,
+        }
+    }
+}
+
+/// RTL-SDR (RTL2832U over USB) backend configuration. Receive only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RtlSdrConfig {
+    /// USB serial of the dongle to open. `None` = the first one found. Serial
+    /// rather than an index because bus position changes on every replug, and
+    /// a persisted index would attach to the wrong dongle.
+    pub serial: Option<String>,
+    /// Sample rate in Hz. The resampler only reaches 225–300 kHz and
+    /// 900 kHz–3.2 MHz; everything between is rejected by the hardware.
+    pub sample_rate_hz: f64,
+    /// Crystal error in parts per million. Read it off the `clock error`
+    /// line that `RUST_LOG=sdroxide_rtlsdr=debug` prints once the stream runs.
+    pub ppm: i32,
+    /// Tuner gain in dB when AGC is off. Snapped to the nearest step the
+    /// hardware can actually produce.
+    pub tuner_gain_db: f64,
+    pub agc: RtlSdrAgc,
+    pub hf_mode: RtlSdrHfMode,
+    /// Bias tee: ~4.5 V DC on the antenna coax for a remote LNA. Off by
+    /// default, and turned off again on a clean shutdown — it will damage a
+    /// transceiver or anything DC-shorted on the other end of the cable.
+    pub bias_tee: bool,
+    /// Bulk transfers kept in flight (advanced). The default gives ~53 ms of
+    /// hardware-side buffering at 2.4 Msps, twice the worst-case retune stall.
+    pub transfers: u8,
+    /// Size of each bulk transfer in KiB (advanced). Must stay a multiple of
+    /// the endpoint's 512-byte packet.
+    pub transfer_kib: u16,
+}
+
+impl Default for RtlSdrConfig {
+    fn default() -> Self {
+        RtlSdrConfig {
+            serial: None,
+            sample_rate_hz: 2_400_000.0,
+            ppm: 0,
+            tuner_gain_db: 30.0,
+            agc: RtlSdrAgc::Manual,
+            hf_mode: RtlSdrHfMode::Auto,
+            bias_tee: false,
+            transfers: 16,
+            transfer_kib: 16,
+        }
+    }
+}
+
+impl RtlSdrConfig {
+    /// Gain element names the backend exposes. They live here rather than in
+    /// `sdroxide-rtlsdr` so the (wasm-safe) settings UI can address them
+    /// without depending on the native backend crate — same reason as
+    /// [`HpsdrConfig::LNA_GAIN_ELEMENT`].
+    pub const TUNER_GAIN_ELEMENT: &'static str = "TUNER";
+    pub const IF_GAIN_ELEMENT: &'static str = "IF";
+    /// Pseudo-elements carrying settings that are not gains at all.
+    ///
+    /// These ride the existing `SetGain` command so that adding this backend
+    /// needs no new `Command` variant, no `DeviceCaps` field and no engine
+    /// change for four settings only one backend has. They are deliberately
+    /// absent from `DeviceCaps::gains`, so nothing renders them as sliders —
+    /// the RTL-SDR settings panel drives them directly. The encodings live
+    /// beside the enums they carry ([`RtlSdrAgc::code`], `HfMode as u8`) so
+    /// the two ends cannot drift.
+    pub const AGC_ELEMENT: &'static str = "AGC";
+    pub const PPM_ELEMENT: &'static str = "PPM";
+    pub const HF_MODE_ELEMENT: &'static str = "HFMODE";
+    pub const BIAS_TEE_ELEMENT: &'static str = "BIASTEE";
+
+    /// Sample rates offered in the UI. All lie inside the resampler's upper
+    /// window except 250 kHz, which is in the lower one. 3.2 Msps is offered
+    /// but drops samples on most hosts.
+    pub const SAMPLE_RATES: [f64; 9] = [
+        250_000.0,
+        960_000.0,
+        1_024_000.0,
+        1_200_000.0,
+        1_536_000.0,
+        1_800_000.0,
+        2_048_000.0,
+        2_400_000.0,
+        3_200_000.0,
+    ];
+
+    /// Maximum R82xx tuner gain, in dB (the last entry of the gain table).
+    pub const GAIN_MAX_DB: f64 = 49.6;
+
+    /// Below this, HF handling kicks in: the Blog V4's upconverter reference
+    /// frequency, and equally the bottom of the R82xx's own range.
+    pub const HF_CROSSOVER_HZ: f64 = 28_800_000.0;
+}
+
+/// One RTL-SDR dongle found on the USB bus. Wasm-safe so it can cross the
+/// `RadioController` trait to the settings UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RtlSdrDevice {
+    /// USB serial string, when the dongle has one programmed.
+    pub serial: Option<String>,
+    /// Best available name: the USB product string, else the VID/PID table.
+    pub name: String,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+impl RtlSdrDevice {
+    /// One-line label for the selection UI.
+    pub fn label(&self) -> String {
+        match &self.serial {
+            Some(s) => format!("{}  (serial {s})", self.name),
+            // Without a serial we can only ever open "the first one", so say so
+            // rather than implying this entry can be pinned.
+            None => format!("{}  [no serial — first match only]", self.name),
+        }
+    }
+}
+
 /// FlexRadio (SmartSDR) backend configuration. Receive is a wideband DAX IQ
 /// stream (sdroxide demodulates); transmit is DAX audio the radio modulates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -425,10 +722,7 @@ impl FlexConfig {
     /// Resolve the IP to connect to: manual override, else the persisted pick.
     /// `None` means "discover and use the first radio found".
     pub fn target_ip(&self) -> Option<&str> {
-        self.manual_ip
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or(self.selected_ip.as_deref())
+        self.manual_ip.as_deref().filter(|s| !s.trim().is_empty()).or(self.selected_ip.as_deref())
     }
 }
 
@@ -521,4 +815,48 @@ pub struct RadioConfig {
     pub tci: TciConfig,
     pub flex: FlexConfig,
     pub icom: IcomConfig,
+    pub rtlsdr: RtlSdrConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every way an existing `radio.json` can arrive has to land on the working
+    /// sideband. The one release that shipped this setting called it `swap_iq`
+    /// and defaulted it to off, which is the broken value — so that key is
+    /// deliberately not read any more, and neither an operator who found the
+    /// checkbox nor one who never knew it existed ends up inverted the wrong way.
+    #[test]
+    fn spectrum_inversion_survives_every_old_config_shape() {
+        let cases = [
+            // Written before the setting existed at all.
+            r#"{"sample_rate_hz": 384000.0}"#,
+            // The old key, left at its (broken) default by someone who never
+            // opened the HPSDR settings.
+            r#"{"sample_rate_hz": 384000.0, "swap_iq": false}"#,
+            // The old key, switched on by an operator who diagnosed it.
+            r#"{"sample_rate_hz": 384000.0, "swap_iq": true}"#,
+            // A completely empty object.
+            r#"{}"#,
+        ];
+        for json in cases {
+            let cfg: HpsdrConfig = serde_json::from_str(json).expect("parses");
+            assert!(cfg.invert_spectrum, "inverted after loading {json}");
+        }
+        // A fresh install gets it too.
+        assert!(HpsdrConfig::default().invert_spectrum);
+        // And an operator who turns it off is still obeyed on the next load.
+        let off: HpsdrConfig =
+            serde_json::from_str(r#"{"invert_spectrum": false}"#).expect("parses");
+        assert!(!off.invert_spectrum);
+    }
+
+    #[test]
+    fn hpsdr_defaults_round_trip() {
+        let cfg = HpsdrConfig::default();
+        let back: HpsdrConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+    }
 }

@@ -67,8 +67,7 @@ impl Default for SkimmerSettings {
 
 impl SkimmerSettings {
     /// Nothing running — the state for devices without a wideband IQ stream.
-    pub const OFF: SkimmerSettings =
-        SkimmerSettings { enabled: [false; 3], squelch_db: [0; 3] };
+    pub const OFF: SkimmerSettings = SkimmerSettings { enabled: [false; 3], squelch_db: [0; 3] };
 
     pub fn enabled(&self, kind: SkimmerKind) -> bool {
         self.enabled[kind.index()]

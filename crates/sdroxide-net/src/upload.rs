@@ -56,11 +56,7 @@ fn upload_qrz(cfg: &NetworkConfig, adif: &str) -> Result<String, String> {
     }
     let body = http::post_form(
         "https://logbook.qrz.com/api",
-        &[
-            ("KEY", cfg.qrz_logbook_key.trim()),
-            ("ACTION", "INSERT"),
-            ("ADIF", adif),
-        ],
+        &[("KEY", cfg.qrz_logbook_key.trim()), ("ACTION", "INSERT"), ("ADIF", adif)],
     )?;
     // Response is url-encoded key=value pairs: RESULT=OK / FAIL / AUTH / REPLACE.
     let fields = parse_kv(&body);
@@ -75,7 +71,9 @@ fn upload_qrz(cfg: &NetworkConfig, adif: &str) -> Result<String, String> {
                 .unwrap_or_else(|| other.to_string());
             Err(format!("QRZ: {reason}"))
         }
-        None => Err(format!("QRZ: unexpected response: {}", body.chars().take(120).collect::<String>())),
+        None => {
+            Err(format!("QRZ: unexpected response: {}", body.chars().take(120).collect::<String>()))
+        }
     }
 }
 

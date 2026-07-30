@@ -27,4 +27,4 @@ sgp4 = { version = "2.4.0", default-features = false, features = ["alloc", "std"
 # async runtime — this crate owns exactly one worker thread.
 ureq = "3.3"
 crossbeam-channel.workspace = true
-sdroxide-config = { version = "0.6.0", path = "../sdroxide-config" }
+sdroxide-config = { path = "../sdroxide-config" }

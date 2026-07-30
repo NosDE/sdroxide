@@ -52,9 +52,7 @@ mod tests {
             .collect();
         nb.process(&mut buf);
 
-        let peak_after = buf[WARMUP as usize..]
-            .iter()
-            .fold(0.0f32, |a, z| a.max(z.norm()));
+        let peak_after = buf[WARMUP as usize..].iter().fold(0.0f32, |a, z| a.max(z.norm()));
         assert!(peak_after < 0.2, "impulse survived: {peak_after}");
         // Ordinary signal untouched.
         let idx = WARMUP as usize + 5_000;

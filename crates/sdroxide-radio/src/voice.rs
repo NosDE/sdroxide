@@ -249,7 +249,9 @@ impl VoiceKeyer {
         }
         if let Some(dir) = self.dir.as_ref() {
             let path = slot_path(dir, slot);
-            if path.exists() && let Err(e) = std::fs::remove_file(&path) {
+            if path.exists()
+                && let Err(e) = std::fs::remove_file(&path)
+            {
                 warn!(path = %path.display(), "could not delete voice slot: {e}");
             }
         }
@@ -404,15 +406,12 @@ mod tests {
     }
 
     fn tone(n: usize) -> Vec<f32> {
-        (0..n)
-            .map(|i| 0.5 * (std::f32::consts::TAU * 700.0 * i as f32 / 48_000.0).sin())
-            .collect()
+        (0..n).map(|i| 0.5 * (std::f32::consts::TAU * 700.0 * i as f32 / 48_000.0).sin()).collect()
     }
 
     #[test]
     fn wav_round_trips_through_the_file() {
-        let path =
-            std::env::temp_dir().join(format!("sdroxide-voice-{}.wav", std::process::id()));
+        let path = std::env::temp_dir().join(format!("sdroxide-voice-{}.wav", std::process::id()));
         let samples = tone(4_800);
         write_wav_mono_48k(&path, &samples).expect("write");
         let back = read_wav_mono_48k(&path).expect("read");

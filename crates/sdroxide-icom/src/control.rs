@@ -199,10 +199,7 @@ mod tests {
         assert_eq!(&p[80..84], &passcode("secret")[..4]);
         assert_eq!(&p[96..104], CLIENT_NAME);
         // The credentials must not appear anywhere in the clear.
-        assert!(
-            !p.windows(6).any(|w| w == b"secret"),
-            "the password went out unobfuscated"
-        );
+        assert!(!p.windows(6).any(|w| w == b"secret"), "the password went out unobfuscated");
     }
 
     #[test]
@@ -241,11 +238,8 @@ mod tests {
 
     #[test]
     fn the_stream_request_names_the_radio_and_the_ports() {
-        let session = Session {
-            auth_id: [1, 2, 3, 4, 5, 6],
-            reply_id: [9; 16],
-            got_reply_id: true,
-        };
+        let session =
+            Session { auth_id: [1, 2, 3, 4, 5, 6], reply_id: [9; 16], got_reply_id: true };
         let p = open_streams(1, 2, 5, &session, "user", "IC-705", 48000, 100);
         assert_eq!(p.len(), 144);
         assert_eq!(p[0], 0x90);

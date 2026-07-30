@@ -14,7 +14,7 @@ or connects to a remote sdroxide server.
 
 1. [Feature overview](#1-feature-overview)
 2. [Basic operation](#2-basic-operation)
-3. [Digital modes (FT8, FT4, PSK31, RTTY, Olivia, THOR, FSQ, SSTV, RF Paint)](#3-digital-modes)
+3. [Digital modes (FT8, FT4, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, RF Paint)](#3-digital-modes)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [Settings](#5-settings)
 6. [Solar system 3D view](#6-solar-system-3d-view)
@@ -35,12 +35,14 @@ or connects to a remote sdroxide server.
 - **Panadapter and waterfall** with click/drag tuning, scroll-to-zoom, a
   draggable filter passband, a colour-coded band-plan strip, and eight
   selectable waterfall colour schemes (including an Icom-style palette).
-- **Dual VFO (A/B)** with split operation, VFO swap/copy, and a sub-receiver on
-  the inactive VFO.
+- **Dual VFO (A/B)** with split operation, VFO swap/copy, and an independently
+  tunable sub-receiver with its own mode and filter.
 - **All the common modes:** LSB, USB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, a
   spectrum-only mode (SPEC), the automatic digital modes **FT8** and **FT4**, the
-  keyboard modes **PSK31**, **RTTY**, **Olivia**, **THOR** and **FSQ**, image
-  **SSTV**, and the transmit-only **RF Paint** (spectrum-painting) mode.
+  keyboard modes **PSK31**, **RTTY**, **Olivia**, **THOR** and **FSQ**, the image
+  modes **SSTV**, **weather fax** and **RIFP** (draft-dulaunoy-rifp-00, a packetised image
+  protocol on its own FSK modem), and the transmit-only **RF Paint**
+  (spectrum-painting) mode.
 - **Receive controls:** AGC (Off/Slow/Med/Fast), volume, mute, squelch, an
   impulse noise blanker, an adaptive auto-notch (constant-tone canceller),
   noise reduction (neural RNNoise or spectral, three levels each), RIT, and a
@@ -132,9 +134,16 @@ The smaller grey number below the readout is the *inactive* VFO's frequency.
 - **Scroll the wheel** to zoom in and out around the cursor.
 - Press **F** to reset the view to the full receiver span.
 - **Left-click** tunes the active VFO to the clicked frequency. **Shift+click**
-  tunes VFO B instead.
+  places the *second* receiver: the sub-receiver when SUB is on, VFO B otherwise.
+  Unlike a plain click, it means the same thing everywhere — over a spot box it
+  takes the spot's frequency, and in FT8/FT4 it still tunes rather than moving
+  the transmit offset.
 - **Left-drag** grabs the spectrum and slides it (the tuning moves with the
-  content).
+  content). Let go while the pointer is still moving and the dial keeps turning,
+  coasting to a stop like a weighted VFO knob — the faster the flick, the further
+  it runs. A slow, careful drag lands exactly where you release it, and pressing
+  anywhere on the panadapter catches a coasting dial and stops it dead (that
+  press does not tune). The sub-receiver's tuning drag has the same flywheel.
 - **Right-drag** pans the view only, without changing tuning.
 - **Shift+drag** measures bandwidth: a horizontal ruler with dotted vertical
   markers appears between where you pressed and the current pointer, showing the
@@ -154,22 +163,23 @@ The smaller grey number below the readout is the *inactive* VFO's frequency.
 
 ![Tuning on the panadapter, showing the VFO marker and filter passband](images/03-panadapter-tuning.png)
 
-**Band-plan strip.** A colour-coded strip along the bottom of the waterfall
+**Band-plan strip.** A colour-coded strip along the bottom of the waterfall (its
+top when the waterfall is flipped — see [§2.8](#28-the-display-and-fft-controls))
 labels the allocations. Zoomed out it shows coarse bands (ham, broadcast, CB,
 AM); zoomed into a ham band it splits into the CW / digital / SSB / beacon
 sub-segments. When you zoom in close (a span of ~100 kHz or less), the digital
 sub-band is broken out into the individual popular modes — **FT8, FT4, JS8,
-WSPR, QRSS, PSK, RTTY, SSTV, FREEDV** — each in its own colour.
+WSPR, QRSS, PSK, RTTY, SSTV, RIFP, FREEDV** — each in its own colour.
 
 ### 2.4 Bands and modes
 
-Click the **Band / Mode** chip (which reads, for example, `20M · USB`) to open a
+Click the **Band / Mode** button (which reads, for example, `20M · USB`) to open a
 popup with three rows:
 
 - **BAND:** `160M 80M 60M 40M 30M 20M 17M 15M 12M 10M 6M 2M GEN`. Each band
   remembers your last frequency, mode, and filter.
 - **MODE:** `LSB USB CW AM SAM NFM WFM DIGU DIGL DSB SPEC`.
-- **DIGITAL:** `FT8 FT4 PSK RTTY OLIVIA THOR FSQ SSTV RFPAINT RADE` (see
+- **DIGITAL:** `FT8 FT4 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP RFPAINT RADE` (see
   [Digital modes](#3-digital-modes)).
 
 ![The band and mode selector popup](images/04-band-mode-popup.jpg)
@@ -180,12 +190,35 @@ See the [appendix](#13-appendix) for what each mode is.
 
 The **VFO** module has:
 
-- **A / B** select chips in the Frequency module (the active VFO is highlighted).
+- **A / B** select buttons in the Frequency module (the active VFO is highlighted).
 - **Swap VFOs** — exchange A and B.
 - **Copy A to B** — copy the active VFO to the other.
 - **SPLIT** — transmit on one VFO and receive on the other.
-- **SUB** — enable a second receiver on the inactive VFO (routed to the right
-  ear). The inactive VFO's marker on the panadapter brightens when SUB is on.
+- **SUB** — enable a second receiver, routed to the right ear.
+
+The sub-receiver tunes **independently of A/B**: swapping VFOs or turning the
+dial leaves it where you parked it. Switching it on reveals a **SUB module** in
+the top bar with everything it has of its own:
+
+- **Frequency** — type it in MHz, or drag the field to tune in 10 Hz steps.
+- **←DIAL** / **DIAL←** — send the sub to the main dial, or bring the main dial
+  to whatever the sub has found.
+- **Mode** and **Filter** — the sub demodulates independently of the main
+  receiver, so you can listen to CW on one and SSB on the other. (Audio modes
+  only: the digital modes decode on the main receiver.)
+- **Vol** / **MUTE** — the sub's own level in the right ear.
+
+On the panadapter the sub is drawn in **violet**, with the same passband wash,
+draggable filter edges and tuning line the main receiver has, labelled `SUB`.
+**Drag inside its passband** (or on its tuning line) to tune it — that drag moves
+the sub instead of panning the view, so each receiver is tuned by dragging its
+own filter area. Released mid-motion it coasts on like the main dial, stopping at
+the edge of the receiver's span. **Shift+click** anywhere sends the sub straight
+there.
+
+Both receivers are tuned by DDCs on the same IQ stream, so the sub can reach
+anything inside the receiver's span and nothing outside it. A band change that
+moves the hardware out from under the sub re-parks it on the inactive VFO.
 
 ### 2.6 RIT and XIT
 
@@ -231,6 +264,22 @@ dial + XIT — so you can see at a glance how far RX and TX are shifted.
   with **AI Med**. (NR affects only what you hear; the FT8/FT4/PSK/RTTY decoders
   still receive the untouched signal, and a steady unmodulated carrier — a
   heterodyne — is treated as noise and suppressed.)
+- **ST** (WFM only) — broadcast **stereo**. It lights when the station's 19 kHz
+  stereo pilot is locked, and needs nothing from you: mono and stereo stations
+  are handled automatically, at the same volume, so there is no jump when one
+  hands over to the other. Click it to force mono.
+
+  On a weak station sdroxide blends back toward mono by itself. That is not a
+  compromise — the difference channel is recovered from a 38 kHz subcarrier,
+  high on FM's noise slope, so it carries roughly 20 dB more hiss than the
+  mono sum. Clean mono beats noisy stereo, and the blend is gradual enough that
+  you will not hear it switch. Forcing mono is still worth doing on a marginal
+  signal you want to listen to for a long time.
+
+  Two things turn stereo off on purpose: switching on the **sub receiver**,
+  which claims the right ear for itself, and switching on **NR** or **ANC**,
+  which delay the audio in a way the stereo matrix cannot survive. Neither buys
+  anything on a broadcast signal.
 
 **The receive filter** is set by dragging the passband edges directly on the
 panadapter: two vertical grip lines mark the filter's low and high edges (they
@@ -254,6 +303,12 @@ passband. The grips work on both the spectrum and the waterfall.
 
 - **floor** / **ceil** — the waterfall's dB range.
 - **FFT** size — `2048`, `4096`, `8192`, `16384`, or `32768`.
+- **FLIP** — scroll the waterfall *upwards* (keyboard shortcut **V**). The
+  newest line is drawn at the bottom and history flows up off the top, the way
+  several other SDR programs draw it. The minute gridlines, the skimmer / FT8
+  boxes, the cluster-spot boxes and the band-plan strip all follow the flip, so
+  the fresh decodes stay next to the fresh signals and nothing covers the newest
+  lines. The setting is remembered between sessions.
 
 The **waterfall colour scheme** and the **spectrum background gradient** are set
 on the **UI** tab of the Settings window (see
@@ -269,10 +324,24 @@ dragging the frequency-scale strip between them.
 
 ### 2.9 The S-meter
 
-The **S-meter** reads S0 (−127 dBm) through S9 (−73 dBm) and beyond, with the
-bar turning red past S9. It shows the S-unit (for example `S9+20`) and the level
-in dBm. On transmit it is replaced by a transmit meter showing power, SWR, and
-ALC as the rig reports them.
+The **S-meter** reads S0 (−127 dBm) through S9 (−73 dBm) and beyond, turning red
+past S9. It shows the S-unit (for example `S9+20`) and the level in dBm.
+
+Clicking the meter cycles three faces:
+
+- **Needle** (the default) — an analog moving-coil instrument. The needle has a
+  little inertia, so it swings into a reading and settles the way a real
+  movement does.
+- **Bar** — a horizontal gradient bar with a graduated scale beneath it and a
+  peak-hold marker that falls back after a moment.
+- **Trace** — the last fifteen seconds plotted as a scrolling graph, which is
+  the one to watch for fading and QSB.
+
+On transmit all three switch to a transmit meter. Where the rig reports SWR it
+becomes the headline reading, on a logarithmic scale with 1:1 at the left stop,
+3:1 at mid-scale and everything past 3:1 in red; forward power (or ALC, on a rig
+with no wattmeter) is shown alongside. Rigs with no SWR bridge fall back to a
+drive/ALC scale.
 
 ### 2.10 Transmit
 
@@ -286,7 +355,9 @@ On a TX-capable rig the **Transmit** module appears:
 
 > **Transmit safety:** by default sdroxide refuses to transmit outside the
 > amateur bands (`tx_ham_only`). Transmit hardware gains start at minimum and
-> the tune drive defaults low. Raise drive deliberately.
+> the tune drive defaults low. Raise drive deliberately. The band lockout can
+> only be lifted from the command line, one run at a time, with `--oob-tx`
+> ([10](#transmitting-outside-the-amateur-bands---oob-tx)).
 
 On a rig with its own power control (TCI), Drive and Tune command the rig's
 output power directly — and both sliders adopt the rig's current settings when
@@ -328,7 +399,7 @@ External programs can trigger the keyer too: with the built-in Hamlib server
 running ([5.8](#58-servers-letting-other-programs-drive-the-radio)),
 `\send_voice_mem <1–10>` plays a slot and `\stop_voice_mem` stops it.
 
-> **Where it works.** The keyer is available in every voice mode and in
+> **NOTE:** The keyer is available in every voice mode and in
 > **RADE** digital voice, where the message is fed to the codec exactly as a
 > live over would be. The other digital modes generate their own transmit
 > audio, so the button is hidden there (and the window closes if you switch
@@ -351,10 +422,14 @@ sdroxide has several families of digital mode. **FT8** and **FT4** are automatic
 timeslot-based modes with QSO sequencing, a world map, and automatic logging
 (3.1–3.6). **PSK31**, **RTTY**, **Olivia**, **THOR** and **FSQ** are live keyboard
 modes: you tune onto a signal, read the decoded text, and type a reply that
-transmits as you go (3.7–3.8). **SSTV** is an image mode: received pictures build
-up in a gallery and you transmit composed images (3.9). **RF Paint** is a
-transmit-only mode that draws text and pictures directly onto the far station's 
-waterfall (3.10).
+transmits as you go (3.7–3.8). **Hellschreiber** is a facsimile mode with no
+decoder at all — it paints letters onto a scrolling strip and you read them by
+eye (3.9). **SSTV** is an image mode: received pictures build up in a gallery and
+you transmit composed images (3.10). **RIFP** carries pictures as numbered,
+checksummed packets over its own FSK modem rather than as an analogue scan, and
+is the one mode here that is not single sideband (3.11). **RF Paint** is a
+transmit-only mode that draws text and pictures directly onto the far station's
+waterfall (3.12).
 
 ### 3.1 Entering the mode
 
@@ -366,9 +441,35 @@ draggable divider sets how much height the panel gets.
 ![The FT8 operating panel](images/07-ft8-panel.png)
 
 While in a digital mode a **FT8 FREQUENCIES** (or **FT4 FREQUENCIES**) row of
-band chips appears in the Band/Mode popup. Click one to jump the dial to the
-standard calling frequency for that band; a chip highlights when the dial is
+band buttons appears in the Band/Mode popup. Click one to jump the dial to the
+standard calling frequency for that band; a button highlights when the dial is
 already on it.
+
+#### Bands with more than one agreed frequency
+
+Most modes have one agreed frequency per band, and the band buttons above are all
+you need. Some have several — and where they do, a **⇵** button appears in that
+mode's operating panel listing them:
+
+| Mode | Where it happens |
+| --- | --- |
+| FT8 | The DXpedition (Fox/Hound) window on every HF band, and 6 m's second frequency at 50.323 |
+| PSK31 | The 40 m region split: 7.040 in Region 1, 7.070 in Regions 2 and 3 |
+| RTTY | The DX calling spots (3.590, 14.083) and the Region 2 slot at 7.080 |
+| SSTV | The move-up-when-busy secondaries — a picture takes two minutes, so one frequency per band is occupied most of the time |
+
+The button's face is the frequency you are on when the dial is already sitting on
+one of them, and reads **⇵ FREQ** when it is not. Clicking a frequency moves the
+**dial**; where you sit inside the audio passband is a separate control and is
+left alone.
+
+An entry shown in **amber** is one the IARU Region 1 band plan does not put
+narrow data on. That is not a mistake in the list: the WSJT-X DXpedition
+frequencies and the FSQCall set are global conventions built around the Region 2
+band plan, and a few of them land in Region 1's CW or phone segments (1.845,
+3.567 and 24.911 for FT8). The DX will be there and so will everyone chasing it
+— but check your own band plan before you key, because sdroxide will not stop
+you.
 
 ### 3.2 One-time setup: your callsign and grid
 
@@ -381,6 +482,9 @@ Click **SETUP** in the QSO area to open the **FT8 / FT4 Setup** window:
 - **TX watchdog / Give up after** — how long unattended transmitting may
   continue with no progress, and how many unanswered calls to one station are
   worth making. Both 0 to disable.
+- **DXpedition** — which side of an FT8 pile-up you are on: **Normal**,
+  **Hound**, or **Fox** (see [DXpedition mode](#341-dxpedition-mode-hound-and-fox)).
+  **Fox signals** sets how many stations a Fox works at once.
 - **Message templates** — the CQ / Grid / Report / R+Report / RR73 / 73 lines,
   using the placeholders `{MYCALL}`, `{MYGRID}`, `{DX}`, and `{REPORT}`. The
   defaults follow standard FT8 practice; you rarely need to change them.
@@ -408,7 +512,12 @@ The panel has two halves:
   never worked) or **DUPE** (already in the log for this band — the row fades
   back). The **New only** filter keeps just the rows that would put something new
   in the log.
-- **QSO** (right) — a world map (your location, the station you are working, and
+  Neither filter ever hides a message addressed to your own station: a station
+  calling you is not calling CQ, and may well be a dupe, but it is the one row
+  in the list you owe an answer to.
+- **QSO** (right) — a **⇵** frequency button when the band has more than one
+  agreed frequency for the mode ([3.1](#31-entering-the-mode)), a world map
+  (your location, the station you are working, and
   a transmit indicator), a station card showing the current step
   (`Idle`, `Wait CQ`, `Calling CQ`, `Tx Grid`, `Tx Report`, `Tx R+Report`,
   `Tx RR73`, `Tx 73`, `Confirming`, `Done`), and a transcript of the exchange
@@ -428,7 +537,12 @@ free text is cut to 13 characters.
 ### 3.4 Working stations
 
 - **Answer a call:** click **REPLY** on a decode. sdroxide adopts that station,
-  picks the opposite time slot, and runs the exchange automatically.
+  picks the opposite time slot, and runs the exchange automatically. If they
+  have been calling *you*, the reply opens where their exchange actually stands
+  rather than at the top: somebody repeating `<you> <them> -19` gets your
+  R+report back, not your grid, and the report they sent is already in the log
+  entry. So a station who calls again after you pressed **STOP QSO** — or who
+  called while you were busy with someone else — is answered with one press.
 - **Losing a pile-up:** if the station you called comes back to someone else
   instead, sdroxide stops calling and holds at `Wait CQ` rather than doubling
   into their QSO. The transcript shows a pink line — *"W9XYZ is working K1ABC"* —
@@ -441,7 +555,12 @@ free text is cut to 13 characters.
   first: a station already worked this session goes last, among signals of
   similar strength a new DXCC entity wins, and otherwise the strongest does —
   it is the one most likely to complete. The others are listed in the transcript
-  ("also calling: …") so you can work them next.
+  ("also calling: …") so you can work them next. An answer that isn't a grid is
+  still an answer: a station that comes back with a signal report (many do, and
+  one that already knows your grid always will) puts you on the answering side
+  of the exchange — R+report next — instead of leaving you calling CQ over the
+  top of them. A late 73 from the contact you just finished is not a caller and
+  is not adopted as one.
 - **Set your transmit tone:** click a decode row (or click a station box on the
   waterfall) to set your transmit audio frequency to that station's frequency.
   The audio frequency is clamped to 200–3500 Hz.
@@ -457,6 +576,55 @@ free text is cut to 13 characters.
   free text, so that is what the field accepts.
 - **Stop:** **STOP QSO** ends the current QSO gracefully; **STOP TX** aborts the
   current transmission immediately and un-keys.
+- **The list says where the band is open.** Each decode carries its continent
+  in its own colour, resolved from the callsign — so which way the band is
+  running is legible down the column without reading a single callsign. Hover a
+  row for the rest: DXCC entity, CQ and ITU zone, grid, distance and beam
+  heading from your own grid, whether the station is new or already in your log
+  and on which band, who a directed CQ is aimed at, and the raw signal report,
+  frequency and DT.
+- **Auto TX FRQ picks where you transmit.** On by default (the button above the
+  decode list, or the setup window). Answering on the frequency of the station
+  you are calling looks right and isn't: they transmit in the period opposite
+  yours, so their frequency says nothing about who is transmitting there when
+  *you* key — and whoever is will not hear you. Instead sdroxide picks the
+  quietest spot in your own transmit period, from the stations it has decoded
+  there, and moves no further than it has to. While it is on, clicking a decode
+  or a station label on the waterfall no longer drags your transmit frequency
+  onto that station; the click just selects. Turn it off to hold a frequency by
+  hand. It has no effect in DXpedition mode, where both roles have their
+  frequencies decided for them.
+- **Queue a run of stations.** The **+** button on each decode marks that
+  station to be worked; mark as many as you like in one pass over a busy slot.
+  They appear in a `QUEUE` strip above the transcript, next one in green, and
+  the sequencer starts each in turn as soon as it is free — after a contact
+  completes, after it gives up on a station that never answers, or in place of
+  a CQ nobody is answering. Click a queued call to drop it, or **CLEAR** to
+  empty the queue. The transmit watchdog still stops the run: it exists to stop
+  an unattended station transmitting, and the queue does not override it.
+- **Directed CQs are read as directed.** `CQ DX`, `CQ EU`, `CQ JA`, `CQ POTA`,
+  `CQ TEST` — sdroxide works out whether the call names you. One that does gets
+  a thicker accent bar than a plain CQ; one aimed at somebody else is neither
+  coloured as a CQ nor listed under **CQ only**. Continents (`EU`, `NA`, `AS`…)
+  are matched against your own entity's continent, country prefixes (`JA`,
+  `DL`…) against your entity, and activity calls (`POTA`, `SOTA`, `TEST`,
+  `QRP`, `FD`, `WW`, `RU`…) are open to everyone. Anything it can't judge is
+  shown rather than hidden. You can send one too: put it in the CQ template on
+  the setup window, e.g. `CQ EU {MYCALL} {MYGRID}`.
+- **The decoder knows who you are waiting for.** Once you are working someone,
+  both callsigns in their next message are already known — 58 of its 77 bits.
+  sdroxide hands them to the decoder as *a-priori* bits, which recovers replies
+  a few dB weaker than a blind decode manages. It runs only where an ordinary
+  decode has already failed and the result still has to pass its checksum, so it
+  can add decodes but never invent one. Nothing to switch on.
+- **Watch your clock.** The station card shows `DT` — how far your slot timing
+  sits from the stations you are hearing, taken from the decodes themselves. It
+  stays grey while you are inside half a second, turns amber past that and pink
+  past 1.5 s. FT8 and FT4 need both ends to agree where a slot begins, and a
+  clock far enough out that nobody can decode you looks exactly like a dead band
+  from your side, so this is the first thing to check when nobody answers.
+  Positive means you transmit early. The figure covers the whole receive path,
+  so a slow audio or network chain counts the same as a wrong clock.
 - **Unattended transmitting stops itself.** Two limits, both on the FT8 setup
   window: the **TX watchdog** (6 minutes by default) stops the sequencer when
   nothing has come back and you haven't touched anything, and **Give up after**
@@ -468,6 +636,41 @@ free text is cut to 13 characters.
 Transmission happens automatically in your chosen time slot (FT8 slots are 15 s,
 FT4 slots are 7.5 s) and goes through the normal transmit path, so the ham-band
 lockout and transmit safety still apply.
+
+#### 3.4.1 DXpedition mode (Hound and Fox)
+
+FT8's answer to a rare-entity pile-up. One station — the **Fox** — transmits up
+to five signals at once in the low part of the passband and works a queue of
+callers; everyone calling it — the **Hounds** — calls from above 1000 Hz. That
+split is what keeps the pile-up off the one station everybody wants. Set your
+role in the FT8 setup window. It applies to FT8 only.
+
+While either role is selected the panadapter shades the two halves of the
+passband, `FOX` below 1000 Hz and `HOUNDS` above it, with the half you transmit
+in tinted more strongly.
+
+**As a Hound**, click **REPLY** on the DXpedition's decode and call from
+wherever in the calling zone you have set your transmit frequency — sdroxide
+refuses to move it down into the Fox's half, and does not follow the Fox down
+when you answer it. Three things then differ from ordinary operation:
+
+- You keep calling while the Fox works other stations, instead of standing down
+  the way you would for a station that took someone else's call.
+- When the Fox comes back to you, your transmit frequency moves *onto the Fox*
+  automatically for the rest of the contact — that is what the Fox is listening
+  for at that point.
+- The Fox's `RR73` completes and logs the contact and you send nothing further.
+  It usually arrives inside a message addressed to the next Hound
+  (`YOURCALL RR73; W9XYZ <DX1FOX> +03`), which sdroxide reads for you.
+
+**As a Fox**, **CALL CQ** starts the pile-up and **STOP QSO** stands it down.
+Callers appear in a `PILE-UP` strip above the transcript — green for the
+stations being worked, grey for those waiting — and are taken strongest and
+rarest first, with anyone already in your log going last. Each transmission
+carries as many signals as **Fox signals** allows, spaced 60 Hz apart and
+sharing the transmitter's power, so more signals means each one is weaker.
+Contacts are logged as their `RR73` goes out; where a caller is waiting, that
+`RR73` shares its signal with the report opening the next contact.
 
 ### 3.5 Reporting what you hear
 
@@ -593,7 +796,102 @@ These three modems are native-Rust and self-contained. On-air interoperability
 with fldigi is being validated; the first release targets clean-to-moderate
 signals.
 
-### 3.9 SSTV
+### 3.9 Hellschreiber
+
+Choose **HELL** from the DIGITAL row for **Hellschreiber** — the oldest digital
+mode still in regular amateur use, and the only one you read with your eyes
+instead of a decoder.
+
+Hell does not send characters. It sends *pictures* of characters: the
+transmitter scans a 7-column by 14-row dot matrix per letter, top to bottom then
+left to right, switching the carrier on and off as it goes. The receiver simply
+free-runs at the same dot rate and paints whatever it hears onto a scrolling
+strip. There is no synchronisation, no framing and no error correction — which is
+exactly why Hell stays readable in conditions that break real decoders. A burst of
+noise smudges a few dots instead of corrupting a whole character, and your eye
+does the rest.
+
+![The Hellschreiber panel: the scrolling receive raster above the transmit box](images/hellschreiber.jpg)
+
+**Reading the strip.** Received text scrolls in from the right. Because nothing
+synchronises the vertical position, a character can straddle the top and bottom
+of the strip — so, like fldigi, sdroxide draws **every column twice, stacked**.
+Whatever the alignment happens to be, one complete legible copy of the text is
+always on screen. That is what the **2ROW** button controls; turn it off for a
+single-height strip and drag the raster up or down to line the text up yourself.
+
+**Panel controls.** The header carries the audio-tone readout with **−**/**+**
+nudges, the variant buttons, and the decode squelch. Below that:
+
+- **Contrast** — hardens or softens the dots. It redraws the entire scrollback,
+  not just what arrives next, so you can rescue text that has already gone by.
+- **Width** — `1×` to `4×` screen pixels per received column. Square dots would
+  fit only about eighteen characters across the panel; the default `2×` shows
+  around sixty.
+- **2ROW** — the doubled display described above (on by default).
+- **REV** — reverse video: light dots on dark paper instead of the classic look.
+- **CLEAR RX** — wipe the strip.
+
+**Transmitting** works like the other keyboard modes: type in the box and press
+**TX**. Characters already sent turn green. **CALL CQ** loads a CQ using your
+callsign, and **CLEAR** empties the buffer and stops. While TX is held with
+nothing to send, Hell transmits blank paper rather than dropping the carrier,
+which is how it holds a channel between overs — so press **TX** again to release.
+Your own transmission is painted onto the same strip as it goes out, which is the
+only confirmation Hell offers that your timing and font are right.
+
+**Variants.** Seven, matching fldigi's set:
+
+| Variant | Speed | Bandwidth | Keying |
+| --- | --- | --- | --- |
+| **FELD** | 2.5 char/s | 295 Hz | on/off keyed |
+| **SLOW** | 0.3 char/s | 35 Hz | on/off keyed |
+| **X5** | 12.5 char/s | 1470 Hz | on/off keyed |
+| **X9** | 22.5 char/s | 2645 Hz | on/off keyed |
+| **FSK245** | 2.5 char/s | 490 Hz | frequency-shifted |
+| **FSK105** | 2.5 char/s | 220 Hz | frequency-shifted |
+| **HELL80** | 5 char/s | 1200 Hz | frequency-shifted |
+
+**FELD** (classic Feld Hell) is what essentially all on-air activity uses; the
+others are worth knowing about but you will rarely meet them. **SLOW** trades
+speed for a 35 Hz bandwidth that survives conditions nothing else will. **X5** and
+**X9** are fast but wide — X9 occupies nearly the whole SSB passband, so the tune
+control clamps it near the middle where it fits. The **FSK** variants keep the
+carrier up and shift it instead of keying it, which suits a linear amplifier
+better and gives a noticeably cleaner raster.
+
+Hell transmits on **USB**. The band buttons are preset from the
+[hellschreiber.com](https://www.hellschreiber.com/hellschreiber-frequencies.htm)
+narrow-band digimode band plan (18 March 2019), using its *common calling and
+operating* frequencies:
+
+| Band | Preset | Band | Preset |
+| --- | --- | --- | --- |
+| 160 m | 1.840 | 17 m | 18.104 |
+| 80 m | 3.574 | 15 m | 21.063 |
+| 60 m | 5.3515 | 12 m | 24.924 |
+| 40 m | 7.040 | 10 m | 28.063 |
+| 30 m | 10.144 | 6 m | 50.286 |
+| 20 m | 14.073 | | |
+
+**These are IARU Region 1 values** where that band plan splits by region, matching
+the Region 1 band edges sdroxide uses elsewhere; Region 2 and 3 differ on 160 m
+and 80 m in particular. Bands quoted as a range use its low edge, so tune *up*
+from the preset to find activity. 6 m is not in that band plan and comes from the
+[Feld Hell Club](https://sites.google.com/site/feldhellclub/Home/frequencies).
+
+On 15 m and 10 m the presets are 21.063 and 28.063 rather than the 21.074 /
+28.074 the band plan names as calling frequencies, because those two sit squarely
+in the FT8 sub-band — and fall outside the operating ranges the same table lists
+beside them.
+
+Hell is a "fuzzy mode" (J2B), so it may be sent in either the CW or the phone
+segments; band plans are recommendations, and listening before you key matters
+more here than the numbers do. Check them against a current plan for your region.
+
+---
+
+### 3.10 SSTV
 
 Choose **SSTV** from the DIGITAL row to send and receive pictures. The panel has
 a received-image gallery on the left and a transmit compositor on the right, with
@@ -652,7 +950,304 @@ Band buttons tune to that band's common SSTV calling frequency (for example
 > conditions — clean signals decode well; weak or drifting signals may slant or
 > show noise (ongoing refinement).
 
-### 3.10 RF Paint (spectrum painting)
+### 3.11 RIFP (Radio Image Framing Protocol)
+
+Choose **RIFP** from the DIGITAL row to send and receive pictures over
+[draft-dulaunoy-rifp-00](https://datatracker.ietf.org/doc/draft-dulaunoy-rifp/) —
+a packetised image protocol, and the only mode here that is *not* single
+sideband. Its `rifp-cpfsk-4800` radio profile keys the carrier itself:
+continuous-phase binary FSK, 4800 baud, ±4 kHz deviation, in a channel about
+25 kHz wide. **The dial is the middle of the signal, not its lower edge.**
+
+The panel is the SSTV panel — the same live picture, the same received gallery,
+the same five transmit slots with their own overlay messages — with a RIFP
+control strip in place of the SSTV mode buttons. Pictures you load are shared
+between the two modes.
+
+> ⚠ **Bandwidth.** 25 kHz does not fit in a narrow-band segment. sdroxide will
+> transmit RIFP wherever you tune it, and the panel says so in red whenever the
+> dial is somewhere the channel does not fit. The segments it treats as wide
+> enough are **10 m FM (29.510–29.700)**, the **6 m all-modes part
+> (50.5–52.0)**, the **2 m all-modes part (144.500–144.794)** — where the image
+> and facsimile modes have always lived — and **70 cm (430–440)**. The band
+> buttons in the Band/Mode popup land in each of those while staying in RIFP,
+> and the **433.920** button jumps to the calling frequency the draft names.
+> Allocations differ by country and your own licence may be narrower than
+> 25 kHz even inside those — checking that is yours to do, not the software's.
+
+**The controls:**
+
+- **CPFSK 4800** — the radio profile. One is defined so far.
+- **Size** — the transmitted picture size (RIFP fixes none of its own).
+  Everything is time: 320×240 at 4 bits takes a couple of minutes.
+- **Encode** — how the picture becomes the object RIFP carries: **G4** (CCITT
+  Group 4 facsimile, bilevel, usually the smallest for line art), **PNG**,
+  **Zlib** or **RLE8** (compressed packed raster), **Raw** (the packed raster
+  itself), **JPEG** (lossy), or **Auto**, which tries each and sends the
+  smallest — never the lossy one unless you ask for it.
+- **Gray** — grayscale depth, 1/2/4/8 bits. RIFP's raster is grayscale by
+  definition: its manifest has no way to describe colour. **Dither** diffuses
+  the quantisation error, which is worth having below 8 bits.
+- **Repeat data** — how many times each data frame is sent. RIFP is
+  unidirectional with no repair requests, so repetition is the *only* recovery a
+  receiver gets; two is the default. **Chunk** sets the payload octets per frame
+  (192 is what the profile recommends).
+
+**Receiving:**
+
+- The **Signal** meter is a modem lock indicator, not an audio level: it rises
+  when the receiver is actually reading FSK symbols rather than noise.
+- Each transfer appears in the control strip as the sender's ID (or the start of
+  the session ID), the chunks received against the total, and a **chunk map** —
+  one lit cell per chunk that has arrived, so you can see where the holes are.
+  **✕** forgets an incomplete transfer.
+- With the **Raw** encoding the picture paints row by row as chunks land. The
+  other encodings cannot be decoded until they are whole, so they appear all at
+  once.
+- A picture is only shown after the reassembled object matches the manifest's
+  size, CRC-32 *and* SHA-256. Nothing partial or unverified reaches the gallery.
+  Enlarge a received picture to see who sent it, how it was carried, and how
+  many chunks arrived first time.
+- The counters read **frames** (valid), **bad** (failed their CRC and were not
+  recovered) and **pictures** (complete and verified).
+- Received pictures are saved as PNG under `~/.config/sdroxide/sstv_rx/`,
+  alongside the SSTV ones.
+
+**Transmitting:** identical to SSTV — pick a slot, load an image, type its
+message, press **TX**. The status line shows which frame of how many is going
+out and how long is left. Your callsign travels as the protocol's Sender ID
+extension.
+
+### 3.12 Weather fax (WEFAX / radiofax)
+
+Choose **WEFAX** from the DIGITAL row to receive the weather charts the
+meteorological services broadcast on short wave — surface analyses, wave
+heights, ice edges, satellite composites. It is **receive only**: these are
+commercial and military transmitters, and an amateur station has nothing to send
+back.
+
+![The weather-fax panel: a chart arriving, the station picker, and the gallery](images/wefax.jpg)
+
+**Finding a signal.** The **STATIONS** button lists the schedules — DWD
+Pinneberg, Northwood, the US Coast Guard transmitters, Halifax, Tokyo, the two
+Australian ones — and picking a frequency tunes the dial. Note that the
+frequencies in every published schedule are the **assigned carrier**, and USB
+reception needs the dial **1.9 kHz below** it: 7880 kHz is tuned at 7878.1. The
+picker does that subtraction for you, which is worth knowing because getting it
+wrong is the commonest reason a chart comes out as a blank page.
+
+Schedules change and stations close, so treat the list as where to start looking
+rather than as a timetable.
+
+**Tuning.** The `+0 Hz` readout beside the START button is the subcarrier's
+offset from where it should be. Tune for roughly zero, green: a fax subcarrier
+runs 1500 Hz for black to 2300 Hz for white, and a receiver a few hundred hertz
+off clips the picture to solid black or solid white. You will hear the signal as
+a warbling two-tone note.
+
+**Starting and stopping.** A transmission opens with a five-second start tone
+and closes with a stop tone, and with **AUTO START** and **AUTO STOP** on
+sdroxide uses both — leave the mode running and charts appear on their own.
+Since a chart takes a quarter of an hour, though, you will usually have tuned to
+one already in progress: press **START** to begin recording mid-chart, and
+**STOP** to end it and save. Turn **AUTO STOP** off to record straight through a
+station sending several charts back to back.
+
+**Geometry.** Nothing in the signal states the line rate, so:
+
+- **LPM** — lines per minute. **120** is what essentially every weather service
+  uses; the others are there for the occasional 60 or 240 LPM transmission.
+- **IOC** — index of cooperation, which fixes the line length: 576 gives 1809
+  pixels per line and is what charts use, 288 gives 904. The start tone
+  announces this one (300 Hz for 576, 675 Hz for 288), so with AUTO START on it
+  is chosen for you.
+
+**Straightening the picture.** Two controls, and both are normal to need:
+
+- **PHASE** ◀ ▶ shifts the picture sideways in 10- or 100-pixel steps. A chart
+  begins with about thirty seconds of phasing signal that tells sdroxide where a
+  line starts; if you tuned in after that went by, the chart arrives cut
+  vertically and wrapped, and this is what puts it back together.
+- **SLANT** trims the sample clock in parts per million. If the chart leans to
+  the left, increase it; to the right, decrease it. A sound card a hundred ppm
+  off — well within tolerance — walks a fifteen-minute chart most of a line
+  sideways, so this is the setting every fax operator ends up with a value for.
+  Once you have found yours it is remembered.
+
+**On the globe.** While you are tuned to a station in the list, the 3D solar
+view ([6](#6-solar-system-3d-view)) draws the path from your QTH to that
+transmitter, exactly as it draws the station you are working in FT8. Weather fax
+carries no callsign and no grid square, so this is the only thing that turns an
+anonymous chart into "this came 900 km across the North Sea" — and it makes the
+propagation obvious when a station you can hear all night in winter vanishes at
+noon.
+
+**The picture.** The chart paints line by line as it arrives, in a view you can
+scroll and zoom while it is still coming in — a chart takes a quarter of an
+hour, and there is no reason to wait for the bottom of it before reading the
+top. The **VIEW** controls decide how it is shown:
+
+- **FIT** scales it to the panel width, **WHOLE** shrinks it until all of it is
+  in view at once, and **50% / 1:1 / 2×** are fixed magnifications. At 1:1 one
+  screen pixel is one fax pixel, which is what you want for reading small print
+  on a chart.
+- **HEIGHT** stretches the picture vertically, ×0.25 to ×4. A chart that comes
+  out squashed or stretched is being decoded at the wrong line rate — this makes
+  it readable, and the LPM chips fix it properly.
+- **FOLLOW** keeps the newest lines in sight. Scrolling up turns it off so you
+  can read what has already arrived without the view snapping back every half
+  second; scrolling back to the bottom turns it on again.
+
+**The gallery.** Completed charts are written as grayscale PNG to
+`~/Pictures/sdroxide/wefax/` — with your pictures rather than in a hidden config
+directory, because a weather chart usually gets printed, mailed or opened next
+to a routing program, and all of that happens in a file manager. Each is named
+for when it was received and what it was tuned to:
+
+```
+wefax-20260729-141530Z-7878.1kHz-DWD.png
+```
+
+that is, UTC date and time, the dial frequency, and the station's callsign when
+the dial is on a published schedule. The strip on the right of the panel lists
+them newest first, each labelled with its date, time and station; click one to
+open it full size, which you will need to — the fronts and isobars are
+unreadable at thumbnail scale — and **◀ NEWER** / **OLDER ▶** step through the
+rest without closing the window. **PATH** copies the directory.
+
+Charts saved by earlier versions in `~/.config/sdroxide/wefax_rx/` are still
+listed alongside the new ones, so nothing you have already received disappears.
+
+### 3.13 JS8
+
+Choose **JS8** from the DIGITAL row. JS8 uses FT8's waveform — the same eight
+tones in the same 79-symbol frame — but carries a conversation instead of a
+contest exchange: free text, questions you can ask another station, and a
+periodic "I am here" heartbeat. Because it is slotted like FT8 it decodes far
+below the noise floor, and because it is a conversation it is slow. A sentence
+takes about a minute. That is the trade.
+
+**Speeds.** Four of them, on buttons in the panel header:
+
+| Speed | Slot | Width | Use |
+|---|---|---|---|
+| NORMAL | 15 s | 50 Hz | The band convention; nearly all traffic |
+| FAST | 10 s | 80 Hz | Good conditions, shorter waits |
+| TURBO | 6 s | 160 Hz | Local and VHF work |
+| SLOW | 30 s | 25 Hz | The weak-signal end |
+
+Both stations must be on the same speed — they are different waveforms, not
+different settings, and a NORMAL station cannot hear a TURBO one. Normal is
+what you want unless you have agreed otherwise.
+
+![The JS8 panel: stations heard on the left, the conversation on the right](images/js8call.jpg)
+
+**The panel.** Stations heard are listed on the left in the same rows the FT8
+decode list uses — report, frequency, callsign, what they would be worth
+(DXCC / BAND / GRID / NEW / DUPE), continent, grid, distance, and the last thing
+they said — so a band you have learned to read in FT8 reads the same way here.
+Hovering a row brings up the full station card: entity, zones, bearing, and
+whether you have worked them before. A row addressed to you is boxed in gold; a
+heartbeat or a CQ, which are invitations, get the red CQ background.
+
+The conversation is on the right, newest at the bottom, with anything addressed
+to you marked ★. A message still arriving is shown greyed with a frame count,
+because a half-received sentence should not read like a complete one.
+
+**Replying.** Clicking a message — or a station's **REPLY** button — aims the
+composer at that station and drafts the reply the exchange expects. A heartbeat
+or a CQ is asking "can anyone hear me?", so it drafts a signal report; `SNR?`,
+`GRID?`, `STATUS?` and `HEARING?` draft their answers; `HW CPY?` drafts a
+report; `RR` and `QSL` draft `73`; `AGN?` puts back the last thing you sent. It
+is only ever a draft — it lands in the text box and you are free to rewrite it,
+because most of JS8 is conversation and there is no standard answer to "good
+evening from Vienna". Free text drafts nothing and only selects the station.
+Clicking a row rather than its REPLY button selects without touching what you
+have already typed.
+
+**Sending.** Type in the box and press Enter. Beside the send button is an
+estimate — `3f · 45s` — of how many frames the message needs and how long it
+will be on the air. Watch that number before you press send; it is the thing
+newcomers to JS8 find most surprising. With a station selected, the query buttons
+ask it directly: **SNR?** for a signal report, **GRID?**, **HEARING?** for what
+it is copying, **STATUS?** for its status message, **HW CPY?** for "how do you
+copy me", and **RR** / **73** to acknowledge and sign off. **CQ** calls
+generally, **HB** sends a single heartbeat.
+
+Anything addressed to a callsign — typed, drafted or from a button — goes out
+as a JS8 *directed* frame, so the station at the other end sees a message meant
+for them rather than words that happen to name them. When the message opens
+with a command the mode knows, that command travels in the frame too; when it
+carries more than the frame can hold (a grid, a status line, a sentence) the
+rest follows as free text. The framing is byte-identical to JS8Call's own,
+which is what the tests check it against. Relay and message-store commands are
+the exception: this station does not act on them, so it does not originate them
+either, and they go out as ordinary text.
+
+**On the map.** Heard stations appear on the 3D globe (**3D** in the DISPLAY
+row) exactly as FT8 decodes do, and the station the composer is aimed at gets
+the contact arc from your QTH. Most JS8 traffic carries no locator — only
+heartbeats, CQs and `GRID` replies do — so if callsign lookup is configured
+(⚙ SETTINGS → Network → Uploads) the rest are resolved through it, one at a
+time, and their grid is shown greyed to mark it as looked up rather than heard.
+Because JS8 beacons every ten or fifteen minutes rather than every slot, a
+station stays lit far longer here than in FT8.
+
+**Answering automatically.** In ⚙ SETUP, *Auto-reply* answers SNR?, GRID?,
+STATUS? and HEARING? queries addressed to you or to @ALLCALL — with the answer,
+not just the acknowledgement: a report rides in the frame itself, and a grid or
+a status line follows it as text. This is what makes a JS8 station worth leaving
+switched on, and it is on by default. It never answers another station's
+traffic, and never answers itself.
+
+*Heartbeat reply* answers a heard heartbeat with a signal report, so the station
+beaconing learns who copied them and how well. It is **off** by default, and
+deliberately hedged about: a busy band carries a heartbeat every slot, and a
+station that answered all of them would flood exactly the band heartbeats exist
+to keep quiet. So it answers a given station at most once every 15 minutes,
+never while a multi-frame message is still arriving, and never while you have
+something of your own queued to send — an answer that waited behind a long
+message would carry a stale report anyway. A CQ is never answered automatically
+at all: it asks for a contact, and starting one is your decision.
+
+**Beaconing.** *Heartbeat* transmits your callsign and grid on an interval so
+others know you are receivable — off, 10, 15, 30 or 60 minutes, the choices
+JS8Call offers. It is **off** by default: an unattended beacon is something you
+should choose, not something a mode switches on for you. **HB AUTO** in the
+panel header turns it on and off without opening SETUP, and the countdown beside
+it says when the next one goes out — a transmitter that keys itself should say
+so where you are already looking.
+
+The first heartbeat is a whole interval away rather than immediate, so choosing
+an interval never keys the radio before you can change your mind. Each one is
+scheduled with up to a slot of jitter, because stations that share an interval
+and started together would otherwise collide on every beacon. Turbo does not
+beacon at all, and cannot acknowledge one: it is the local and VHF speed, and an
+unattended transmitter there spends a lot of a small band to reach nobody far
+away.
+
+**Where beacons go.** Not on your working frequency. Heartbeats and their
+acknowledgements move to a free slot in the **500–1000 Hz sub-band**, the same
+convention JS8Call follows: it is where stations watching for beacons look, and
+it keeps an unattended transmitter off somebody else's QSO. The slot is chosen
+at the moment the beacon goes out — a beacon can wait behind a long message for
+minutes, and a frequency picked when it was queued would be somebody else's by
+then. A slot counts as taken if anything was decoded within one signal width of
+it in the last half-minute (longer at Slow, whose transmissions are longer than
+that), and if the whole sub-band is busy the beacon takes whichever slot has
+been quiet longest.
+
+So a beacon appears on the waterfall somewhere other than your transmit marker.
+The panel header says where the last one went — `HB 750 Hz` beside the
+countdown — so you can tell your own beacon from a stranger's. If you would
+rather keep everything you transmit in one place, ⚙ SETUP → *Beacon frequency*
+→ **Working freq** switches it off.
+
+Relayed messages and stored-message requests are decoded and shown, but this
+station will not act on them — forwarding traffic on someone else's behalf is a
+decision for the operator.
+
+### 3.14 RF Paint (spectrum painting)
 
 Choose **RFPAINT** from the DIGITAL row for **RF Paint** — a transmit-only mode
 that draws text and pictures **directly onto a receiver's waterfall**. There is no
@@ -701,9 +1296,9 @@ label each one on the waterfall. There are three: **CW**, **PSK31**, and
 ![The skimmer labelling signals on the waterfall](images/10-skimmer.png)
 
 - The **SKIM** button in the Display module opens the skimmer popup: one row per
-  skimmer (**CW**, **PSK**, **RTTY**), each with an on/off chip and its own
+  skimmer (**CW**, **PSK**, **RTTY**), each with an on/off button and its own
   **squelch** — the minimum SNR (dB) a decoded signal must reach before it earns
-  a box. The SKIM chip stays lit while any skimmer runs, and a skimmer you switch
+  a box. The SKIM button stays lit while any skimmer runs, and a skimmer you switch
   off stops decoding entirely (it costs no CPU) and its boxes disappear. Like the
   band/mode popup, this one fades away by itself after a few seconds; keep the
   pointer on it to hold it open.
@@ -737,18 +1332,19 @@ decode.
 
 Everything that configures sdroxide lives in one window, opened with the
 **⚙ SETTINGS** button in the System module (the **⚙ SETUP** button in the SPOTS
-window opens the same dialog on its Spots tab). Eight tabs run across the top:
+window opens the same dialog on its Spots tab). Nine tabs run across the top:
 
 | Tab | What it holds |
 | --- | --- |
 | **General** | Your callsign and grid, and the sound devices. [5.1](#51-general-station-and-audio) |
 | **Radio** | Which rig sdroxide talks to, and how. [5.2](#52-radio-choosing-and-configuring-the-rig) |
-| **UI** | Frame rate, waterfall palette, spectrum background. [5.3](#53-ui-display-preferences) |
+| **UI** | Frame rate, waterfall palette, spectrum background, 3D cloud rendering. [5.3](#53-ui-display-preferences) |
 | **Controls** | Keyboard, mouse and MIDI bindings. [5.4](#54-controls-keyboard-mouse-and-midi) |
-| **Spots** | DX cluster, POTA, SOTA and PSK Reporter feeds. [5.5](#55-spots-spot-feeds) |
+| **Spots** | DX cluster, POTA, SOTA and PSK Reporter feeds, and the broadcast station list. [5.5](#55-spots-spot-feeds) |
 | **FreeDV** | FreeDV Reporter (qso.freedv.org). [5.6](#56-freedv-freedv-reporter) |
 | **Uploads** | Callsign lookup, QSL upload, confirmation download. [5.7](#57-uploads-callsign-lookup-and-qsl-services) |
 | **Servers** | Hamlib rigctld, the built-in TCI server, and the WSJT-X UDP broadcast. [5.8](#58-servers-letting-other-programs-drive-the-radio) |
+| **TLE** | Satellites to track beyond the amateur set, and their frequencies. [5.9](#59-tle-satellites-and-their-frequencies) |
 
 Most settings take effect the moment you change them. The ones that open or
 rebind a connection — the radio itself, the spot feeds, FreeDV Reporter, and the
@@ -757,8 +1353,9 @@ each section below. Nothing here needs a restart.
 
 Settings are written to the per-user config directory ([§11](#11-configuration-files)):
 display preferences to `config.toml`, the radio to `radio.json`, key/mouse/MIDI
-bindings to `input.json`, feeds and credentials to `net.json`, and the two
-servers to `rigctld.json`, `tciserver.json` and `wsjtx.json`.
+bindings to `input.json`, feeds and credentials to `net.json`, the two servers
+to `rigctld.json`, `tciserver.json` and `wsjtx.json`, and the satellite
+additions to `satellites.json`.
 
 ### 5.1 General: station and audio
 
@@ -818,10 +1415,12 @@ radio. Everything below the selector changes to match the choice:
   [5.2.2](#522-cat-radios-serial-control--usb-audio).
 - **TCI (network)** — a TCI server such as ExpertSDR3 or Thetis. See
   [5.2.4](#524-tci-network-expertsdr3-and-thetis).
+- **RTL-SDR (USB)** — an RTL2832U dongle, driven by sdroxide's own USB driver
+  with no SoapySDR involved. See [5.2.5](#525-rtl-sdr-usb-dongles).
 - **FlexRadio (network)** — a FLEX-6000 or FLEX-8000 over the SmartSDR API. See
-  [5.2.5](#525-flexradio-network-flex-6000-and-flex-8000).
+  [5.2.6](#526-flexradio-network-flex-6000-and-flex-8000).
 - **Icom (network)** — an IC-705, IC-7610 or IC-9700 over LAN or WLAN. See
-  [5.2.6](#526-icom-network-ic-705-ic-7610-ic-9700).
+  [5.2.7](#527-icom-network-ic-705-ic-7610-ic-9700).
 
 There is no auto-detect: you pick the interface, and an interface that cannot be
 opened falls back to a silent source rather than guessing at another one.
@@ -862,6 +1461,28 @@ The device to open and the sample rate come from `config.toml`
 (`device_args`, `sample_rate`). For example, `device_args = "driver=hackrf"`;
 an empty value uses the first device found. You can also override the device on
 the command line with `--device`.
+
+**Why your VFO does not sit in the middle of the waterfall.** On a SoapySDR
+device with a wide enough span, sdroxide parks the hardware LO a quarter of the
+span *above* the dial and tunes down to the signal in software, so your VFO
+marker sits a quarter of the way in from the left rather than dead centre. That
+is deliberate. Most SoapySDR hardware mixes straight to baseband, which piles
+its own LO leakage, converter offset and flicker noise up at the centre of the
+span — precisely where the dial would otherwise be. A narrow mode never notices,
+because that junk falls outside the demodulator's passband, but an FM
+discriminator has no passband to hide behind: on a HackRF One tuned straight
+onto a strong FM broadcast station, the offset measures about the same amplitude
+as the station itself, and what comes out of the speaker is static. Moving the
+LO clear of the dial is worth about 14 dB of recovered signal over simply
+subtracting the offset, so sdroxide does both. Narrow streams (under 1 Msps) and
+devices whose analogue filter is too narrow to reach the offset keep the LO on
+the dial and rely on the offset subtraction alone.
+
+The whole span is still yours — three quarters of it now sits above the dial,
+which is where band activity usually is — and the LO moves only when the dial
+would otherwise leave the usable span or come too close to the centre. Other
+interfaces (RTL-SDR, HPSDR, TCI, CAT) are unaffected: none of them puts the dial
+on a dirty LO.
 
 #### 5.2.2 CAT radios (serial control + USB audio)
 
@@ -910,13 +1531,37 @@ With the **HPSDR (network)** interface, sdroxide reaches an OpenHPSDR
 involved:
 
 - **Devices / Discover** — scan the local network for HPSDR devices and pick one
-  from the list. Protocol 2 devices are selectable; Protocol 1-only devices
-  (such as the Hermes Lite 2) are listed greyed-out.
+  from the list. Both protocols are driven: Protocol 1 (the Metis framing used
+  by the Hermes Lite 2 and the older Metis/Hermes boards) and Protocol 2. Which
+  one a board speaks is detected when the connection opens.
 - **Manual IP** — connect directly to a known address (for example
   `192.168.1.50`), skipping discovery. A manual IP overrides whatever discovery
   found.
 - **Sample rate** — the DDC receive rate: 48, 96, 192, 384, 768, or 1536 kHz.
-  Wider rates give a wider panadapter span at more CPU/network cost.
+  Protocol 1 boards top out at 384 kHz. Wider rates give a wider panadapter span
+  at more CPU/network cost.
+- **LNA gain** — the front-end gain of a Hermes Lite 2, −12 to +48 dB. It takes
+  effect immediately, with no reconnect, and is remembered as the level the
+  radio starts at. It is the only analogue gain the board has: too high and the
+  ADC clips, which smears spurious signals across the whole band; too low and
+  the receiver goes deaf. Start around +20 dB and work from there. The same
+  control also appears as **Gain** next to the volume slider in the main window,
+  and on the **Device** tab.
+- **Invert spectrum (Swap I/Q)** — mirrors the board's spectrum about the tuned
+  frequency, on transmit as well as receive. **On by default**, because a
+  Hermes Lite 2 needs it. Turn it *off* only if signals appear on the wrong side
+  of the dial and nothing decodes: the giveaway is a waterfall full of
+  convincing-looking traces while SSB comes out on the wrong sideband and FT8
+  returns no decodes at all (or a handful of CQs from callsigns that don't match
+  their grid).
+- **Filter board** — which accessory board is fitted to the Hermes Lite 2's J16
+  header. Leave this at **None** unless one really is fitted. Those seven pins
+  are general-purpose open-collector outputs, and operators also use them for
+  amplifier PTT, antenna relays and transverter switching; driving them from
+  band data would start operating whatever is connected. With the **N2ADR filter
+  board** selected, the low-pass filter follows the band you are on (the
+  transmit band while keyed) and the board's 3 MHz receive high-pass is switched
+  in above 3 MHz.
 
 Receive is wideband IQ, so the full panadapter and the skimmers work.
 
@@ -958,7 +1603,75 @@ the TCI server, which modulates it.
 > acting as the rig so WSJT-X and friends can drive it — see
 > [§ 5.8.2 Built-in TCI server](#582-built-in-tci-server).
 
-#### 5.2.5 FlexRadio (network): FLEX-6000 and FLEX-8000
+#### 5.2.5 RTL-SDR (USB dongles)
+
+![The Radio tab with the RTL-SDR interface selected](images/settings-radio-rtlsdr.jpg)
+
+The **RTL-SDR (USB)** interface drives an RTL2832U dongle directly, using
+sdroxide's own USB driver. There is no SoapySDR and no libusb involved, so this
+works in every build — including the standard Windows `.msi` and macOS `.dmg` —
+with nothing extra to install beyond access to the device itself (see the
+README's *RTL-SDR permissions*).
+
+Supported tuners are the **R820T**, **R820T2** and **R828D**, which between them
+cover essentially every dongle still sold, including the RTL-SDR Blog V3 and V4.
+Older E4000 and FC001x sticks are not supported; sdroxide names the button it
+found and suggests the SoapySDR backend instead.
+
+Receive only — there is no transmit path in this hardware.
+
+- **Dongle** — which stick to open, by USB serial. **Rescan** re-lists the bus;
+  it opens nothing, so it is safe to press while receiving. Dongles ship with the
+  serial `00000001` from the factory, so if you run more than one, program
+  distinct serials (with `rtl_eeprom`) before you can pin them individually.
+  Leaving this at *first one found* is fine with a single dongle.
+- **Sample rate** — the resampler reaches 225–300 kHz and 900 kHz–3.2 MHz, with
+  nothing in between; the list offers only rates the hardware produces exactly.
+  2.4 Msps is the default and the highest that runs reliably on most hosts.
+  3.2 Msps is offered but drops samples on many machines.
+- **AGC** — the tuner and the demodulator have independent automatic gain loops.
+  *Manual* (no AGC) is the right setting for measurement and for weak-signal
+  digital modes, where a gain loop pumping on a strong neighbour costs you the
+  signal you were decoding.
+- **Tuner gain** — applies immediately, no reconnect. The tuner has 29 discrete
+  steps, so the value snaps to the nearest one it can actually produce.
+- **Frequency correction** — the dongle's crystal error in parts per million.
+  You do not have to guess it: run
+
+  ```sh
+  RUST_LOG=sdroxide_rtlsdr=debug sdroxide
+  ```
+
+  and after about twenty seconds the log prints a line like
+  `clock: 2400017 sps, +7.0 ppm — set this as the ppm correction`. That is the
+  number to type in. It is measured from the dongle's own sample clock, which is
+  the same oscillator the tuner runs from, so correcting it corrects your
+  frequency readout too.
+- **HF reception** — the tuner itself starts at 24 MHz. Below that:
+  - an **RTL-SDR Blog V4** upconverts in hardware, so HF simply works and the
+    dial reads correctly with no offset to apply anywhere;
+  - other dongles reach HF only by **direct sampling** the ADC's Q branch, which
+    is what a V3's HF port is wired to. *Automatic* switches at 28.8 MHz (with
+    hysteresis, so a dial parked near the boundary does not flap); *Direct
+    sampling (Q branch)* forces it; *Off* disables HF entirely.
+
+  Switching between the tuner and direct sampling re-initialises the tuner and
+  briefly interrupts the stream.
+- **Bias tee** — feeds roughly 4.5 V DC up the antenna coax for a mast-head
+  preamplifier.
+
+> **The bias tee puts DC on the feedline.** Never enable it with a transceiver,
+> a DC-grounded antenna, or a preamplifier powered from somewhere else on the
+> other end of the cable. sdroxide turns it off again on a clean shutdown, and
+> shows a standing warning while it is on, because the setting is remembered
+> across restarts and there is otherwise nothing to tell you.
+
+If the dongle is unplugged, sdroxide notices within a few seconds and reconnects
+by itself when you plug it back in — no need to press Apply. A dongle left
+streaming by a program that was killed rather than closed is reset automatically
+on the next open, so it does not need physically replugging either.
+
+#### 5.2.6 FlexRadio (network): FLEX-6000 and FLEX-8000
 
 With the **FlexRadio (network)** interface, sdroxide drives a FLEX-6000- or
 FLEX-8000-series radio directly over the SmartSDR API: a wideband **DAX IQ**
@@ -1031,7 +1744,7 @@ anything:
   rails as keying up: transmit-capable radio, inside its TX range, and inside the
   amateur bands while `tx_ham_only` is set.
 
-#### 5.2.6 Icom (network): IC-705, IC-7610, IC-9700
+#### 5.2.7 Icom (network): IC-705, IC-7610, IC-9700
 
 With the **Icom (network)** interface, sdroxide speaks the protocol Icom's own
 RS-BA1 software uses, directly: CI-V control and audio in both directions over
@@ -1094,7 +1807,10 @@ The **UI** tab holds display preferences, stored in `config.toml` under `[ui]`:
 
 - **Screen update rate** — the GUI/spectrum frame rate (30, 60, or 90 fps).
   Higher looks smoother and costs more CPU/GPU.
-- **Waterfall scroll speed** — how fast the waterfall scrolls.
+- **Waterfall scroll speed** — how fast the waterfall scrolls: **Slow** (5
+  rows/s), **Medium** (28) or **Fast** (56). Fast trades screen time for
+  vertical resolution, which is what you want when a CW or FT8 trace is smearing
+  into the row above it; Slow keeps several minutes of band on screen at once.
 - **Spectrum update speed** — how quickly the spectrum trace reacts; slower is
   more averaged and smoother.
 - **Waterfall palette** — the waterfall colour scheme (see
@@ -1102,6 +1818,16 @@ The **UI** tab holds display preferences, stored in `config.toml` under `[ui]`:
 - **Spectrum background** — a vertical gradient behind the spectrum line, filled
   from the **top** colour down to the **bottom** colour (default dark red →
   black). Untick **Gradient** for a plain background.
+
+Under **3D view**:
+
+- **Cloud rendering** — how the `CLOUDS` layer of the solar-system window
+  ([6](#6-solar-system-3d-view)) draws the weather. **Layered** stacks
+  slices through the troposphere and is the cheap option. **Volumetric** walks a
+  ray through it instead, so the Sun casts the cloud tops onto the deck below and
+  lightning glows out *through* the storm making it rather than only brightening
+  its outside — at several times the cost per pixel. Both draw the same weather;
+  this only chooses how much the GPU spends on the light in it.
 
 ### 5.4 Controls: keyboard, mouse and MIDI
 
@@ -1124,7 +1850,7 @@ key is down — or *Toggle*, which flips on each press.
 
 The table lists every shortcut, one per row: the key **Shortcut**, what it
 **Does**, its **Step / mode**, its **Accel**, and an **On** tickbox to disable a
-binding without deleting it. Click the shortcut chip to rebind it, then press
+binding without deleting it. Click the shortcut button to rebind it, then press
 the key combination you want (Esc cancels). **+ Add shortcut** creates a row,
 **✕** removes one, and **Restore defaults** puts back the shipped set listed in
 [13](#13-appendix). Shortcuts are ignored while you are typing in a text field
@@ -1155,7 +1881,8 @@ back to receive rather than transmitting your office.
 - **Click-tune rounding** — the step click-to-tune snaps to.
 - **Invert wheel direction** — flips both wheel actions.
 - **Left-drag tunes as well as pans** — turn it off to make left-drag pan only,
-  like right-drag.
+  like right-drag. It also turns off the dial's coast, since there is no longer a
+  dial being turned.
 - **Scroll a digit on the frequency readout to tune it** — the wheel over a digit
   of the VFO readout steps that digit.
 - **Restore mouse defaults** puts the whole section back.
@@ -1166,6 +1893,8 @@ reserved for tuning and panning; the middle and extra (side) buttons are free, s
 button held for PTT behaves like a footswitch.
 
 F1 always opens this manual, even while you are typing, so it is not rebindable.
+While the manual is open, the arrow, Page and Home/End keys scroll it instead of
+running whatever you have bound them to.
 
 #### 5.4.3 MIDI controller
 
@@ -1184,7 +1913,7 @@ has no MIDI access.
 - **Last message** — names whatever control moved last, which is how you identify
   an unlabelled knob.
 
-Each row of the binding table is one control: the **Control** chip (click it,
+Each row of the binding table is one control: the **Control** button (click it,
 then move the control you want — LEARN captures it), what it **Does**, how it
 **Reads as**, its **Step / mode**, an **LED** tickbox, and **On**. **+ Add MIDI
 control** adds a row and **Clear all** empties the table.
@@ -1228,6 +1957,11 @@ filters, the world map — is [§9.1](#91-spot-feeds-dx-cluster-pota-sota-psk-re
   band)** shows who is being heard on the band you are on. **Max age (s)** drops
   spots older than that many seconds.
 - **APPLY** connects or disconnects the feeds and saves the settings.
+- **Broadcast stations** — where the longwave/shortwave station list lives, with
+  **Reload** (re-read the file after editing it) and **Restore bundled list**
+  (replace it with the one shipped in this build, keeping the old one as
+  `broadcast_stations.json.bak`). See
+  [§9.6](#96-broadcast-stations-on-longwave-and-shortwave).
 
 FreeDV Reporter is a spot source too, but has its own tab —
 [5.6](#56-freedv-freedv-reporter).
@@ -1256,7 +1990,7 @@ tab itself is:
   stations as spots** adds them to the panadapter, world map and SPOTS window
   under the **FREEDV** filter.
 - The status lines underneath show exactly how you are being reported
-  (`OE3JJS / JN78ve — SDRoxide 0.6.0`) and whether the connection is up.
+  (`OE3JJS / JN78ve — SDRoxide 0.7.0`) and whether the connection is up.
 - **APPLY** connects or disconnects and saves.
 
 ### 5.7 Uploads: callsign lookup and QSL services
@@ -1421,6 +2155,129 @@ This one is **output only**: nothing is read from the socket, so no program on
 it can tune or key the radio. Programs that want to *drive* sdroxide use rigctld
 or the TCI server above.
 
+### 5.9 TLE: satellites and their frequencies
+
+The **TLE** tab decides which satellites the tracker in the 3D view
+([6](#6-solar-system-3d-view)) follows, and what frequencies it shows for them.
+
+Out of the box it follows the **amateur radio** group and the **ISS**. Both are
+ordinary subscriptions, so unlike earlier versions they can be switched off,
+filtered, given orbit rings or pointed somewhere else — and anything else worth
+tracking can be added beside them: a weather satellite, a cubesat too new to be
+in the amateur group, a fresher element set than the one that arrived, or a
+frequency the built-in table has wrong.
+
+Everything on this tab is saved the moment you change it — there is no APPLY —
+into `satellites.json`. The 3D view picks changes up on its next frame.
+
+#### 5.9.1 Subscriptions
+
+![The TLE subscriptions management](images/settings-tle1.jpg)
+
+A two-line element set is only good for a few days: SGP4 accuracy decays
+quickly, and sdroxide refuses to propagate elements more than a fortnight past
+their epoch at all. So anything you mean to *keep* tracking wants a
+**subscription** — a URL serving an element-set listing, refetched on the same
+six-hourly cadence as the amateur set.
+
+Each row has:
+
+- a **tick** to track it or park it,
+- a **name** (yours, for the row — the satellite names come from the listing),
+- the **URL**, which must be `https://`,
+- **Orbits** — which satellites in the listing get an orbit ring and a label.
+  Three positions, because there are three useful answers:
+
+  | | |
+  | --- | --- |
+  | **none** | Plain dots, visible only under `ALL SATS`. It really does mean none: the curated few are not exempt. |
+  | **curated** | Rings and labels only for the satellites in sdroxide's own curated list — QO-100, the ISS, AO-7, FO-29, SO-50, AO-73, JO-97, RS-44, XW-3 and IO-117. |
+  | **all** | Everything in the listing. |
+
+  A whole group wants **curated**: ninety rings at once is unreadable, and none
+  at all leaves ninety anonymous dots. A short listing like the ISS wants
+  **all**.
+
+  That curated list is ten *amateur* satellites, so for a weather, GNSS or
+  launch-window listing the middle position would behave exactly like **none**.
+  It is greyed out on those once a fetch has shown the listing contains none of
+  them — the position is not hidden, so you can see why it is unavailable.
+- a **filter** — catalogue numbers to keep, comma separated. Empty tracks
+  everything the listing carries. This is what turns CelesTrak's fifty-satellite
+  weather group into just the three NOAA APT birds.
+
+The status beside each row is what the last fetch actually did: how many
+satellites it yielded and how old the listing is, or why it failed.
+
+The **CelesTrak groups** buttons below add the common listings in one click. A lit
+button means you are already subscribed:
+
+| button | What it is |
+| --- | --- |
+| **Amateur radio** | Every amateur satellite. **On by default** — this is what the tracker used to fetch unconditionally. |
+| **ISS** | The ISS on its own, from its own element set. **On by default**: fresher than the copy inside the amateur group, and it keeps working if you unsubscribe from that. |
+| **Weather** | The NOAA APT and Meteor LRPT birds on 137 MHz |
+| **CubeSats** | Everything cubesat-sized, including amateur payloads too new for the amateur group |
+| **Space stations** | The ISS, Tiangong and the vehicles docked with them |
+| **Last 30 days' launches** | Where a brand-new amateur satellite turns up first |
+| **Geostationary** | The geostationary belt, QO-100 among it |
+| **GNSS** | GPS, Galileo, GLONASS and BeiDou |
+
+The two default ones are added the first time this version runs and then left
+alone: unsubscribing sticks, and if you have already customised one — renamed
+it, turned its orbit rings on — your version is kept rather than replaced.
+
+Subscribing to a group does **not** put ninety orbit rings on the globe: both
+default subscriptions arrive on the **Orbits** setting that suits them, so the
+amateur group shows the curated few with rings and labels and everything else as
+dots behind `ALL SATS` — exactly as it behaved when it was built in.
+
+Subscriptions refresh **while the 3D view is open**, which is the same rule the
+rest of that window's network activity follows ([6](#6-solar-system-3d-view)).
+**UPDATE NOW** fetches them all immediately without opening it. Fetched listings
+are cached on disk, so they survive a restart and keep working offline.
+
+#### 5.9.2 Pasted element sets
+
+![The manual TLE input area](images/settings-tle2.jpg)
+
+For a one-off, paste the two- or three-line set straight into the box and press
+**+ Add pasted**. Both forms are understood, several at once are fine, and
+pasting a set for a satellite already listed *refreshes* that entry rather than
+adding a second one.
+
+Each row shows its catalogue number and how old the elements are — green while
+they are fresh, amber past three days, red once they are too stale to propagate.
+Press **✎** to see and correct the two lines (in a monospace font, because the
+format is column-addressed and a misaligned paste is otherwise invisible). A
+malformed entry says what is wrong with it instead of quietly never appearing in
+the sky.
+
+Pasted satellites are always drawn with their orbit ring and label: typing a TLE
+in by hand is a clear enough statement of interest. They also **override** a
+subscribed element set for the same satellite, so this is how you put a fresher
+ISS TLE in front of the one CelesTrak served this morning.
+
+#### 5.9.3 Frequencies
+
+![The TLE frequency management](images/settings-tle3.jpg)
+
+These are the rows the pass table shows underneath a pass
+([6](#6-solar-system-3d-view)). Give a catalogue number and press **+
+Satellite**: if the built-in table knows it, the entry starts as a copy of it,
+so correcting one frequency does not mean retyping the beacon and the
+transponder as well.
+
+Each link is a row: what it is, the downlink, the uplink, the mode, and a note
+for anything you have to know before keying up. A frequency is either one number
+(`145.800`) or a transponder passband written `145.950-145.970`. Leave a
+direction blank for a beacon.
+
+An entry here **replaces** the built-in one for that catalogue number outright
+rather than merging with it — which is why a new one starts from a copy. Delete
+every link in an entry and it disappears, and the built-in table shows through
+again.
+
 ---
 
 ## 6. Solar system 3D view
@@ -1455,6 +2312,13 @@ coastline data as the FT8 world map, with international borders, lit by the real
 Sun with a soft terminator. Your QTH is the green ring and the yellow dot is the
 point the Sun is directly overhead; both appear once you zoom in far enough for
 a point on the surface to mean anything.
+
+The coastlines and borders keep a **faint glow of their own on the night side**,
+fading in across the terminator the way city lights do. It is deliberately
+subtle — the terminator is still the most obvious thing on the globe — but it
+means the dark hemisphere stays a map rather than a slab, which matters because
+almost everything worth looking at happens there: the far end of a grey-line
+QSO, the auroral oval, a satellite footprint crossing at 3 a.m.
 
 ![The Earth with the FT8 coastlines, the QTH ring and the sub-solar point](images/3d-earth.jpg)
 
@@ -1498,9 +2362,19 @@ the QSO ends the camera rejoins the tour at whichever viewpoint is nearest.
 Switching the `QSO` layer off leaves AUTO on its normal loop.
 
 **Layers** — `ORBITS` (orbital paths, sampled from the real ephemeris, so they
-are the true eccentric orbits), `PLANETS`, `CME`, `SPOTS`, `FLARES`, `GRID` (the
-solar rotation axis, equator and heliographic parallels), `LABELS`, `STARS`,
-`QSO`, `SATS` and `AURORA`.
+are the true eccentric orbits), `CLOUDS`, `PLANETS`, `CME`, `SUN OBS`, `LABELS`,
+`QSO`, `SATS`, `AURORA` and `AWARDS`. All but `AWARDS` are on to begin with —
+that one puts a marker on all three hundred-odd DXCC entities, so it waits until
+you ask for it.
+
+`SUN OBS` is solar *observations* on the Sun's disk: the sunspot active regions
+and the flare source locations, which used to be two buttons and are one idea.
+The name also settles a collision — everywhere else in this manual, **SPOTS**
+means the DX cluster.
+
+The star field and the heliographic graticule (the solar rotation axis, equator
+and parallels) have no buttons: they are the backdrop and the coordinate frame
+everything else is read against, and are always drawn.
 
 **The PLANETS layer** adds the rest of the solar system: the seven other
 planets, eighteen major moons, and Saturn's and Uranus's rings. Names are shown
@@ -1526,6 +2400,71 @@ sulphur yellows, Iapetus its black leading hemisphere. Radii are exaggerated by
 the **body** scale like the Earth's, but capped so that no planet ever outgrows
 the Sun; each planet's moons are scaled by the same factor as the planet, so a
 moon at six planet radii is drawn at six planet radii.
+
+**The CLOUDS layer** puts the weather on the globe, live, from NOAA/NESDIS's
+Global Mosaic of Geostationary Satellite Imagery — GOES-East and GOES-West, both
+Meteosats and Himawari, stitched into one picture of the planet every hour.
+
+Like the aurora it is drawn as a depth of air rather than as a picture stuck on
+a sphere, and for the same reason: that is what it is. What makes that possible
+is the infrared channel. Brightness in the infrared is cloud-top *temperature*,
+and temperature is *altitude* — so the renderer is handed a height field taken
+from measurement, and a thunderhead stands fifteen kilometres tall over the
+stratus beside it because it really does. The Sun lights the tops and they shade
+their own undersides, which is what makes a deck read as three-dimensional
+rather than as fog, and the limb shows the deck standing off the surface because
+a grazing line of sight crosses a great deal more of it.
+
+Two channels are fetched. Infrared is the backbone and works in the dark.
+Visible is a correction on the sunlit half only: low warm cloud is nearly
+invisible to infrared — the top of a marine stratus deck is within a few kelvin
+of the sea under it — and obvious in visible light, so where the Sun is up that
+channel fills in what the first cannot see.
+
+**What is real and what is not.** The cloud field is measured. The
+*lightning is simulated* — and the readout along the bottom of the window says
+so, because a globe that flickers with plausible-looking strikes must not be
+read as showing strikes. What comes from the data is where the thunderstorms
+are, how large, how tall, and how often each should flash: cold-top area is the
+oldest satellite proxy there is for flash rate and a good one. What is invented
+is which millisecond a given stroke fires. No free worldwide feed of individual
+strikes exists to use instead. The flashes light the cloud from inside rather
+than being drawn as marks on it, so an anvil goes bright from below.
+
+Four honest limits, all of them stated in the readout or visible in the
+picture:
+
+* **Nothing is known above about 73°.** A ring of geostationary satellites
+  cannot see the poles, so the layer fades out towards them rather than guessing.
+  The aurora owns those latitudes anyway.
+* **The picture is an hour or more old.** The mosaics are published hourly and
+  run about an hour and a quarter behind the clock. The readout gives the hour
+  the picture is *of*, never the moment it was fetched.
+* **Cloud-top height is a fit, not a retrieval.** The mosaic is a rendered
+  image rather than a calibrated field, so the brightness-to-temperature ramp is
+  a fit to the standard infrared enhancement. The shapes are exactly what the
+  satellites saw; the heights are the right heights to within a kilometre or two.
+* **A cloud field is a difference.** Cloud is measured as brightness above a
+  locally estimated clear-sky background — which is what stops the cold winter
+  hemisphere and the polar night being read as an overcast, and what makes the
+  deserts come out clear. The cost is at the other end: an overcast broader than
+  the window used to estimate it sets its own background and reads thinner than
+  it is.
+
+The vertical scale is exaggerated about six times. Eighteen kilometres on a
+six-thousand-kilometre planet is a quarter of one per cent of the radius, and a
+hairline cannot be volumetric; six times over is enough for a storm to stand up
+out of the deck and shallow enough that nobody would mistake the result for a
+mountain range. Altitudes are fractions of the radius the globe is *drawn* at,
+so the deck stays glued to the surface at any setting of the **body** scale.
+
+**Cloud rendering** on the UI settings tab
+([5.3](#53-ui-display-preferences)) chooses how the deck
+is drawn. *Layered* stacks slices through the troposphere and is the cheap
+option. *Volumetric* walks a ray through it instead, so the Sun casts the cloud
+tops onto the deck below and a flash glows out *through* the storm making it
+rather than only brightening its outside — at several times the cost per pixel.
+Both draw the same weather.
 
 **The AURORA layer** puts the auroral oval on the globe, live, from NOAA's
 OVATION model — a 1°×1° grid of the probability of seeing aurora, issued every
@@ -1582,13 +2521,32 @@ seem to disagree.
 propagated with SGP4 from CelesTrak element sets. Ten popular ones are drawn by
 default with their orbit rings — QO-100, the ISS, AO-7, FO-29, SO-50, AO-73,
 JO-97, RS-44, XW-3 and IO-117. Geostationary orbits are green, low ones cyan.
-`ALL SATS` in the Sun module adds every satellite in the amateur element set as a
-plain dot; the orbit rings stay on the curated few, because ninety rings at once
-is unreadable.
+`ALL SATS` in the Sun module adds every satellite in the subscribed listings as
+a plain dot; the orbit rings stay on the curated few, because ninety rings at
+once is unreadable.
+
+Which satellites arrive at all is set in the **TLE** settings tab
+([5.9](#59-tle-satellites-and-their-frequencies)) — the amateur group and the
+ISS are subscribed by default, and you can add the weather birds, the cubesats
+or your own element sets beside them. A set you paste in there is always drawn
+with its ring and label, and overrides a fetched one for the same satellite.
+Those fetches happen while this window is open, like every other fetch it
+makes.
 
 With `LABELS` on, each of the curated satellites is named with **its elevation
 from your QTH right now** — a number means it is above your horizon and
 workable, `▼` means it is not.
+
+**Finding one by name.** The search box under the clock takes a designator or a
+catalogue number — `AO-73`, `o-7`, `25544` — and matches are pulled out of the
+crowd in yellow, with their orbit ring and their name, whether or not they were
+being drawn a moment ago. That is the point of it: a satellite outside the
+curated set has no label at all until `ALL SATS` is on, and then there are
+ninety unlabelled dots. Matching is case-insensitive and on any part of the
+name, so a partial designator is enough. The line underneath says how many of
+the tracked satellites matched; **Enter** on a single match opens its pass
+table, and **✕** clears the box. The search only appears while the `SATS` layer
+is on.
 
 ![Aurora and satellite visualization and pass table](images/17-sats-passes.jpg)
 
@@ -1611,18 +2569,80 @@ Predictions come from SGP4 on the current element set, and the window shows how
 old those elements are. A day-old TLE is good to a second or so on rise time; a
 week-old one is not, which is why the age is on display.
 
+Below the pass table is the satellite's **frequency list** — what to actually
+tune to once it comes over the horizon:
+
+| Column | Meaning |
+| --- | --- |
+| `LINK` | What the link is: a linear transponder, an FM repeater, a beacon, a telemetry or APRS downlink |
+| `DOWNLINK` | Where to listen, in MHz. A transponder shows its whole passband |
+| `UPLINK` | Where to transmit, in MHz. `—` for a beacon, which only transmits |
+| `MODE` | The emission: `SSB/CW`, `FM`, `BPSK 1k2`, `DVB-S2`, … |
+
+Anything you have to know before keying up — a CTCSS tone, an inverting
+transponder, a bird that only runs to a schedule — is spelled out under the
+table and repeated as a tooltip on the link name. Remember that these are the
+nominal frequencies: Doppler moves a LEO downlink by several kilohertz across a
+pass, upwards on the way in and downwards on the way out.
+
+The built-in list covers the satellites drawn by default plus a few more, and it
+is reference data transcribed from the AMSAT list rather than anything derived
+from the element set — transponders do get switched and schedules do change. Add
+your own or correct a wrong one in the **TLE** settings tab
+([5.9](#59-tle-satellites-and-their-frequencies)), where your entries override
+the built-in table.
+
 **The QSO layer** puts your FT8/FT4 traffic on the globe. Every station decoded
 in the last two minutes is a white dot that fades as it ages — the same set the
-flat map in the FT8 panel shows, so the two never disagree. The station you are
-working is joined to your QTH by a cyan arc, and a decode you have clicked but
-not yet answered by a yellow one. The arcs are true great circles lifted off the
-surface, bowing further out the longer the path: an antipodal contact springs
-well clear of the planet, which is the only way both ends stay visible at once
-on a sphere. While you transmit, a bright pulse runs along the arc.
+flat map in the FT8 panel shows, so the two never disagree. Behind them, every
+decode of the last hour is an arc from your QTH to the station that sent it,
+cyan when it is fresh and cooling to violet as it ages out of the trail, with a
+spark running the newest ones in the direction the signal travelled. That is the
+band's shape over the last hour, drawn: which paths were open, and when they
+opened.
+
+The station you are working is joined to your QTH by a heavy cyan beam with a
+ring on each end and a pulse running the path — outwards to them while you
+transmit, back to you the rest of the time — so the QSO in progress is
+unmistakable among an hour of traffic. A decode you have clicked but not yet
+answered gets a thin yellow arc. All of them are true great circles lifted off
+the surface, bowing further out the longer the path: an antipodal contact
+springs well clear of the planet, which is the only way both ends stay visible
+at once on a sphere.
+
+**Activity** — the controls for that hour of traffic:
+
+| Control | What it does |
+| --- | --- |
+| `LIVE` | Follow the band as it happens (where it starts every session). |
+| `▶ REPLAY` | Sweep the replay head from an hour ago to now, over and over, at the chosen speed. |
+| `min ago` | Park the head anywhere in the last hour by hand. Dragging it stops a running replay. |
+| `trail` | How long a decode's arc stays on the globe behind the head (default 10 minutes). |
+| `speed` | How many times real time the replay runs at (default 60×, so the hour takes a minute). |
+
+Wound back off `LIVE`, the white "decoded just now" dots go away: what is on the
+globe then is the hour being replayed, not the present, and the two are not
+mixed. The history is kept only while sdroxide runs, so a fresh start begins
+with an empty hour that fills as the decodes come in.
+
+**The AWARDS layer** paints your logbook's DXCC coverage on the Earth as a map
+of what is *missing*. Every entity in the bundled country file gets a marker at
+its nominal centre: orange and slowly breathing where you have never worked it,
+amber where you have worked it but no QSL has come back, and a dim green dot
+once one has. The gaps are what stands out — an evening's chase has somewhere to
+aim. A key in the bottom-right corner counts the three states.
+
+It follows the band filter in the **AWARDS** window
+([§9.4](#94-award-tracking)), so setting that to `20m` repaints the globe as
+"what am I still missing on twenty". The layer needs the Earth to fill a fair
+part of the view before it draws — three hundred markers on a planet a few
+pixels across is noise, not information — and it is off by default. In the
+browser tab it is absent entirely: the logbook lives in the main window, and the
+relay carries live data rather than your records.
 
 **Sun** — which SDO product wraps the Sun:
 
-| Chip | Product |
+| Button | Product |
 | --- | --- |
 | `HMI` | HMI continuum — white light. **This is the one that shows sunspots.** |
 | `193` | AIA 193 Å — corona and coronal holes |
@@ -1631,7 +2651,7 @@ on a sphere. While you transmit, a bright pulse runs along the arc.
 | `211` | AIA 211 Å — active-region corona |
 | `MIX` | The 211/193/171 composite |
 
-`↻` fetches everything again immediately. Next to the chips is the age of the
+`↻` fetches everything again immediately. Next to the buttons is the age of the
 solar image — green when it is current, yellow when the last fetch failed and
 you are seeing a cached picture, pink when there is nothing at all. It always
 tells you what you are actually looking at; a cached image is never presented as
@@ -1650,7 +2670,7 @@ size, so nothing is ever invisible however you set these.
 all, forwards and backwards.
 
 **Clock** — a UTC time readout sits in the top-left corner. Scrubbing the time 
-with the `±6h`/`±24h` chips turns it yellow and relabels it `SIM`, denoting  
+with the `±6h`/`±24h` buttons turns it yellow and relabels it `SIM`, denoting  
 that the time displayed is not the current real time.
 
 **Propagation panel** — top right, the numbers worth checking before you call CQ:
@@ -1686,7 +2706,7 @@ about ±6 hours; treat this the same way.
 **Where the data comes from.** This is the only part of sdroxide that makes
 outbound internet connections, and it only does so **while this window is
 open** — closing it stops the background fetcher entirely, and never opening it
-means no request is ever made. Three hosts are contacted:
+means no request is ever made. Five hosts are contacted:
 
 | Host | Data | Refresh |
 | --- | --- | --- |
@@ -1694,8 +2714,9 @@ means no request is ever made. Three hosts are contacted:
 | `kauai.ccmc.gsfc.nasa.gov` | CMEs and solar flares ([NASA CCMC DONKI](https://ccmc.gsfc.nasa.gov/tools/DONKI/)) | 20 min |
 | `services.swpc.noaa.gov` | Sunspot regions, planetary K/A, 10.7 cm flux, GOES X-ray level (NOAA SWPC) | 5–60 min |
 | `services.swpc.noaa.gov` | The OVATION auroral oval grid, auroral hemispheric power, and the three-day planetary K forecast | 15–60 min |
+| `nowcoast.noaa.gov` | Global infrared and visible cloud mosaics (NOAA/NESDIS GMGSI, served by nowCOAST) | 10 min |
 | `prop.kc2g.com` | Ionosonde soundings for the MUF estimate (GIRO network, aggregated by KC2G) | 15 min |
-| `celestrak.org` | Orbital element sets for the amateur satellites | 6 h |
+| `celestrak.org` | Orbital element sets: the listings you subscribe to (the amateur group and the ISS by default), plus QO-100 | 6 h |
 
 Everything fetched is cached under `solar/` in the config directory and is
 loaded *before* the first network request, so the window opens instantly with
@@ -1719,8 +2740,9 @@ fitted, and cones are coloured cyan through pink with increasing speed.
 
 *Credits: solar imagery courtesy of NASA/SDO and the AIA and HMI science teams;
 CME and flare data from NASA CCMC's DONKI; sunspot regions, geomagnetic indices,
-solar flux, X-ray data and the OVATION aurora model from NOAA SWPC; ionosonde
-soundings from the GIRO
+solar flux, X-ray data and the OVATION aurora model from NOAA SWPC; cloud
+imagery from NOAA/NESDIS's Global Mosaic of Geostationary Satellite Imagery,
+served by NOAA nowCOAST; ionosonde soundings from the GIRO
 network via [prop.kc2g.com](https://prop.kc2g.com/); satellite element sets from
 [CelesTrak](https://celestrak.org/), propagated with SGP4. Planetary positions
 from JPL's approximate element set, moon orbits fitted to JPL Horizons, and body
@@ -1844,21 +2866,34 @@ Enable the feeds you want — DX cluster, POTA, SOTA, PSK Reporter — on the
 Spots then appear two ways:
 
 - **On the panadapter** — colour-coded, clickable boxes along the bottom of the
-  waterfall (DX = cyan, POTA = green, SOTA = amber, PSK = violet, FREEDV = pink),
-  each with a leader line down to the spotted frequency. Located spots (POTA
-  parks, PSK reporters, FreeDV stations) also appear as dots on the FT8 world
-  map.
+  waterfall (DX = cyan, POTA = green, SOTA = amber, PSK = violet, FREEDV = pink,
+  BC = orange), each with a leader line down to the spotted frequency. Located
+  spots (POTA parks, PSK reporters, FreeDV stations, broadcast transmitters) also
+  appear as dots on the FT8 world map.
 - **In the SPOTS window** — a filterable list (toggle **DX / POTA / SOTA / PSK /
-  FREEDV**, or **IN VIEW** to show only spots inside the current panadapter
+  FREEDV / BC**, or **IN VIEW** to show only spots inside the current panadapter
   span). Each row
   shows the source, callsign, frequency, mode, age and reference/comment, and a
   green **NEW** flag when it is a DXCC entity you haven't worked yet.
+
+Switching a category off hides it everywhere at once — the list, the panadapter
+labels and the world-map dots.
+
+**Search** — the **⌕** box below the chips does a fuzzy search over everything in
+the list: callsigns, station and transmitter names, comments, park and summit
+references, and the frequency written either way, so `9420`, `9.420` and `avlis`
+all find the same station. Letters need only appear in order, so `bbcws` finds
+"BBC World Service"; several words are all required, so `bbc asc` narrows to the
+BBC transmissions from Ascension. Matching rows are ranked best-first while you
+type, and a counter under the box says how many of the total matched. The search
+narrows the list only — the panadapter labels stay where the frequencies are.
 
 **Click a spot** — on the panadapter or in the SPOTS list — to tune your VFO onto
 it, switch to its mode, and open a **pre-filled New Entry** in the logbook (call,
 frequency, mode, and any grid/reference from the spot). If auto-lookup is on
 (below), the name/QTH/grid are filled in too. CW spots are tuned a sidetone pitch
-low so the signal lands in the CW passband.
+low so the signal lands in the CW passband. Broadcast stations only tune — they
+have no callsign to log or look up.
 
 ### 9.2 Callsign lookup
 
@@ -1912,6 +2947,23 @@ of LoTW, eQSL or a paper card is received for it. The same entity resolution
 flags **new** DXCC entities in the SPOTS list, so you can spot an all-time-new
 one at a glance.
 
+**Nothing here is ever reset**, and there is no control to reset it: the tally is
+recomputed from the logbook every time it is shown, so it is only ever a
+statement about the log as it stands. Delete a QSO and the entity it brought in
+goes with it; import an ADIF and its entities appear. There is no per-year or
+per-season rollover either — DXCC, WAS, WAZ and grids are all-time awards. The
+band filter is the only thing that narrows what is counted, and it is a view, not
+a state.
+
+**On the globe** — the 3D view's `AWARDS` layer
+([§6](#6-solar-system-3d-view)) paints the same tally on the Earth as a "what am
+I still missing" heat map: every DXCC entity in the country file gets a marker at
+its nominal centre, orange and breathing where you have never worked it, amber
+where you have but it is unconfirmed, and a dim green dot once a QSL has come
+back. A key in the bottom-right corner gives the counts. It follows the same band
+filter as this window, so switching to `20m` here repaints the globe as "what is
+missing on twenty".
+
 ### 9.5 FreeDV Reporter (qso.freedv.org)
 
 [FreeDV Reporter](https://qso.freedv.org/) is where FreeDV operators announce
@@ -1940,6 +2992,66 @@ connects read-only for twenty seconds and prints the stations and events it saw.
 It uses the server's view role, so it needs no radio and never makes you visible
 to anyone.
 
+### 9.6 Broadcast stations on longwave and shortwave
+
+SDRoxide ships a list of longwave and shortwave broadcast stations and labels them
+on the waterfall in orange, alongside the network spots — so a carrier on 225 kHz
+comes up as *Polskie Radio Program 1, Solec Kujawski* rather than as an
+unexplained signal. Click one to tune it in AM; unlike a cluster spot it opens no
+log entry and looks up no callsign.
+
+Only stations **on the air now** are labelled. Each entry may carry a UTC window
+and a set of days, and shortwave schedules move with the season, so the list is
+filtered against the clock every minute. Everything without a window — all the
+longwave transmitters, and the round-the-clock private shortwave stations — is
+always shown. Turn the whole category off with the **BC** chip in the SPOTS
+window.
+
+Because every entry names a real transmitter site with its coordinates, the
+stations also appear as dots on the FT8 world map, and **tuning one draws its path
+on the 3D globe**: a great-circle arc from your grid square to the transmitter,
+labelled with the station and site, exactly as a QSO or a weather-fax chart is.
+That turns "a signal on 15400" into "this came 8,000 km from Ascension Island".
+It needs your grid set on the **General** tab, and the **QSO** layer on.
+
+**The list is yours to edit.** On first run the bundled table is copied to
+`broadcast_stations.json` in the config directory ([§11](#11-configuration-files))
+and SDRoxide never writes it again — a schedule you have corrected or a local
+station you have added survives every upgrade. The **Spots** settings tab
+([§5.5](#55-spots-spot-feeds)) shows the path, with **Reload** to re-read the file
+after editing and **Restore bundled list** to go back to the shipped one (your
+version is kept as `broadcast_stations.json.bak`). Deleting the file also
+re-seeds it. If the file will not parse, SDRoxide warns and falls back to the
+bundled list rather than showing no stations, and leaves your file alone so you
+can fix it.
+
+Each entry needs only a name and a frequency in kHz:
+
+```json
+{ "name": "BBC World Service", "freq_khz": 15400, "site": "Ascension Island",
+  "country": "Ascension", "lat": -7.8981, "lon": -14.3769, "power_kw": 250,
+  "lang": "English", "target": "Africa",
+  "start_utc": 1800, "end_utc": 2100, "days": "1234567", "season": "B" }
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `freq_khz` | Required. Frequency in kHz, as broadcast schedules print it. |
+| `site`, `country` | Transmitter site — the country is where the transmitter stands, not where the broadcaster is from. |
+| `lat`, `lon` | Transmitter position in degrees. Both or neither; without them there is no map dot and no globe arc. |
+| `power_kw`, `lang`, `target` | Shown in the spot row. |
+| `mode` | Only if it is not plain `AM` — `SAM`, `USB`, … |
+| `start_utc`, `end_utc` | UTC `HHMM`. Leave both out for a round-the-clock station. `end_utc` below `start_utc` wraps past midnight, so `2200`–`0200` works. |
+| `days` | Digits `1` (Monday) to `7` (Sunday), e.g. `"12345"` for weekdays. Empty means daily. |
+| `season` | `"A"` (last Sunday in March to last Sunday in October) or `"B"`. Absent means both. |
+
+The bundled list is deliberately conservative: it covers stations whose
+frequency-and-site pairing is stable rather than trying to be a full timetable,
+and gives times only where the station keeps to them. For a complete seasonal
+schedule to paste extra entries from, see
+[eibispace.de](https://www.eibispace.de/) or
+[short-wave.info](https://www.short-wave.info/).
+
 ---
 
 ## 10. Command-line reference
@@ -1954,7 +3066,7 @@ to anyone.
 | `--freq <HZ>` | Center frequency in Hz (default 14,200,000). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC or a moderate value). |
-| `--mode <MODE>` | Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8, FT4, PSK, RTTY, OLIVIA, THOR, FSQ, SSTV, RFPAINT). |
+| `--mode <MODE>` | Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8, FT4, PSK, RTTY, OLIVIA, THOR, FSQ, SSTV, RIFP, WEFAX, RFPAINT, RADE). |
 | `--server` | Run as a server (web client + WebSocket streaming backend). |
 | `--connect <HOST[:PORT]>` | Connect as a native remote client to a running server. |
 | `--port <PORT>` | Server port (default: from config, 4950). |
@@ -1966,10 +3078,45 @@ to anyone.
 | `--width <CHARS>` | Console spectrum width in characters (default 100). |
 | `--freedv-reporter-probe <SECS>` | Connect to FreeDV Reporter read-only for SECS seconds and print what arrives. Uses the server's view role, so nothing is reported and you do not appear on the site. Needs no radio. |
 | `--freedv-reporter-host <HOST[:PORT]>` | FreeDV Reporter host for the probe (default `qso.freedv.org`). |
+| `--oob-tx` | Allow transmit on **any** frequency the hardware supports, not just the amateur bands. See below. |
 
 **Testing without a radio:** `--siggen` (built-in signal generator), `--file`
 (replay an IQ recording), `--probe` (list SoapySDR devices), and `--console`
 (a text-mode waterfall) are handy for trying things out.
+
+### Transmitting outside the amateur bands: `--oob-tx`
+
+sdroxide refuses to key up outside the amateur allocations. That lockout is the
+last thing standing between a mistyped frequency and an out-of-band
+transmission, so it is on by default and there is no button in the interface to
+turn it off.
+
+`--oob-tx` lifts it **for that run only**. It overrides `tx_ham_only` in
+`config.toml` and cannot be saved, so lifting the lockout is a deliberate act
+every single time sdroxide starts:
+
+```sh
+sdroxide --oob-tx
+```
+
+A warning appears in the middle of the window on startup and stays there until
+you dismiss it by hand. It comes back on the next launch, because the flag has
+to be passed again on the next launch.
+
+The flag can only ever *loosen* the lockout, never tighten it: without it,
+sdroxide behaves exactly as it always has.
+
+> **This is for licensed out-of-band use** — MARS/CAP, a commercial or
+> experimental licence, a service-monitor or dummy-load bench — where you are
+> authorised to use the frequencies you are about to key on. Transmitting
+> outside your licence is an offence in every country that issues one, and the
+> penalty for interfering with aeronautical, maritime or emergency traffic is
+> not a fine.
+
+Running `--server --oob-tx` lifts the lockout for **every** client that
+connects, local or remote, and each of them gets the warning: the licence at
+risk belongs to whoever is at the controls, who need not be whoever started the
+engine.
 
 ---
 
@@ -1997,15 +3144,24 @@ sdroxide stores its settings under the per-user config directory:
 | `wsjtx.json` | JSON | WSJT-X UDP broadcast: enabled, destination host and port, and the name clients see. |
 | `skimmer.json` | JSON | Skimmers: which of CW / PSK / RTTY run, and each one's spot squelch in dB. Restored at startup; a narrowband (audio-mode) radio still forces them off without disturbing what you picked. |
 | `input.json` | JSON | Control inputs: keyboard bindings, panadapter mouse behaviour, mouse-button bindings, and the MIDI controller mapping. Belongs to the machine running the user interface, not the engine. |
+| `satellites.json` | JSON | Satellite additions for the 3D tracker: subscribed element-set listings, element sets pasted in by hand, and frequency entries that override the built-in table. Belongs to the user interface, like `input.json`. |
+| `broadcast_stations.json` | JSON | Longwave and shortwave broadcast stations and their transmitter sites, labelled on the waterfall ([§9.6](#96-broadcast-stations-on-longwave-and-shortwave)). Seeded from the bundled list on first run and never written again, so your edits survive upgrades; delete it to get the bundled list back. |
 | `sstv_messages.json` | JSON | The overlay message stored for each of the five SSTV transmit slots. |
 | `voice_names.json` | JSON | The label given to each of the ten voice-keyer slots. |
 | `voice/` | dir | The voice-keyer recordings (`slot1.wav`…`slot10.wav`), 48 kHz mono. Drop your own WAV in to replace a message. |
 | `sstv_tx/` | dir | The five SSTV transmit-image slots (`slot0.png`…`slot4.png`). |
-| `sstv_rx/` | dir | Received SSTV pictures, kept for the gallery. |
-| `solar/` | dir | Cached solar imagery and space-weather JSON for the 3D view, with an index of HTTP validators so refreshes stay cheap. Safe to delete; it is re-fetched on demand. |
+| `sstv_rx/` | dir | Received SSTV and RIFP pictures, kept for the gallery. |
+| `wefax_rx/` | dir | Weather-fax charts received by an earlier version. Charts now go to `~/Pictures/sdroxide/wefax/`, but this is still read so an existing collection stays in the gallery. |
+| `solar/` | dir | Cached solar imagery, space-weather JSON and subscribed element-set listings for the 3D view, with an index of HTTP validators so refreshes stay cheap. Safe to delete; it is re-fetched on demand. |
 
 Every file has sensible defaults, so a missing or partial file always loads. You
 normally edit these through the GUI rather than by hand.
+
+Two things are kept outside the config directory, because they are things you
+will want to open in an ordinary file manager rather than program state:
+audio recordings go to `<Music>/sdroxide/`, and received weather-fax charts to
+`<Pictures>/sdroxide/wefax/`. Where the platform exposes no such folder, both
+fall back to the config directory.
 
 ---
 
@@ -2078,11 +3234,18 @@ stuck, press Apply / reconnect again.
 | M | Toggle mute. |
 | N | Toggle noise blanker. |
 | F | Fit the view to the full receiver span. |
+| V | Flip the waterfall (scroll upwards). |
 | 1 – 9, 0 (numpad) | Transmit voice-keyer slots 1–10 (nothing if the slot is empty). |
 | − (numpad) | Stop a voice-keyer message. |
 | F1 | Open this manual (works even while typing). |
 
 Shortcuts are ignored while typing in a text field.
+
+While this manual is open it takes the scrolling keys for itself, so reading it
+never tunes the radio at the same time: Up / Down scroll a few lines, Page Up /
+Page Down scroll a screen, Home / End jump to the ends, and Left / Right step to
+the previous / next section in the CONTENTS outline. Esc or F1 closes it and the
+keys go back to tuning.
 
 These are the **defaults**. Every one of them can be rebound — and PTT, band
 changes, filter width and much else bound to keys, mouse buttons or a MIDI
@@ -2097,17 +3260,20 @@ F1 is the exception: it always opens the manual, so it is not rebindable.
 | CW | Morse (continuous wave). |
 | AM | Amplitude modulation. |
 | SAM | Synchronous AM. |
-| NFM / WFM | Narrow / wide FM. |
+| NFM / WFM | Narrow / wide FM. WFM decodes broadcast stereo automatically. |
 | DIGU / DIGL | Data over USB / LSB (general digital). |
 | DSB | Double sideband. |
 | SPEC | Spectrum only (no demodulation). |
 | FT8 / FT4 | Automatic digital modes with decoding, QSO sequencing, and logging. |
+| JS8 | JS8 — conversational messaging on FT8's waveform. Four speeds (Normal 15 s / Fast 10 s / Turbo 6 s / Slow 30 s); directed queries, heartbeats and multi-frame free text. |
 | PSK | PSK31 keyboard mode (BPSK31 / varicode). |
 | RTTY | RTTY keyboard mode (Baudot; selectable shift and baud). |
 | OLIVIA | Robust MFSK keyboard mode (selectable tones/bandwidth). |
 | THOR | DominoEX-family IFK keyboard mode with FEC (THOR4…THOR32). |
 | FSQ | Fast Simple QSO — 33-tone IFK with directed (FSQCALL) messaging and images. |
+| HELL | Hellschreiber — facsimile "dot" mode read by eye, not decoded (Feld Hell, Slow, X5, X9, FSK Hell 245/105, Hell 80). |
 | SSTV | Slow-scan TV image mode (Scottie, Martin, Robot). |
+| RIFP | Radio Image Framing Protocol (draft-dulaunoy-rifp-00): packetised images over continuous-phase FSK. Centred on the dial, ~25 kHz wide — 70 cm, 2 m/6 m all-modes, or 10 m FM. |
 | RFPAINT | RF Paint — transmit-only spectrum painting of text and images onto the waterfall. |
 
 ### Bands

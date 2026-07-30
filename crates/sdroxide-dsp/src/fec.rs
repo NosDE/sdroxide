@@ -98,11 +98,7 @@ pub fn viterbi_decode(coded: &[u8], terminated: bool) -> Vec<u8> {
         pm = npm;
     }
     // Choose the traceback start state.
-    let mut state = if terminated {
-        0
-    } else {
-        (0..NSTATES).min_by_key(|&s| pm[s]).unwrap_or(0)
-    };
+    let mut state = if terminated { 0 } else { (0..NSTATES).min_by_key(|&s| pm[s]).unwrap_or(0) };
     let mut bits = vec![0u8; nsteps];
     for step in (0..nsteps).rev() {
         bits[step] = trace[step * NSTATES + state];

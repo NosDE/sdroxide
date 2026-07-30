@@ -8,7 +8,7 @@ sdroxide-types.workspace = true
 # Data types for the solar-system viewer protocol (src/solar.rs). Only the
 # portable half of that crate is reachable from here — its network and
 # filesystem modules are cfg'd out on wasm32, which is where this one runs.
-sdroxide-solar = { version = "0.6.0", path = "../sdroxide-solar" }
+sdroxide-solar = { path = "../sdroxide-solar" }
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true

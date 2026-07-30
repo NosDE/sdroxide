@@ -59,6 +59,9 @@ pub struct RxState {
     pub noise_reduction: NrLevel,
     /// Adaptive auto-notch (ANC): cancel constant tone elements in the audio.
     pub auto_notch: bool,
+    /// Allow WFM broadcast stereo when the 19 kHz pilot locks. Ignored in every
+    /// other mode.
+    pub wfm_stereo: bool,
 }
 
 impl RxState {
@@ -75,6 +78,7 @@ impl RxState {
             squelch_db: SQUELCH_OPEN_DB,
             noise_reduction: NrLevel::Off,
             auto_notch: false,
+            wfm_stereo: true,
         }
     }
 }
@@ -151,6 +155,17 @@ pub struct RadioState {
     /// Indexed by [`RxId::index`]: main, sub.
     pub rx: [RxState; 2],
     pub sub_rx_enabled: bool,
+    /// Where the sub receiver listens. Independent of A/B: the sub is a second
+    /// receiver, not a second view of a VFO, so swapping VFOs or retuning the
+    /// dial leaves it where the operator parked it — including across switching
+    /// the sub off and back on.
+    ///
+    /// Zero means "never placed". The engine parks it on the inactive VFO then,
+    /// and again whenever a band change moves the hardware out from under it:
+    /// the sub is a DDC on the same IQ as the main receiver, so a frequency
+    /// outside the device passband is one it cannot hear.
+    #[serde(default)]
+    pub sub_rx_hz: f64,
 
     pub rit: OffsetState,
     pub xit: OffsetState,
@@ -181,6 +196,16 @@ pub struct RadioState {
     /// when not recording.
     #[serde(default)]
     pub recording_file: Option<String>,
+    /// The engine will key outside the amateur bands.
+    ///
+    /// Set by the `--oob-tx` command-line flag, never by anything in the UI:
+    /// it is a deliberate act at launch, not a setting to be toggled by
+    /// accident. Published here rather than kept in the binary so a *remote*
+    /// client is warned too — the operator sitting at the UI is the one whose
+    /// licence is on the line, and they may not be the one who started the
+    /// engine.
+    #[serde(default)]
+    pub oob_tx: bool,
 }
 
 impl Default for RadioState {
@@ -195,16 +220,12 @@ impl Default for RadioState {
             sample_rate: 1_536_000.0,
             rx: [RxState::with_mode(mode), RxState::with_mode(mode)],
             sub_rx_enabled: false,
+            sub_rx_hz: 0.0, // never placed; the engine parks it on first use
             rit: OffsetState::default(),
             xit: OffsetState::default(),
             // Low drive defaults: digital amplitude stays far from full
             // scale until the operator raises it deliberately.
-            tx: TxState {
-                drive: 0.1,
-                tune_drive: 0.05,
-                mic_gain: 0.5,
-                ..TxState::default()
-            },
+            tx: TxState { drive: 0.1, tune_drive: 0.05, mic_gain: 0.5, ..TxState::default() },
             atu: AtuState::NotStarted,
             band: Band::M20,
             noise_blanker: false,
@@ -215,6 +236,7 @@ impl Default for RadioState {
             antenna_tx: String::new(),
             recording: false,
             recording_file: None,
+            oob_tx: false,
         }
     }
 }

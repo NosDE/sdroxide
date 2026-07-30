@@ -90,10 +90,7 @@ pub(crate) struct Shared {
 
 /// Build a tokio runtime and serve until the process exits.
 pub fn run_blocking(params: ServerParams) -> Result<(), ServerError> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(serve(params))
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve(params))
 }
 
 pub async fn serve(params: ServerParams) -> Result<(), ServerError> {
@@ -282,7 +279,24 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 Some(ServerMsg::SstvImage { image_id, mode, w, h, png })
             }
             RadioEvent::SstvStatus(s) => Some(ServerMsg::SstvStatus(s)),
+            RadioEvent::WefaxLine { image_id, y, gray } => {
+                Some(ServerMsg::WefaxLine { image_id, y, gray })
+            }
+            RadioEvent::WefaxImage { image_id, w, h, png } => {
+                Some(ServerMsg::WefaxImage { image_id, w, h, png })
+            }
+            RadioEvent::WefaxStatus(s) => Some(ServerMsg::WefaxStatus(s)),
+            RadioEvent::RifpRows { image_id, y, w, h, rows } => {
+                Some(ServerMsg::RifpRows { image_id, y, w, h, rows })
+            }
+            RadioEvent::RifpImage { image_id, meta, png } => {
+                Some(ServerMsg::RifpImage { image_id, meta, png })
+            }
+            RadioEvent::RifpStatus(s) => Some(ServerMsg::RifpStatus(s)),
             RadioEvent::DigiImage { png } => Some(ServerMsg::DigiImage { png }),
+            RadioEvent::HellColumns { seq, rows, cols } => {
+                Some(ServerMsg::HellColumns { seq, rows, cols })
+            }
             RadioEvent::VoiceStatus(v) => {
                 latest.voice = Some(v.clone());
                 Some(ServerMsg::VoiceStatus(v))

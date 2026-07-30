@@ -188,7 +188,8 @@ impl FsqRx {
             if let Some(prev) = self.prev_tone {
                 // +2·NUMTONES guards the unsigned subtraction against a downward
                 // tone step underflowing.
-                let code = ((tone + 2 * NUMTONES - prev - 1) % NUMTONES) & ((1 << BITS_PER_SYM) - 1);
+                let code =
+                    ((tone + 2 * NUMTONES - prev - 1) % NUMTONES) & ((1 << BITS_PER_SYM) - 1);
                 for shift in (0..BITS_PER_SYM).rev() {
                     if let Some(c) = self.vrx.push_bit(((code >> shift) & 1) as u8) {
                         out.push(c);

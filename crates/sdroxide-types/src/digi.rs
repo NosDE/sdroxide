@@ -5,9 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Mode;
-use crate::entity::resolve_callsign;
+use crate::entity::{resolve_callsign, resolve_prefix};
 use crate::geo::grid_distance_km;
+use crate::{Mode, RifpEncoding, RifpProfile, RifpSize};
 
 /// One decoded FT8/FT4 message from a receive slot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,48 +30,183 @@ pub struct Decode {
     pub grid: Option<String>,
     /// True when the message is a CQ call.
     pub is_cq: bool,
-    /// True when the CQ carried the `DX` modifier ("CQ DX AB1CD FN42") — the
-    /// caller only wants stations outside their own DXCC entity. See
-    /// [`cq_is_for_us`].
+    /// The modifier on a directed CQ, uppercased: the token between `CQ` and
+    /// the caller's callsign. `DX`, a continent (`EU`, `NA`, `AS`…), a country
+    /// prefix (`JA`, `DL`), or an activity (`POTA`, `TEST`). `None` for a plain
+    /// CQ, which is open to everyone. See [`cq_is_for_us`].
     #[serde(default)]
-    pub cq_dx: bool,
+    pub cq_to: Option<String>,
     /// True for a 13-character free-text message. It carries no addressing at
     /// all — `to` and `from` are always `None`, however much the text may look
     /// like an exchange.
     #[serde(default)]
     pub free_text: bool,
+    /// DXpedition (Fox) layout only: the station whose contact the Fox is
+    /// closing with `RR73` ("K1ABC RR73; W9XYZ <DX1FOX> +03" → `K1ABC`).
+    ///
+    /// It rides beside `to`/`from`, which name the *other* half of that message
+    /// (the station being worked now). A Hound learns its QSO is complete from
+    /// this field and nowhere else — the RR73 addressed to it is never in `to`.
+    #[serde(default)]
+    pub rr73_to: Option<String>,
 }
 
 /// How far away a station has to be to count as DX when the DXCC entity can't
 /// be resolved from either callsign — a rough stand-in for "another country".
 const DX_FALLBACK_KM: f64 = 3000.0;
 
+/// The continent codes cty.dat uses, which are also what a `CQ EU` names.
+const CONTINENTS: [&str; 7] = ["NA", "SA", "EU", "AF", "AS", "OC", "AN"];
+
+/// CQ modifiers that name an *activity* rather than a place: anyone may answer
+/// one, wherever they are.
+///
+/// The list exists because several of these collide with real callsign
+/// prefixes — `FD` (Field Day) begins like France, `WW` (CQ WW) like the United
+/// States, `RU` (ARRL RTTY Roundup) like Russia — and reading them
+/// geographically would hide contest CQs from everybody outside one country.
+const ACTIVITY_CQ: [&str; 11] =
+    ["POTA", "SOTA", "WWFF", "IOTA", "TEST", "QRP", "FD", "WW", "RU", "SKCC", "DIG"];
+
 /// True when a decoded CQ is one *we* may answer.
 ///
-/// A plain CQ is open to everyone. "CQ DX" asks for stations outside the
-/// caller's own DXCC entity, so it only counts as a CQ for us when we really are
-/// DX for them: the UI neither colours nor lists such a call under "CQ only"
-/// when we'd just be a local answering a DX call.
+/// A plain CQ is open to everyone. A directed one names who it wants, and the
+/// UI neither colours nor lists under "CQ only" a call we would only be
+/// answering out of turn:
 ///
-/// When the entity can't be resolved on both sides we fall back to the
-/// great-circle distance between the grids, and if that is unavailable too the
-/// call is treated as open — showing a CQ we can't judge beats hiding one we
-/// could have worked.
+/// * `CQ DX` wants stations outside the caller's own DXCC entity.
+/// * `CQ EU`, `CQ NA`, … want a continent.
+/// * `CQ JA`, `CQ DL`, … want a country, named by its prefix.
+/// * `CQ POTA`, `CQ TEST`, … want a kind of contact, not a place, so they are
+///   open to anyone.
+///
+/// Every test fails *open*: when the entity can't be resolved on both sides we
+/// fall back to the great-circle distance between the grids, and where even
+/// that is unavailable the call is treated as open. Showing a CQ we can't judge
+/// beats hiding one we could have worked.
 pub fn cq_is_for_us(d: &Decode, my_call: &str, my_grid: &str) -> bool {
     if !d.is_cq {
         return false;
     }
-    if !d.cq_dx {
-        return true;
-    }
-    let Some(from) = d.from.as_deref() else { return true };
-    match (resolve_callsign(from), resolve_callsign(my_call)) {
-        // The DXCC entity is what "DX" means on HF: same entity → we're local.
-        (Some(theirs), Some(mine)) => theirs.name != mine.name,
-        _ => match d.grid.as_deref().and_then(|g| grid_distance_km(my_grid, g)) {
-            Some(km) => km >= DX_FALLBACK_KM,
-            None => true,
+    let Some(dir) = d.cq_to.as_deref() else { return true };
+    let mine = resolve_callsign(my_call);
+    match dir {
+        "DX" => {
+            let Some(from) = d.from.as_deref() else { return true };
+            match (resolve_callsign(from), mine) {
+                // The DXCC entity is what "DX" means on HF: same entity → local.
+                (Some(theirs), Some(mine)) => theirs.name != mine.name,
+                _ => match d.grid.as_deref().and_then(|g| grid_distance_km(my_grid, g)) {
+                    Some(km) => km >= DX_FALLBACK_KM,
+                    None => true,
+                },
+            }
+        }
+        c if CONTINENTS.contains(&c) => mine.is_none_or(|m| m.continent == c),
+        a if ACTIVITY_CQ.contains(&a) => true,
+        // A country prefix. It is ours when the entity it names is the entity
+        // our own callsign belongs to — "CQ JA" from anywhere is for every
+        // Japanese station, however that station's own prefix is written.
+        pfx => match (resolve_prefix(pfx), mine) {
+            (Some(wanted), Some(mine)) => wanted.name == mine.name,
+            _ => true,
         },
+    }
+}
+
+/// Which side of an FT8 DXpedition-mode pile-up this station is operating.
+///
+/// DXpedition mode is FT8's answer to a rare-entity pile-up: one *Fox* works up
+/// to five *Hounds* at a time, transmitting several signals at once in the low
+/// part of the passband, always in the same (even) period. Hounds call from
+/// above 1000 Hz and, once the Fox comes back to them, move down onto the Fox's
+/// own frequency to finish. Both roles are FT8-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DxpedMode {
+    /// Ordinary FT8/FT4 operation; neither side of a DXpedition pile-up.
+    #[default]
+    Normal,
+    /// Calling a DXpedition station running Fox mode.
+    Hound,
+    /// Running the pile-up: several simultaneous signals, a queue of callers.
+    Fox,
+}
+
+/// DXpedition mode splits the passband in two: the Fox transmits its signals
+/// below this audio offset, and Hounds call above it, so the pile-up never
+/// lands on top of the one station everybody is trying to work. A Hound crosses
+/// into the Fox's half only after the Fox has answered it, to finish the
+/// contact on the Fox's own frequency.
+pub const FOX_ZONE_MAX_HZ: f32 = 1000.0;
+/// Top of the Hound calling zone — the practical upper edge of an FT8 passband.
+/// Display only; nothing refuses to transmit above it.
+pub const HOUND_ZONE_MAX_HZ: f32 = 3000.0;
+/// Most signals a Fox may transmit at once (WSJT-X's limit).
+pub const FOX_MAX_SLOTS: u8 = 5;
+
+impl DxpedMode {
+    pub const ALL: [DxpedMode; 3] = [DxpedMode::Normal, DxpedMode::Hound, DxpedMode::Fox];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DxpedMode::Normal => "Normal",
+            DxpedMode::Hound => "Hound",
+            DxpedMode::Fox => "Fox",
+        }
+    }
+}
+
+/// A station the operator has marked to be called, holding everything the
+/// sequencer needs to open the contact without hearing them again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedCall {
+    pub call: String,
+    pub grid: Option<String>,
+    /// Their signal when we queued them — the report we open with.
+    pub snr_db: i16,
+    /// Their tone offset, so we answer where they were transmitting.
+    pub audio_hz: f32,
+    /// Hold silently until they call CQ (or call us) rather than opening on
+    /// them. Decided when they were queued, exactly as the reply button decides
+    /// it: a station mid-exchange with someone else is not free yet.
+    pub wait_for_cq: bool,
+}
+
+/// One station in a Fox's pile-up, for the operator's queue display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoxCaller {
+    pub call: String,
+    pub grid: Option<String>,
+    /// Their signal at us — the report we send them.
+    pub snr_db: i16,
+    /// True once we have sent them a report and are running their contact;
+    /// false while they are only waiting in the queue.
+    pub working: bool,
+}
+
+/// How workable a station's clock offset is.
+///
+/// FT8 and FT4 depend on both ends agreeing where a slot begins. Being a little
+/// out costs nothing; being a lot out is the commonest reason a station calls
+/// all evening and nobody ever comes back, because its transmissions land
+/// outside the window everyone else's decoder searches. The thresholds follow
+/// WSJT-X's practical guidance rather than any hard decoder limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockHealth {
+    /// Well inside tolerance.
+    Good,
+    /// Still decodable, but worth fixing — FT4's slot is half as long, so this
+    /// hurts there first.
+    Marginal,
+    /// Far enough out that stations will fail to decode us.
+    Bad,
+}
+
+pub fn clock_health(offset_s: f32) -> ClockHealth {
+    match offset_s.abs() {
+        d if d < 0.5 => ClockHealth::Good,
+        d if d < 1.5 => ClockHealth::Marginal,
+        _ => ClockHealth::Bad,
     }
 }
 
@@ -191,6 +326,29 @@ pub struct DigiStatus {
     /// RADE digital voice: modem state, when that mode is active.
     #[serde(default)]
     pub rade: Option<RadeStatus>,
+    /// JS8: heard list, reassembled conversation and transmit-queue progress.
+    /// `None` in every other mode, so the panel that renders it is its own
+    /// "are we in JS8?" test.
+    #[serde(default)]
+    pub js8: Option<crate::Js8Status>,
+    /// Fox mode: the pile-up, callers being worked first. Empty in every other
+    /// role, so the panel showing it is its own "are we the Fox?" test.
+    #[serde(default)]
+    pub fox_queue: Vec<FoxCaller>,
+    /// Stations the operator has marked to work, in the order they will be
+    /// taken. The sequencer starts the next one as soon as it is free.
+    #[serde(default)]
+    pub call_queue: Vec<QueuedCall>,
+    /// How far our slot timing sits from the stations we are hearing, in
+    /// seconds. Positive means our clock runs ahead of theirs — we transmit
+    /// early and everyone else appears late to us. `None` until enough decodes
+    /// have arrived to say. See [`clock_health`].
+    ///
+    /// It measures the whole receive path, not the system clock alone: a slow
+    /// audio or network chain adds to it the same way a fast clock does. Either
+    /// way it is the offset stations on the air actually see.
+    #[serde(default)]
+    pub clock_offset_s: Option<f32>,
 }
 
 /// Live state of the RADE V1 modem.
@@ -248,6 +406,10 @@ impl DigiStatus {
             fsq_heard: Vec::new(),
             fsq_messages: Vec::new(),
             rade: None,
+            js8: None,
+            fox_queue: Vec::new(),
+            call_queue: Vec::new(),
+            clock_offset_s: None,
         }
     }
 }
@@ -277,7 +439,6 @@ pub struct QsoRecord {
 
     // Extended fields: contesting, awards, QSL status. All
     // `#[serde(default)]` via the struct attribute, so older logs still load.
-    
     /// Worked operator's name.
     pub name: String,
     /// Worked station's town / QTH.
@@ -416,6 +577,102 @@ impl ThorMode {
     }
 }
 
+/// Hellschreiber variant. Feld Hell is the classic on/off-keyed facsimile mode;
+/// X5 and X9 speed it up, Slow Hell crawls for weak signals, and the FSK
+/// variants keep the carrier up and shift it instead of keying it.
+///
+/// Rates follow fldigi's `feldcolumnrate` (character columns per second); every
+/// variant scans 14 dot rows per column and 7 columns per character cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HellVariant {
+    #[default]
+    Feld,
+    Slow,
+    X5,
+    X9,
+    Fsk245,
+    Fsk105,
+    Hell80,
+}
+
+impl HellVariant {
+    /// Dot rows scanned per character column.
+    pub const ROWS: usize = 14;
+    /// Columns per character cell; the last is the inter-character gap.
+    pub const CELL_COLS: usize = 7;
+
+    pub const ALL: [HellVariant; 7] = [
+        HellVariant::Feld,
+        HellVariant::Slow,
+        HellVariant::X5,
+        HellVariant::X9,
+        HellVariant::Fsk245,
+        HellVariant::Fsk105,
+        HellVariant::Hell80,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HellVariant::Feld => "FELD",
+            HellVariant::Slow => "SLOW",
+            HellVariant::X5 => "X5",
+            HellVariant::X9 => "X9",
+            HellVariant::Fsk245 => "FSK245",
+            HellVariant::Fsk105 => "FSK105",
+            HellVariant::Hell80 => "HELL80",
+        }
+    }
+
+    /// Character columns per second (fldigi's `feldcolumnrate`).
+    pub fn column_rate(self) -> f64 {
+        match self {
+            HellVariant::Feld => 17.5,
+            HellVariant::Slow => 2.1875,
+            HellVariant::X5 => 87.5,
+            HellVariant::X9 => 157.5,
+            HellVariant::Fsk245 => 17.5,
+            HellVariant::Fsk105 => 17.5,
+            HellVariant::Hell80 => 35.0,
+        }
+    }
+
+    /// Dots (transmitted pixels) per second — 14 rows in every column.
+    pub fn pixel_rate(self) -> f64 {
+        self.column_rate() * Self::ROWS as f64
+    }
+
+    /// Characters per second — 2.5 for classic Feld Hell.
+    pub fn chars_per_sec(self) -> f64 {
+        self.column_rate() / Self::CELL_COLS as f64
+    }
+
+    /// **Peak-to-peak** FSK shift in Hz; 0 for the on/off-keyed variants.
+    ///
+    /// This is fldigi's `hell_bandwidth`, which it applies as `tone ± value/2` —
+    /// so it is the full shift, not the deviation.
+    pub fn shift_hz(self) -> f64 {
+        match self {
+            HellVariant::Fsk245 => 122.5,
+            HellVariant::Fsk105 => 55.0,
+            HellVariant::Hell80 => 300.0,
+            _ => 0.0,
+        }
+    }
+
+    /// True for the frequency-shifted variants (continuous carrier); false for
+    /// the on/off-keyed ones.
+    pub fn is_fsk(self) -> bool {
+        self.shift_hz() > 0.0
+    }
+
+    /// Nominal occupied bandwidth in Hz — fldigi's receive-filter width. Drives
+    /// the receive filter, the waterfall markers, and the audio-centre clamp.
+    pub fn bandwidth_hz(self) -> f64 {
+        let raw = if self.is_fsk() { 4.0 * self.shift_hz() } else { 1.2 * self.pixel_rate() };
+        5.0 * (raw / 5.0).round()
+    }
+}
+
 /// echoed to clients in [`DigiStatus`]. `#[serde(default)]` so an older
 /// `digi.json` without the newer fields still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -468,10 +725,132 @@ pub struct DigiConfig {
     /// Calling CQ is exempt (repeating a CQ is the point); this counts calls to
     /// one station that never comes back. 0 disables it.
     pub max_tx_repeats: u32,
+    /// FT8/FT4: choose our transmit tone offset ourselves, rather than moving
+    /// onto whichever station we are answering.
+    ///
+    /// Answering on the DX's own frequency is the obvious thing and the wrong
+    /// one: they transmit in the opposite period to us, so their frequency
+    /// tells us nothing about who is transmitting there when *we* do — and the
+    /// station that is will not hear a word. With this on, the engine picks the
+    /// quietest spot in the period we are about to transmit in, from the
+    /// stations it has actually decoded there. Turn it off to hold a frequency
+    /// by hand. Ignored in DXpedition mode, where both roles have their
+    /// frequencies decided for them.
+    pub auto_tx_freq: bool,
+    /// FT8: which side of a DXpedition pile-up to operate (see [`DxpedMode`]).
+    /// Ignored in every other mode.
+    pub dxped_mode: DxpedMode,
+    /// Fox mode: how many signals to transmit at once (1..=5, WSJT-X's limit).
+    /// They are spaced 60 Hz apart starting at the transmit tone offset, and
+    /// share the transmitter's power between them.
+    pub fox_slots: u8,
     /// RADE: silence the demodulated (analog) audio, so only decoded speech is
     /// audible. Off by default — hearing the raw signal is how the operator
     /// tunes onto an over before the modem syncs.
     pub rade_mute_analog: bool,
+
+    /// JS8: transmission speed. Normal is the band convention; Fast and Turbo
+    /// trade sensitivity for latency, Slow the reverse. Changing it restarts
+    /// the decoder, since every speed is a different waveform.
+    #[serde(default)]
+    pub js8_speed: crate::Js8Speed,
+    /// JS8: answer SNR? / GRID? / HEARING? / STATUS? addressed to us or to
+    /// @ALLCALL. What makes a station worth leaving switched on.
+    #[serde(default = "yes")]
+    pub js8_auto_reply: bool,
+    /// JS8: send an automatic heartbeat every N minutes; 0 disables it.
+    ///
+    /// Off by default, deliberately. An automatic beacon that switches itself
+    /// on when the operator picks a mode is an on-air behaviour nobody
+    /// consented to.
+    #[serde(default)]
+    pub js8_heartbeat_min: u32,
+    /// JS8: answer a heard heartbeat with a signal report, so the station
+    /// beaconing learns who is copying them.
+    ///
+    /// Off by default, as upstream has it. This is the one auto-reply that
+    /// answers something nobody asked: a busy band carries a heartbeat every
+    /// slot, and a station that answered all of them would flood exactly the
+    /// band heartbeats exist to keep quiet. The engine rate-limits it besides.
+    #[serde(default)]
+    pub js8_hb_ack: bool,
+    /// JS8: beacon on the working frequency instead of moving to a free slot in
+    /// the 500–1000 Hz heartbeat sub-band.
+    ///
+    /// Off by default, so heartbeats go where the band convention says they
+    /// go — a beacon on top of somebody's QSO is exactly what the sub-band
+    /// exists to prevent. Upstream calls the same switch "heartbeat anywhere".
+    #[serde(default)]
+    pub js8_hb_anywhere: bool,
+    /// JS8: forget an incomplete multi-frame message after this many seconds.
+    #[serde(default = "js8_default_timeout")]
+    pub js8_assembly_timeout_s: u32,
+    /// JS8: station callsign, falling back to `my_call` when empty. Mirrors
+    /// `fsq_call`.
+    #[serde(default)]
+    pub js8_call: String,
+    /// JS8: free-text status sent in reply to ` STATUS?`.
+    #[serde(default)]
+    pub js8_status: String,
+    /// JS8: groups this station belongs to, so directed traffic to them counts
+    /// as addressed to us.
+    #[serde(default)]
+    pub js8_groups: Vec<String>,
+    /// Hellschreiber variant (Feld Hell / Slow / X5 / X9 / the FSK variants).
+    pub hell_variant: HellVariant,
+    /// Hellschreiber receive AGC speed: 0 = off (an absolute scale, meaningful
+    /// because the digi tap is already post-AGC) … 1 = fast. Normalises the
+    /// raster so a weak signal still paints legibly.
+    ///
+    /// Contrast, brightness and reverse video are deliberately *not* here: the
+    /// panel keeps its own copy of the raw grays, so shading them client-side
+    /// lets those controls repaint the whole scrollback rather than only the
+    /// columns that arrive after the change.
+    pub hell_rx_agc: f32,
+
+    // ── RIFP (draft-dulaunoy-rifp-00) ──
+    /// RIFP radio profile — the modulation the frames ride on.
+    pub rifp_profile: RifpProfile,
+    /// How the transmitted picture is encoded into the object bytes.
+    pub rifp_encoding: RifpEncoding,
+    /// Transmitted picture size.
+    pub rifp_size: RifpSize,
+    /// Weather fax: scan rate, index of cooperation, and whether the start and
+    /// stop tones drive the receiver on their own.
+    pub wefax_lpm: crate::WefaxLpm,
+    pub wefax_ioc: crate::WefaxIoc,
+    pub wefax_auto_start: bool,
+    pub wefax_auto_stop: bool,
+    /// Sample-clock trim in parts per million. A sound card a hundred ppm off
+    /// walks a quarter-hour chart most of a line sideways, which is the one
+    /// setting a fax operator always ends up touching.
+    pub wefax_slant_ppm: f32,
+    /// Grayscale depth the picture is quantised to before encoding (1/2/4/8).
+    /// The bilevel facsimile encodings are always 1 regardless.
+    pub rifp_bits_per_pixel: u8,
+    /// Payload octets per DATA frame. The CPFSK profile recommends 192: small
+    /// chunks cost header overhead, large ones lose more to a single hit.
+    pub rifp_chunk_size: u16,
+    /// Send every DATA frame this many times. Two is the reference
+    /// implementation's default — RIFP has no repair requests, so repetition is
+    /// the only recovery there is.
+    pub rifp_data_repeats: u8,
+    /// Send the MANIFEST this many times before the data starts.
+    pub rifp_manifest_repeats: u8,
+    /// Repeat the MANIFEST every N data chunks so a receiver that tuned in late
+    /// can still reassemble. 0 disables the periodic repeat.
+    pub rifp_manifest_every: u16,
+    /// Carry the operator's callsign as the Sender ID header TLV. The draft's
+    /// privacy considerations note that a stable sender identifier is trackable;
+    /// on the amateur bands identifying is the point, so this defaults on.
+    pub rifp_send_sender_id: bool,
+    /// Short UTF-8 description carried as the Content Hint header TLV, shown by
+    /// a receiver before the picture finishes arriving. Empty sends none.
+    pub rifp_content_hint: String,
+    /// Dither the picture when quantising to fewer than 8 bits per pixel.
+    pub rifp_dither: bool,
+    /// Give up on an incomplete incoming session after this many seconds.
+    pub rifp_session_timeout_s: u32,
 }
 
 impl Default for DigiConfig {
@@ -499,14 +878,51 @@ impl Default for DigiConfig {
             max_tx_repeats: 10,
             sstv_tx_ppm: 0.0,
             rf_paint_speed: 0.25,
+            auto_tx_freq: true,
+            dxped_mode: DxpedMode::Normal,
+            fox_slots: 3,
             rade_mute_analog: false,
+            js8_speed: crate::Js8Speed::Normal,
+            js8_auto_reply: true,
+            js8_heartbeat_min: 0,
+            js8_hb_ack: false,
+            js8_hb_anywhere: false,
+            js8_assembly_timeout_s: 300,
+            js8_call: String::new(),
+            js8_status: String::new(),
+            js8_groups: Vec::new(),
+            hell_variant: HellVariant::Feld,
+            hell_rx_agc: 0.35,
+            rifp_profile: RifpProfile::default(),
+            rifp_encoding: RifpEncoding::default(),
+            rifp_size: RifpSize::default(),
+            wefax_lpm: crate::WefaxLpm::default(),
+            wefax_ioc: crate::WefaxIoc::default(),
+            wefax_auto_start: true,
+            wefax_auto_stop: true,
+            wefax_slant_ppm: 0.0,
+            rifp_bits_per_pixel: 4,
+            rifp_chunk_size: 192,
+            rifp_data_repeats: 2,
+            rifp_manifest_repeats: 3,
+            rifp_manifest_every: 8,
+            rifp_send_sender_id: true,
+            rifp_content_hint: String::new(),
+            rifp_dither: true,
+            rifp_session_timeout_s: 300,
         }
     }
 }
 
 impl DigiConfig {
     /// Fill a template's placeholders. `report` is a signed dB value.
-    pub fn fill(template: &str, my_call: &str, my_grid: &str, dx: &str, report: Option<i16>) -> String {
+    pub fn fill(
+        template: &str,
+        my_call: &str,
+        my_grid: &str,
+        dx: &str,
+        report: Option<i16>,
+    ) -> String {
         let rpt = report.map(fmt_report).unwrap_or_default();
         template
             .replace("{MYCALL}", my_call)
@@ -521,11 +937,7 @@ impl DigiConfig {
 
 /// Format an SNR as an FT8 report token: `-13`, `+02`, `+00`.
 pub fn fmt_report(db: i16) -> String {
-    if db < 0 {
-        format!("-{:02}", -db)
-    } else {
-        format!("+{:02}", db)
-    }
+    if db < 0 { format!("-{:02}", -db) } else { format!("+{:02}", db) }
 }
 
 /// Which band a frequency falls in, as an ADIF band string (e.g. "20m").
@@ -755,7 +1167,8 @@ fn record_from_fields(fields: &[(String, String)]) -> QsoRecord {
     let time_on = get("TIME_ON").unwrap_or_default();
     r.start_utc = parse_adif_datetime(&date, &time_on);
     let time_off = get("TIME_OFF").unwrap_or_else(|| time_on.clone());
-    r.end_utc = if time_off.is_empty() { r.start_utc } else { parse_adif_datetime(&date, &time_off) };
+    r.end_utc =
+        if time_off.is_empty() { r.start_utc } else { parse_adif_datetime(&date, &time_off) };
     r.my_call = get("STATION_CALLSIGN")
         .or_else(|| get("OPERATOR"))
         .unwrap_or_default()
@@ -806,7 +1219,11 @@ fn parse_adif_datetime(date: &str, time: &str) -> i64 {
     let mo = date[4..6].parse().unwrap_or(1);
     let d = date[6..8].parse().unwrap_or(1);
     let (h, mi, s) = if time.len() >= 6 {
-        (time[0..2].parse().unwrap_or(0), time[2..4].parse().unwrap_or(0), time[4..6].parse().unwrap_or(0))
+        (
+            time[0..2].parse().unwrap_or(0),
+            time[2..4].parse().unwrap_or(0),
+            time[4..6].parse().unwrap_or(0),
+        )
     } else if time.len() >= 4 {
         (time[0..2].parse().unwrap_or(0), time[2..4].parse().unwrap_or(0), 0)
     } else {
@@ -822,8 +1239,15 @@ pub fn qso_log_to_text(records: &[QsoRecord]) -> String {
     );
     for r in records {
         let (date, time) = adif_date_time(r.start_utc);
-        let d = format!("{}-{}-{} {}:{}:{}", &date[0..4], &date[4..6], &date[6..8],
-            &time[0..2], &time[2..4], &time[4..6]);
+        let d = format!(
+            "{}-{}-{} {}:{}:{}",
+            &date[0..4],
+            &date[4..6],
+            &date[6..8],
+            &time[0..2],
+            &time[2..4],
+            &time[4..6]
+        );
         out.push_str(&format!(
             "{:19}  {:10} {:5} {:10.6}  {:4}  {:>4} {:>4}\n",
             d,
@@ -860,8 +1284,14 @@ mod tests {
             from: Some(from.to_string()),
             grid: grid.map(|g| g.to_string()),
             is_cq: true,
-            cq_dx: msg.starts_with("CQ DX"),
+            // Whatever sits between "CQ" and the callsign is the modifier.
+            cq_to: msg
+                .split_whitespace()
+                .nth(1)
+                .filter(|t| *t != from)
+                .map(|t| t.to_ascii_uppercase()),
             free_text: false,
+            rr73_to: None,
         }
     }
 
@@ -899,6 +1329,57 @@ mod tests {
         // Nor can we judge with no station callsign or grid of our own.
         let dx = cq("CQ DX W1AW FN31", "W1AW", Some("FN31"));
         assert!(cq_is_for_us(&dx, "", ""));
+    }
+
+    #[test]
+    fn a_continent_cq_is_for_that_continent() {
+        let eu = cq("CQ EU W1AW FN31", "W1AW", Some("FN31"));
+        assert!(cq_is_for_us(&eu, "DL1ABC", "JN48"), "Germany is in EU");
+        assert!(cq_is_for_us(&eu, "G0ABC", "IO91"));
+        assert!(!cq_is_for_us(&eu, "K2XYZ", "FN30"), "a US station is not EU");
+        assert!(!cq_is_for_us(&eu, "JA1XYZ", "PM95"));
+
+        let na = cq("CQ NA DL1ABC JN48", "DL1ABC", Some("JN48"));
+        assert!(cq_is_for_us(&na, "K2XYZ", "FN30"));
+        assert!(!cq_is_for_us(&na, "G0ABC", "IO91"));
+
+        // A station whose own entity we can't resolve gets shown everything.
+        assert!(cq_is_for_us(&eu, "QQ2QQ", "JN47"));
+    }
+
+    #[test]
+    fn a_country_cq_is_for_that_country() {
+        let ja = cq("CQ JA W1AW FN31", "W1AW", Some("FN31"));
+        assert!(cq_is_for_us(&ja, "JA1XYZ", "PM95"));
+        assert!(!cq_is_for_us(&ja, "K2XYZ", "FN30"));
+        assert!(!cq_is_for_us(&ja, "DL1ABC", "JN48"));
+    }
+
+    #[test]
+    fn an_activity_cq_is_open_to_everyone() {
+        // POTA, contests and the rest invite a kind of contact, not a place —
+        // including the ones whose token collides with a country prefix ("FD"
+        // starts like France, "WW" like the United States, "RU" like Russia).
+        for modifier in ["POTA", "SOTA", "TEST", "QRP", "FD", "WW", "RU"] {
+            let d = cq(&format!("CQ {modifier} W1AW FN31"), "W1AW", Some("FN31"));
+            for me in ["K2XYZ", "DL1ABC", "JA1XYZ"] {
+                assert!(cq_is_for_us(&d, me, "FN30"), "CQ {modifier} hidden from {me}");
+            }
+        }
+        // A modifier nobody recognises is shown rather than hidden.
+        let odd = cq("CQ ZZZZ W1AW FN31", "W1AW", Some("FN31"));
+        assert!(cq_is_for_us(&odd, "K2XYZ", "FN30"));
+    }
+
+    #[test]
+    fn clock_health_is_symmetric_about_zero() {
+        assert_eq!(clock_health(0.0), ClockHealth::Good);
+        assert_eq!(clock_health(0.49), ClockHealth::Good);
+        // Early and late are equally unworkable.
+        assert_eq!(clock_health(0.9), ClockHealth::Marginal);
+        assert_eq!(clock_health(-0.9), ClockHealth::Marginal);
+        assert_eq!(clock_health(2.0), ClockHealth::Bad);
+        assert_eq!(clock_health(-2.0), ClockHealth::Bad);
     }
 
     #[test]
@@ -983,4 +1464,14 @@ mod tests {
         // A known civil date: 2021-01-01 00:01:00 UTC.
         assert_eq!(ymd_hms_to_unix(2021, 1, 1, 0, 1, 0), 1_609_459_260);
     }
+}
+
+/// `#[serde(default)]` helper: a bool that defaults to true.
+fn yes() -> bool {
+    true
+}
+
+/// `#[serde(default)]` helper for [`DigiConfig::js8_assembly_timeout_s`].
+fn js8_default_timeout() -> u32 {
+    300
 }

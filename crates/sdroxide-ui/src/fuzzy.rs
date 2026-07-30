@@ -1,0 +1,155 @@
+//! A small fuzzy matcher for the search-as-you-type fields.
+//!
+//! Subsequence matching in the style of `fzf`: the query characters have to
+//! appear in order but not adjacently, so `bbcws` finds "BBC World Service" and
+//! `okee` finds "Okeechobee, FL". Scored rather than boolean so a list can be
+//! ranked by how well each row matched instead of staying in its natural order.
+//!
+//! Hand-rolled because the tree carries no fuzzy-matching crate and this is
+//! forty lines; it also has to compile for wasm32, like the rest of the UI.
+
+/// A match at the start of a word is worth the most.
+const BOUNDARY_BONUS: i32 = 16;
+/// A match immediately after the previous one is worth nearly as much: it means
+/// the query is a contiguous run rather than scattered letters.
+const RUN_BONUS: i32 = 10;
+/// An isolated match still counts for something.
+const MATCH_BONUS: i32 = 2;
+/// Each haystack character stepped over between matches costs a little, so a
+/// tight match beats a loose one.
+const SKIP_PENALTY: i32 = 1;
+
+fn is_boundary(c: u8) -> bool {
+    matches!(c, b' ' | b'-' | b'_' | b'/' | b'.' | b',' | b'(' | b')' | b':' | b'\t')
+}
+
+/// Score one term against `haystack`, or `None` if the term is not a
+/// subsequence of it. Higher is better. An empty term scores 0 and matches.
+///
+/// ASCII-case-insensitive, matching the rest of the codebase's callsign and
+/// station handling; non-ASCII bytes still compare exactly, so an accented
+/// station name is findable by typing it.
+pub fn score(haystack: &str, term: &str) -> Option<i32> {
+    if term.is_empty() {
+        return Some(0);
+    }
+    let h = haystack.as_bytes();
+    let n = term.as_bytes();
+    let mut total = 0;
+    let mut ni = 0;
+    let mut prev_match: Option<usize> = None;
+    for (hi, &hc) in h.iter().enumerate() {
+        if ni == n.len() {
+            break;
+        }
+        if !hc.eq_ignore_ascii_case(&n[ni]) {
+            continue;
+        }
+        let prev_idx = hi.checked_sub(1);
+        let at_boundary = prev_idx.is_none_or(|i| is_boundary(h[i]));
+        let continues_run = prev_idx.is_some() && prev_match == prev_idx;
+        total += if at_boundary {
+            BOUNDARY_BONUS
+        } else if continues_run {
+            RUN_BONUS
+        } else {
+            MATCH_BONUS
+        };
+        if let Some(p) = prev_match {
+            total -= (hi - p - 1) as i32 * SKIP_PENALTY;
+        }
+        prev_match = Some(hi);
+        ni += 1;
+    }
+    if ni < n.len() {
+        return None;
+    }
+    // Prefer the shorter of two otherwise equal matches, so a query that is
+    // nearly the whole name outranks the same letters buried in a long one.
+    Some(total - (h.len() as i32) / 8)
+}
+
+/// Score a whole query: every whitespace-separated term has to match somewhere,
+/// and the scores add up. That makes `bbc asc` find the BBC transmission from
+/// Ascension without caring which order the two words appear in.
+///
+/// An all-whitespace query matches everything with score 0, which is what the
+/// callers want for an empty search box.
+pub fn score_terms(haystack: &str, query: &str) -> Option<i32> {
+    let mut total = 0;
+    for term in query.split_whitespace() {
+        total += score(haystack, term)?;
+    }
+    Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_query_matches_everything() {
+        assert_eq!(score_terms("BBC World Service", ""), Some(0));
+        assert_eq!(score_terms("BBC World Service", "   "), Some(0));
+    }
+
+    #[test]
+    fn a_substring_matches_case_insensitively() {
+        assert!(score("BBC World Service", "world").is_some());
+        assert!(score("BBC World Service", "WORLD").is_some());
+        assert!(score("BBC World Service", "bbc").is_some());
+    }
+
+    #[test]
+    fn a_scattered_subsequence_matches() {
+        assert!(score("BBC World Service", "bbcws").is_some());
+        assert!(score("Okeechobee, FL", "okfl").is_some());
+    }
+
+    #[test]
+    fn a_non_subsequence_does_not_match() {
+        assert_eq!(score("BBC World Service", "zzz"), None);
+        // Right letters, wrong order.
+        assert_eq!(score("BBC World Service", "dlrow"), None);
+    }
+
+    #[test]
+    fn every_term_must_match() {
+        assert!(score_terms("BBC World Service Ascension", "bbc asc").is_some());
+        assert!(score_terms("BBC World Service Ascension", "bbc nowhere").is_none());
+        // Order between terms does not matter.
+        assert!(score_terms("BBC World Service Ascension", "asc bbc").is_some());
+    }
+
+    #[test]
+    fn a_word_start_outranks_a_letter_in_the_middle() {
+        let boundary = score("BBC World Service", "w").unwrap();
+        let middle = score("Newton", "w").unwrap();
+        assert!(boundary > middle, "{boundary} should beat {middle}");
+    }
+
+    #[test]
+    fn the_intended_station_outranks_an_accidental_subsequence() {
+        // "bbc" is a real prefix of the first and only a scattered accident in
+        // the second, so the ranking must put the BBC first.
+        let intended = score("BBC World Service", "bbc").unwrap();
+        let accident = score("Bangladesh Betar Cabirpur", "bbc").unwrap();
+        assert!(intended > accident, "{intended} should beat {accident}");
+    }
+
+    #[test]
+    fn a_tight_run_outranks_a_loose_one() {
+        let tight = score("Radio Nikkei", "nikkei").unwrap();
+        let loose = score("Radio Nacional Inconfidencia Kilo Kilo Echo India", "nikkei").unwrap();
+        assert!(tight > loose, "{tight} should beat {loose}");
+    }
+
+    #[test]
+    fn a_frequency_is_findable_as_typed() {
+        // The callers fold both renderings of the frequency into the haystack.
+        let hay = "voice of greece avlis greece 9420 9.420";
+        assert!(score_terms(hay, "9420").is_some());
+        assert!(score_terms(hay, "9.420").is_some());
+        assert!(score_terms(hay, "avlis").is_some());
+    }
+}

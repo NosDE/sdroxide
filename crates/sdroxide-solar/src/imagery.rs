@@ -244,9 +244,7 @@ mod tests {
 
     #[test]
     fn decodes_real_sdo_browse_images() {
-        for (bytes, channel) in
-            [(HMI, SdoChannel::HmiContinuum), (AIA193, SdoChannel::Aia0193)]
-        {
+        for (bytes, channel) in [(HMI, SdoChannel::HmiContinuum), (AIA193, SdoChannel::Aia0193)] {
             let img = decode(bytes, channel, 1_784_937_600).expect("fixture must decode");
             assert_eq!((img.w, img.h), (512, 512));
             assert_eq!(img.rgba.len(), 512 * 512 * 4);
@@ -351,4 +349,3 @@ mod tests {
         assert_eq!(SdoChannel::from_u8(99), SdoChannel::HmiContinuum);
     }
 }
-

@@ -88,8 +88,13 @@ impl MfskClock {
             if t >= self.sps {
                 let a = t - self.sps - self.buf_start;
                 let b = t - self.buf_start;
-                let mags =
-                    tone_bank_mags(&self.buf[a..b], self.base_hz, self.spacing, self.tones, self.rate);
+                let mags = tone_bank_mags(
+                    &self.buf[a..b],
+                    self.base_hz,
+                    self.spacing,
+                    self.tones,
+                    self.rate,
+                );
                 let peak = mags.iter().copied().fold(0.0f32, f32::max);
                 self.peak += 0.02 * (peak - self.peak);
                 let phase = (t / self.hop) % SUBPHASES;
@@ -144,9 +149,7 @@ pub fn tone_bank_mags(
     n_tones: usize,
     rate: f64,
 ) -> Vec<f32> {
-    (0..n_tones)
-        .map(|k| dft_bin(samples, base_hz + k as f64 * spacing_hz, rate).norm())
-        .collect()
+    (0..n_tones).map(|k| dft_bin(samples, base_hz + k as f64 * spacing_hz, rate).norm()).collect()
 }
 
 /// In-place fast Walsh–Hadamard transform (natural order). `data.len()` must be a

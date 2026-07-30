@@ -13,6 +13,9 @@ pub fn run(
     source: Box<dyn IqSource>,
     caps: DeviceCaps,
     settings: &Settings,
+    // Whether the engine refuses to key outside the amateur bands. Resolved in
+    // `main` from `config.toml` and the `--oob-tx` flag.
+    tx_ham_only: bool,
     initial_mode: Option<Mode>,
     port: u16,
     web_root: Option<PathBuf>,
@@ -31,7 +34,7 @@ pub fn run(
             mic: Some(MicParams { consumer: mic_consumer, rate: 48_000.0 }),
             cal_offset_db: settings.cal_offset_db as f32,
             initial_mode,
-            tx_ham_only: settings.tx_ham_only,
+            tx_ham_only,
             // A headless server is typically started before the rig it talks
             // to; the engine uses this to attach as soon as the radio is there.
             reopen,

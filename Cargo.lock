@@ -2343,6 +2343,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-kit-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06d3a048d09fbb6597dbf7c69f40d14df4a49487db1487191618c893fc3b1c26"
+dependencies = [
+ "core-foundation-sys",
+ "mach2 0.5.0",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2619,6 +2629,15 @@ name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "mach2"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1b95cd5421ec55b445b5ae102f5ea0e768de1f82bd3001e11f426c269c3aea"
 dependencies = [
  "libc",
 ]
@@ -2929,6 +2948,24 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "nusb"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf1553b6f47685e4c658b2100a6d7262abdc73cb97f423453546ca020155ae9"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "futures-core",
+ "io-kit-sys 0.5.0",
+ "linux-raw-sys 0.12.1",
+ "log",
+ "once_cell",
+ "rustix 1.1.4",
+ "slab",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4093,7 +4130,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdroxide"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4110,6 +4147,7 @@ dependencies = [
  "sdroxide-net",
  "sdroxide-proto",
  "sdroxide-radio",
+ "sdroxide-rtlsdr",
  "sdroxide-server",
  "sdroxide-tci",
  "sdroxide-types",
@@ -4120,7 +4158,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-audio"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cpal",
  "rtrb",
@@ -4130,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-cat"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "sdroxide-types",
@@ -4141,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-config"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "directories",
  "sdroxide-types",
@@ -4154,19 +4192,28 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-digi"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
+ "fax",
+ "flate2",
+ "getrandom 0.3.4",
+ "hound",
+ "image",
  "mfsk-core",
+ "num-complex",
  "sdroxide-dsp",
  "sdroxide-rade",
  "sdroxide-types",
+ "serde",
+ "serde_json",
+ "sha2",
  "tracing",
 ]
 
 [[package]]
 name = "sdroxide-dsp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "nnnoiseless",
  "num-complex",
@@ -4177,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-flex"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "rtrb",
@@ -4190,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-hpsdr"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "network-interface",
@@ -4202,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-icom"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "rtrb",
@@ -4214,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-midi"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "midir",
@@ -4224,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-net"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "roxmltree",
@@ -4239,7 +4286,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "postcard",
  "sdroxide-solar",
@@ -4250,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-rade"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4268,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-radio"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "image",
@@ -4292,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-rigctld"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "sdroxide-types",
@@ -4300,8 +4347,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdroxide-rtlsdr"
+version = "0.7.0"
+dependencies = [
+ "crossbeam-channel",
+ "nusb",
+ "rtrb",
+ "sdroxide-types",
+ "thiserror 2.0.19",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sdroxide-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "crossbeam-channel",
@@ -4324,7 +4384,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-skimmer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "num-complex",
@@ -4336,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-solar"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "image",
@@ -4351,7 +4411,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-tci"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "rtrb",
@@ -4363,14 +4423,15 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "sdroxide-ui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -4393,7 +4454,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-web"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "console_error_panic_hook",
  "eframe",
@@ -4408,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "sdroxide-wsjtx"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "sdroxide-types",
  "tracing",
@@ -4522,7 +4583,7 @@ dependencies = [
  "cfg-if",
  "core-foundation 0.10.1",
  "core-foundation-sys",
- "io-kit-sys",
+ "io-kit-sys 0.4.1",
  "mach2 0.4.3",
  "nix",
  "scopeguard",

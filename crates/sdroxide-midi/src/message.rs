@@ -34,15 +34,9 @@ pub fn parse(bytes: &[u8]) -> Option<MidiControl> {
         0x80 => MidiControl { msg: msg(MidiMsgKind::Note, d1), value: 0, off: true },
         // A note-on at velocity 0 is the conventional note-off; controllers
         // that use it would otherwise leave a button latched down forever.
-        0x90 => MidiControl {
-            msg: msg(MidiMsgKind::Note, d1),
-            value: d2,
-            off: d2 == 0,
-        },
+        0x90 => MidiControl { msg: msg(MidiMsgKind::Note, d1), value: d2, off: d2 == 0 },
         0xB0 => MidiControl { msg: msg(MidiMsgKind::Cc, d1), value: d2, off: false },
-        0xC0 => {
-            MidiControl { msg: msg(MidiMsgKind::ProgramChange, d1), value: d1, off: false }
-        }
+        0xC0 => MidiControl { msg: msg(MidiMsgKind::ProgramChange, d1), value: d1, off: false },
         0xE0 => {
             // 14-bit little-endian; bindings only need the coarse position.
             let bend = ((d2 as u16) << 7) | d1 as u16;

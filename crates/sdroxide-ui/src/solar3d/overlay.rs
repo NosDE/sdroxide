@@ -11,8 +11,20 @@ use crate::theme;
 use crate::view::solar_layer as layer;
 
 /// Layer chips, in bar order.
-const LAYERS: [(u32, &str, &str); 11] = [
+///
+/// The star field and the heliographic graticule are not among them: they are
+/// the backdrop and the coordinate frame everything else is read against, so
+/// they are always drawn rather than being switches.
+const LAYERS: [(u32, &str, &str); 10] = [
     (layer::ORBITS, "ORBITS", "Orbital paths"),
+    (
+        layer::CLOUDS,
+        "CLOUDS",
+        "Cloud cover from NOAA's global geostationary mosaic, drawn as a depth of air \
+         rather than a picture stuck on the surface: infrared says how cold each cloud \
+         top is, and that is how high it stands. Thunderstorms flash inside the towers \
+         they build.",
+    ),
     (
         layer::PLANETS,
         "PLANETS",
@@ -21,11 +33,13 @@ const LAYERS: [(u32, &str, &str); 11] = [
          fitted to JPL Horizons.",
     ),
     (layer::CME, "CME", "Coronal mass ejection trajectory cones"),
-    (layer::SPOTS, "SPOTS", "Sunspot active regions"),
-    (layer::FLARES, "FLARES", "Solar flare source locations"),
-    (layer::GRID, "GRID", "Ecliptic plane and heliographic graticule"),
+    (
+        layer::SUN_OBS,
+        "SUN OBS",
+        "Solar observations on the Sun's disk: sunspot active regions, and where the \
+         flares came from",
+    ),
     (layer::LABELS, "LABELS", "Body and region labels"),
-    (layer::STARS, "STARS", "Background star field"),
     (layer::QSO, "QSO", "Decoded FT8/FT4 stations and the path to the station being worked"),
     (layer::SATS, "SATS", "Amateur-radio satellites, their orbits and elevation from your QTH"),
     (
@@ -34,9 +48,26 @@ const LAYERS: [(u32, &str, &str); 11] = [
         "The auroral oval from NOAA's OVATION model, drawn as emission shells at their real \
          altitudes, with the equatorward edge of the 10 % contour marked on the surface",
     ),
+    (
+        layer::AWARDS,
+        "AWARDS",
+        "Award coverage: every DXCC entity painted by what your logbook is still missing. \
+         Orange burns where you have never worked the entity, amber where you have but it is \
+         unconfirmed, dim green where a QSL has come back. Follows the band filter in the \
+         AWARDS window.",
+    ),
 ];
 
+/// How often the view redraws when nothing is happening to it.
+///
+/// This is a clock, not a document: the Earth turns, the terminator moves, the
+/// Moon goes round and the QSO arcs follow the contacts. It has to keep running
+/// whether or not the pointer is over it and whether or not the window has
+/// focus — a frozen orrery in the corner of the screen is worse than none.
+const IDLE_FRAME: std::time::Duration = std::time::Duration::from_millis(33);
+
 pub fn ui(ui: &mut egui::Ui, st: &mut SolarUi) {
+    ui.ctx().request_repaint_after(IDLE_FRAME);
     // Take a snapshot of the feed's data for this frame. Cloning the `Arc`
     // first means the guard's lifetime is not tied to `st`, which is borrowed
     // mutably by every module below.
@@ -46,11 +77,7 @@ pub fn ui(ui: &mut egui::Ui, st: &mut SolarUi) {
     let now = super::wall_clock_unix() as i64;
 
     egui::Panel::top(egui::Id::new("solar-top"))
-        .frame(
-            egui::Frame::new()
-                .fill(theme::BG_DEEP)
-                .inner_margin(egui::Margin::symmetric(8, 6)),
-        )
+        .frame(egui::Frame::new().fill(theme::BG_DEEP).inner_margin(egui::Margin::symmetric(8, 6)))
         .show(ui, |ui| {
             chrome::angled_frame(ui, theme::PINK, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -62,6 +89,7 @@ pub fn ui(ui: &mut egui::Ui, st: &mut SolarUi) {
                         sun_module(ui, st, data, now);
                         scale_module(ui, st);
                         time_module(ui, st);
+                        activity_module(ui, st);
                     },
                 );
             });
@@ -109,10 +137,7 @@ fn target_button(ui: &mut egui::Ui, st: &mut SolarUi) {
             ui.set_max_width(560.0);
             for (caption, targets) in Focus::groups() {
                 ui.label(
-                    RichText::new(caption.to_uppercase())
-                        .color(theme::CYAN_DIM)
-                        .size(9.5)
-                        .strong(),
+                    RichText::new(caption.to_uppercase()).color(theme::CYAN_DIM).size(9.5).strong(),
                 );
                 ui.horizontal_wrapped(|ui| {
                     for f in targets {
@@ -149,10 +174,22 @@ fn target_button(ui: &mut egui::Ui, st: &mut SolarUi) {
 }
 
 fn layers_module(ui: &mut egui::Ui, st: &mut SolarUi) {
-    chrome::module(ui, "Layers", 594.0, |ui| {
+    // Wide enough for the nine chips that show without a logbook. AWARDS, which
+    // only appears once there is a log to colour, spills past the edge — it
+    // always has.
+    chrome::module(ui, "Layers", 610.0, |ui| {
         for (bit, label, hint) in LAYERS {
-            if chrome::chip(ui, st.layer(bit), label).on_hover_text(hint).clicked() {
-                st.toggle_layer(bit);
+            // The award layer has nothing to paint without a logbook to paint
+            // it from — the browser tab has none — and a chip that provably
+            // does nothing is worse than no chip.
+            if bit == layer::AWARDS && st.awards.is_empty() {
+                continue;
+            }
+            // `layer` is already "any of these bits", so a chip standing for a
+            // pair lights when either half is on and clears both when clicked.
+            let on = st.layer(bit);
+            if chrome::chip(ui, on, label).on_hover_text(hint).clicked() {
+                st.set_layers(bit, !on);
             }
         }
     });
@@ -188,7 +225,9 @@ fn sun_module(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>, now
                 let s = d.status(Source::Sun);
                 match (s.age_secs(now), &s.last_error) {
                     (Some(age), None) => (timefmt::age(age), theme::GREEN),
-                    (Some(age), Some(_)) => (format!("{} · offline", timefmt::age(age)), theme::YELLOW),
+                    (Some(age), Some(_)) => {
+                        (format!("{} · offline", timefmt::age(age)), theme::YELLOW)
+                    }
                     (None, Some(_)) => ("offline".to_string(), theme::PINK),
                     (None, None) => ("…".to_string(), theme::CYAN_DIM),
                 }
@@ -241,13 +280,104 @@ fn time_module(ui: &mut egui::Ui, st: &mut SolarUi) {
         if chrome::chip(ui, st.sim_offset_s == 0.0, "NOW").clicked() {
             st.sim_offset_s = 0.0;
         }
-        for (label, dt) in [("−24h", -86400.0), ("−1h", -3600.0), ("+1h", 3600.0), ("+24h", 86400.0)]
+        for (label, dt) in
+            [("−24h", -86400.0), ("−1h", -3600.0), ("+1h", 3600.0), ("+24h", 86400.0)]
         {
             if chrome::chip(ui, false, label).clicked() {
                 st.sim_offset_s += dt;
             }
         }
     });
+}
+
+/// The FT8/FT4 activity time-lapse: where in the last hour the globe's arcs
+/// are being replayed from, how long a trail they leave, and how fast the
+/// replay runs.
+fn activity_module(ui: &mut egui::Ui, st: &mut SolarUi) {
+    chrome::module(ui, "Activity", 430.0, |ui| {
+        let hour = crate::digi_map::HISTORY_S as f64;
+        if chrome::chip(ui, st.lapse_live() && !st.lapse_playing, "LIVE")
+            .on_hover_text("Follow the band as it happens")
+            .clicked()
+        {
+            st.lapse_playing = false;
+            st.set_lapse_back(0.0);
+        }
+        if chrome::chip_accent(
+            ui,
+            st.lapse_playing,
+            if st.lapse_playing { "⏸ REPLAY" } else { "▶ REPLAY" },
+            theme::CYAN,
+            theme::INK_ON_CYAN,
+        )
+        .on_hover_text("Replay the last hour of decodes, over and over")
+        .clicked()
+        {
+            st.lapse_playing = !st.lapse_playing;
+            // Starting from the present would replay nothing, so a replay
+            // begun while live starts at the top of the hour.
+            if st.lapse_playing && st.lapse_live() {
+                st.set_lapse_back(hour);
+            }
+        }
+
+        // The head, as minutes ago. Dragging it is also how you stop the
+        // replay running away from where you wanted to look.
+        let mut back_min = (st.lapse_back_s / 60.0) as f32;
+        let resp = ui.add(
+            egui::DragValue::new(&mut back_min)
+                .speed(0.5)
+                .range(0.0..=(hour / 60.0))
+                .suffix(" min ago"),
+        );
+        if resp.on_hover_text("Where in the last hour the globe is showing").changed() {
+            st.set_lapse_back(back_min as f64 * 60.0);
+            st.lapse_playing = false;
+        }
+
+        ui.label(RichText::new("trail").color(theme::CYAN_DIM).size(10.0));
+        ui.add(
+            egui::DragValue::new(&mut st.view.lapse_trail_min)
+                .speed(0.25)
+                .range(0.5..=(hour / 60.0))
+                .suffix(" min"),
+        )
+        .on_hover_text("How long a decode's arc stays on the globe behind the head");
+
+        ui.label(RichText::new("speed").color(theme::CYAN_DIM).size(10.0));
+        ui.add(
+            egui::DragValue::new(&mut st.view.lapse_speed)
+                .speed(1.0)
+                .range(1.0..=600.0)
+                .suffix("×"),
+        )
+        .on_hover_text("How much faster than real time the replay runs");
+
+        let hits = st.digi.history.len();
+        let (text, color) = if !st.layer(layer::QSO) {
+            ("QSO layer off".to_string(), theme::YELLOW)
+        } else if hits == 0 {
+            ("no decodes yet".to_string(), theme::CYAN_DIM)
+        } else if st.lapse_live() {
+            (format!("{hits} in the hour"), theme::GREEN)
+        } else {
+            (format!("−{:.0} min", st.lapse_back_s / 60.0), theme::CYAN)
+        };
+        ui.label(RichText::new(text).color(color).size(10.5));
+    });
+}
+
+/// Step the activity replay head, at `speed` × real time, looping round the
+/// hour. Looping and not stopping at the present on purpose: the point of a
+/// replay is to watch the opening come and go more than once.
+fn advance_lapse(ui: &egui::Ui, st: &mut SolarUi, dt: f32) {
+    if !st.lapse_playing {
+        return;
+    }
+    let step = dt.max(0.0) as f64 * st.view.lapse_speed.clamp(1.0, 600.0) as f64;
+    let back = st.lapse_back_s - step;
+    st.set_lapse_back(if back <= 0.0 { crate::digi_map::HISTORY_S as f64 } else { back });
+    ui.ctx().request_repaint();
 }
 
 /// The 3D scene: mouse interaction, the wgpu paint callback, then the readouts
@@ -261,13 +391,16 @@ fn scene(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>) {
     interact(ui, st, &resp);
 
     let ppp = ui.ctx().pixels_per_point();
-    let px = [
-        (rect.width() * ppp).round().max(1.0),
-        (rect.height() * ppp).round().max(1.0),
-    ];
+    let px = [(rect.width() * ppp).round().max(1.0), (rect.height() * ppp).round().max(1.0)];
     let sim_now = super::wall_clock_unix() + st.sim_offset_s;
     let anim = ui.input(|i| i.time);
-    advance_tour(ui, st, sim_now, anim);
+    // One elapsed-time step for everything animated off the wall clock, so the
+    // tour and the activity replay cannot disagree about how long a frame was.
+    let dt =
+        if st.last_frame_time <= 0.0 { 1.0 / 60.0 } else { (anim - st.last_frame_time) as f32 };
+    st.last_frame_time = anim;
+    advance_tour(ui, st, sim_now, dt);
+    advance_lapse(ui, st, dt);
     reframe(st, sim_now);
     let mut scene = super::scene::build(st, data, sim_now, px, anim as f32);
     // Labels and pick targets are egui's business, not the GPU's, so they come
@@ -276,9 +409,16 @@ fn scene(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>) {
     let picks = std::mem::take(&mut scene.picks);
     let view_proj = scene.globals.view_proj;
 
-    let (sun_img, sun_gen, aurora, aurora_gen) = match data {
-        Some(d) => (d.sun.clone(), d.sun_gen, d.aurora.clone(), d.aurora_gen),
-        None => (None, 0, None, 0),
+    let (sun_img, sun_gen, aurora, aurora_gen, clouds, clouds_gen) = match data {
+        Some(d) => (
+            d.sun.clone(),
+            d.sun_gen,
+            d.aurora.clone(),
+            d.aurora_gen,
+            d.clouds.clone(),
+            d.clouds_gen,
+        ),
+        None => (None, 0, None, 0, None, 0),
     };
     ui.painter().add(crate::egui_wgpu::Callback::new_paint_callback(
         rect,
@@ -289,6 +429,8 @@ fn scene(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>) {
             sun_gen,
             aurora,
             aurora_gen,
+            clouds,
+            clouds_gen,
         },
     ));
 
@@ -296,10 +438,13 @@ fn scene(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>) {
     // Only if a label did not already take it: a name sits on top of its own
     // body, and clicking the text should not be ambiguous.
     pick_bodies(ui, st, rect, &view_proj, &picks, &resp, took_click);
-    clock(ui, rect, sim_now, st.sim_offset_s != 0.0);
+    let clock_rect = clock(ui, rect, sim_now, st.sim_offset_s != 0.0);
+    sat_search(ui, st, data, rect, clock_rect);
     let below = weather_panel(ui, st, data, rect, sim_now as i64);
     aurora_panel(ui, st, data, rect, below, sim_now as i64);
     info_card(ui, st, data, rect, sim_now);
+    award_panel(ui, st, rect);
+    clouds_note(ui, st, data, rect, sim_now as i64);
     impact_banner(ui, data, rect, sim_now as i64);
     pass_window(ui, st, data, sim_now);
 
@@ -315,11 +460,7 @@ fn scene(ui: &mut egui::Ui, st: &mut SolarUi, data: Option<&SolarData>) {
 }
 
 /// Project a world point into the widget. `None` when it is behind the eye.
-fn project(
-    view_proj: &[[f32; 4]; 4],
-    rect: egui::Rect,
-    world: [f32; 3],
-) -> Option<egui::Pos2> {
+fn project(view_proj: &[[f32; 4]; 4], rect: egui::Rect, world: [f32; 3]) -> Option<egui::Pos2> {
     // Column-major, so column i scales input component i.
     let mut o = [0.0f32; 4];
     for (r, out) in o.iter_mut().enumerate() {
@@ -369,16 +510,18 @@ fn draw_labels(
         }
 
         let galley = p.layout_no_wrap(l.text.clone(), font.clone(), l.color);
-        let text_rect = egui::Rect::from_min_size(
-            pos - egui::vec2(0.0, galley.size().y * 0.5),
-            galley.size(),
-        );
-        let hovered = l.click != Click::None
-            && pointer.is_some_and(|q| text_rect.expand(4.0).contains(q));
+        let text_rect =
+            egui::Rect::from_min_size(pos - egui::vec2(0.0, galley.size().y * 0.5), galley.size());
+        let hovered =
+            l.click != Click::None && pointer.is_some_and(|q| text_rect.expand(4.0).contains(q));
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             // A backing plate, so it reads as something you can press.
-            p.rect_filled(text_rect.expand2(egui::vec2(4.0, 2.0)), 0, theme::FILL.gamma_multiply(0.85));
+            p.rect_filled(
+                text_rect.expand2(egui::vec2(4.0, 2.0)),
+                0,
+                theme::FILL.gamma_multiply(0.85),
+            );
             if clicked {
                 hit = Some(l.click);
             }
@@ -388,7 +531,13 @@ fn draw_labels(
         // well as over empty space.
         let color = if hovered { theme::TEXT_STRONG } else { l.color };
         let shadow = egui::Color32::from_black_alpha(color.a().saturating_sub(40));
-        p.text(pos + egui::vec2(1.0, 1.0), egui::Align2::LEFT_CENTER, &l.text, font.clone(), shadow);
+        p.text(
+            pos + egui::vec2(1.0, 1.0),
+            egui::Align2::LEFT_CENTER,
+            &l.text,
+            font.clone(),
+            shadow,
+        );
         p.text(pos, egui::Align2::LEFT_CENTER, &l.text, font.clone(), color);
     }
 
@@ -576,12 +725,8 @@ fn pass_window(ui: &egui::Ui, st: &mut SolarUi, data: Option<&SolarData>, sim_no
                                 } else {
                                     theme::TEXT
                                 };
-                                ui.label(
-                                    RichText::new(timefmt::ymd_hm(p.rise_unix)).color(color),
-                                );
-                                ui.label(
-                                    RichText::new(hhmm(p.set_unix)).color(color),
-                                );
+                                ui.label(RichText::new(timefmt::ymd_hm(p.rise_unix)).color(color));
+                                ui.label(RichText::new(hhmm(p.set_unix)).color(color));
                                 ui.label(
                                     RichText::new(format!("{} min", p.duration_s() / 60))
                                         .color(color),
@@ -616,18 +761,103 @@ fn pass_window(ui: &egui::Ui, st: &mut SolarUi, data: Option<&SolarData>, sim_no
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(
-                            "AOS/LOS are azimuths at the horizon. Times are UTC.",
-                        )
-                        .color(theme::LINE_LIT)
-                        .size(10.0),
+                        RichText::new("AOS/LOS are azimuths at the horizon. Times are UTC.")
+                            .color(theme::LINE_LIT)
+                            .size(10.0),
                     );
                 }
             }
+
+            // The operator's own entry wins over the built-in table: they have
+            // either corrected it or added a satellite it never knew about.
+            let (freqs, mine) = match st.sat_cfg.freqs_for(id) {
+                Some(f) => (Some(f), true),
+                None => (sdroxide_solar::satfreq::builtin_for(id), false),
+            };
+            freq_table(ui, freqs, mine, &cache.name);
         });
     if !open {
         st.selected_sat = None;
     }
+}
+
+/// The satellite's published frequencies, under the pass table.
+///
+/// Knowing when a bird comes over is only half of working it; the other half is
+/// what to tune to, and that is a table an operator would otherwise have open
+/// in a browser next to the radio.
+fn freq_table(
+    ui: &mut egui::Ui,
+    freqs: Option<&sdroxide_solar::SatFreqs>,
+    mine: bool,
+    tracked_name: &str,
+) {
+    let Some(freqs) = freqs.filter(|f| f.usable_links().next().is_some()) else {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("No frequencies on file for this one — add them in Settings ▸ TLE.")
+                .color(theme::LINE_LIT)
+                .size(10.0),
+        );
+        return;
+    };
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    let heading = if mine { "FREQUENCIES  ·  YOURS" } else { "FREQUENCIES" };
+    ui.label(RichText::new(heading).color(theme::CYAN_DIM).size(9.5).strong());
+    // The published designator can differ from what the element set calls it;
+    // showing it means a table entry keyed to the wrong catalogue number is
+    // visible rather than quietly presenting the wrong satellite's frequencies.
+    if !freqs.name.trim().is_empty() && !freqs.name.eq_ignore_ascii_case(tracked_name) {
+        ui.label(
+            RichText::new(format!("published as {}", freqs.name)).color(theme::LINE_LIT).size(10.0),
+        );
+    }
+    ui.add_space(2.0);
+
+    egui::Grid::new("solar-freq-grid").num_columns(4).spacing([14.0, 3.0]).show(ui, |ui| {
+        for h in ["LINK", "DOWNLINK (MHz)", "UPLINK (MHz)", "MODE"] {
+            ui.label(RichText::new(h).color(theme::CYAN_DIM).size(9.5).strong());
+        }
+        ui.end_row();
+        for l in freqs.links.iter().filter(|l| !l.is_empty()) {
+            let mut label = RichText::new(&l.label).color(theme::TEXT);
+            if !l.note.is_empty() {
+                label = label.color(theme::TEXT_STRONG);
+            }
+            let resp = ui.label(label);
+            if !l.note.is_empty() {
+                resp.on_hover_text(&l.note);
+            }
+            // The downlink is what gets tuned first, so it leads.
+            ui.label(
+                RichText::new(l.downlink.map_or_else(|| "—".into(), |b| b.to_string()))
+                    .color(theme::GREEN),
+            );
+            ui.label(
+                RichText::new(l.uplink.map_or_else(|| "—".into(), |b| b.to_string()))
+                    .color(theme::YELLOW),
+            );
+            ui.label(RichText::new(&l.mode).color(theme::TEXT));
+            ui.end_row();
+        }
+    });
+
+    // Everything an operator has to know before keying up sits in the notes, so
+    // they go on screen rather than only in a tooltip.
+    for l in freqs.links.iter().filter(|l| !l.note.is_empty() && !l.is_empty()) {
+        ui.label(
+            RichText::new(format!("{} — {}", l.label, l.note)).color(theme::LINE_LIT).size(10.0),
+        );
+    }
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Doppler shifts these by a few kHz across a LEO pass.")
+            .color(theme::LINE_LIT)
+            .size(10.0),
+    );
 }
 
 /// `HH:MM` — the date is already on the start column.
@@ -641,7 +871,7 @@ fn hhmm(unix: i64) -> String {
 /// UTC because everything else in the window is: the ephemeris, the DONKI
 /// timestamps, the arrival estimates and the FT8 slot boundaries. A local-time
 /// clock here would be the only thing on screen in a different frame.
-fn clock(ui: &egui::Ui, rect: egui::Rect, sim_now: f64, scrubbed: bool) {
+fn clock(ui: &egui::Ui, rect: egui::Rect, sim_now: f64, scrubbed: bool) -> Option<egui::Rect> {
     use super::dotmatrix;
 
     let (_, _, _, h, m, s) = sdroxide_types::utc_ymd_hms(sim_now as i64);
@@ -660,7 +890,7 @@ fn clock(ui: &egui::Ui, rect: egui::Rect, sim_now: f64, scrubbed: bool) {
         egui::vec2(size.x, size.y + label_size.y + 6.0) + pad * 2.0,
     );
     if !rect.contains_rect(panel) {
-        return;
+        return None;
     }
 
     ui.painter().rect_filled(panel, 0, theme::BG_DEEP.gamma_multiply(0.72));
@@ -684,6 +914,107 @@ fn clock(ui: &egui::Ui, rect: egui::Rect, sim_now: f64, scrubbed: bool) {
         on.gamma_multiply(0.6),
         egui::Color32::TRANSPARENT,
     );
+    Some(panel)
+}
+
+/// The satellite search box, under the clock.
+///
+/// Ninety satellites is far too many to find one by reading labels, and the
+/// ones that are not in the curated set have no label at all until `ALL SATS`
+/// is on — at which point there are ninety unlabelled dots. Typing a designator
+/// pulls that satellite out of the crowd with its orbit and its name, whether
+/// or not it was being drawn a moment ago.
+///
+/// Hidden when the satellite layer is off, because a search that highlights
+/// things nothing is drawing would look broken.
+fn sat_search(
+    ui: &egui::Ui,
+    st: &mut SolarUi,
+    data: Option<&SolarData>,
+    rect: egui::Rect,
+    clock_rect: Option<egui::Rect>,
+) {
+    let Some(clock_rect) = clock_rect else { return };
+    if !st.layer(layer::SATS) {
+        // Leaving text behind in a hidden box would keep highlighting after the
+        // layer came back, with nothing on screen to say why.
+        st.sat_search.clear();
+        return;
+    }
+
+    let width = clock_rect.width().max(210.0);
+    let area = egui::Rect::from_min_size(
+        clock_rect.left_bottom() + egui::vec2(0.0, 6.0),
+        egui::vec2(width, 30.0),
+    );
+    if !rect.contains_rect(area) {
+        return;
+    }
+
+    // Matches are counted from the same predicate the scene highlights with, so
+    // "3 of 94" can never disagree with what is lit up.
+    let (hits, total) = match data {
+        Some(d) => d.satellites().fold((0usize, 0usize), |(h, n), sat| {
+            (h + st.sat_search_hit(&sat.name, sat.norad_id) as usize, n + 1)
+        }),
+        None => (0, 0),
+    };
+    let query = st.sat_search.trim().to_string();
+    let mut clear = false;
+    let mut open: Option<u64> = None;
+
+    egui::Area::new(egui::Id::new("solar-sat-search"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(area.min)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(theme::BG_DEEP.gamma_multiply(0.72))
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.set_width(width - 16.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(RichText::new("⌕").color(theme::CYAN_DIM).size(14.0));
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut st.sat_search)
+                                .desired_width(width - 62.0)
+                                .hint_text("satellite")
+                                .text_color(theme::TEXT_STRONG),
+                        );
+                        // Enter on a single match opens its pass table, which is
+                        // what you were looking the satellite up for.
+                        if edit.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && hits == 1
+                        {
+                            open = data.and_then(|d| {
+                                d.satellites()
+                                    .find(|s| st.sat_search_hit(&s.name, s.norad_id))
+                                    .map(|s| s.norad_id)
+                            });
+                        }
+                        if !query.is_empty()
+                            && ui.button("✕").on_hover_text("Clear the search").clicked()
+                        {
+                            clear = true;
+                        }
+                    });
+                    if !query.is_empty() {
+                        let (text, colour) = match hits {
+                            0 => ("no match".to_string(), theme::PINK),
+                            n => (format!("{n} of {total} tracked"), theme::YELLOW),
+                        };
+                        ui.label(RichText::new(text).color(colour).size(10.0));
+                    }
+                });
+        });
+
+    if clear {
+        st.sat_search.clear();
+    }
+    if let Some(id) = open {
+        st.selected_sat = Some(id);
+    }
 }
 
 /// The propagation numbers, top right: MUF at the QTH, K and A, the 10.7 cm
@@ -770,9 +1101,7 @@ fn weather_panel(
     // may be a long way off, and saying so costs one line.
     let note = st
         .qth
-        .and_then(|(lat, lon)| {
-            sdroxide_solar::indices::estimate_muf(&w.ionosondes, lat, lon, now)
-        })
+        .and_then(|(lat, lon)| sdroxide_solar::indices::estimate_muf(&w.ionosondes, lat, lon, now))
         .map(|m| {
             p.layout_no_wrap(
                 format!("{} · {:.0} km", m.confidence(), m.nearest_km),
@@ -786,8 +1115,10 @@ fn weather_panel(
     let width = note.as_ref().map_or(width, |n| width.max(n.size().x + pad * 2.0));
     let height =
         rows.len() as f32 * row_h + note.as_ref().map_or(0.0, |n| n.size().y + 4.0) + pad * 2.0;
-    let panel =
-        egui::Rect::from_min_size(egui::pos2(rect.right() - width - 12.0, top), egui::vec2(width, height));
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - width - 12.0, top),
+        egui::vec2(width, height),
+    );
     if !rect.contains_rect(panel) {
         return top;
     }
@@ -943,15 +1274,11 @@ fn aurora_panel(
 
     let title = p.layout_no_wrap("AURORA".into(), small.clone(), theme::CYAN_DIM);
     let pad = 10.0;
-    let strip_w = if bins.is_empty() {
-        0.0
-    } else {
-        bins.len() as f32 * (BAR_W + BAR_GAP) - BAR_GAP
-    };
-    let width = (key_w + val_w + 18.0)
-        .max(strip_w)
-        .max(footer.as_ref().map_or(0.0, |f| f.size().x))
-        + pad * 2.0;
+    let strip_w =
+        if bins.is_empty() { 0.0 } else { bins.len() as f32 * (BAR_W + BAR_GAP) - BAR_GAP };
+    let width =
+        (key_w + val_w + 18.0).max(strip_w).max(footer.as_ref().map_or(0.0, |f| f.size().x))
+            + pad * 2.0;
     let height = title.size().y
         + 5.0
         + rows.len() as f32 * row_h
@@ -960,8 +1287,10 @@ fn aurora_panel(
         + footer.as_ref().map_or(0.0, |f| f.size().y + 4.0)
         + pad * 2.0;
 
-    let panel =
-        egui::Rect::from_min_size(egui::pos2(rect.right() - width - 12.0, top), egui::vec2(width, height));
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - width - 12.0, top),
+        egui::vec2(width, height),
+    );
     // Same rule as every other readout in this window: if it does not fit, it
     // is not drawn. A panel clipped by the viewport edge is worse than none.
     if !rect.contains_rect(panel) {
@@ -995,7 +1324,10 @@ fn aurora_panel(
                 theme::LINE.gamma_multiply(0.55),
             );
             p.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(x, base - h.max(1.0)), egui::pos2(x + BAR_W, base)),
+                egui::Rect::from_min_max(
+                    egui::pos2(x, base - h.max(1.0)),
+                    egui::pos2(x + BAR_W, base),
+                ),
                 0,
                 kp_color(bin.kp),
             );
@@ -1094,8 +1426,98 @@ fn info_card(
     }
 }
 
+/// The award layer's key, bottom right: what each colour on the globe means,
+/// and how many entities are in each state.
+///
+/// A heat map with no legend is decoration. This one is small, and it only
+/// exists while the layer it explains is switched on.
+fn award_panel(ui: &egui::Ui, st: &SolarUi, rect: egui::Rect) {
+    if !st.layer(layer::AWARDS) || st.awards.is_empty() {
+        return;
+    }
+    let (missing, worked, confirmed) = sdroxide_types::coverage_counts(&st.awards);
+    let rows = [
+        ("missing", missing, egui::Color32::from_rgb(0xff, 0x5a, 0x28)),
+        ("worked", worked, theme::YELLOW),
+        ("confirmed", confirmed, theme::GREEN),
+    ];
+
+    let p = ui.painter();
+    let font = egui::FontId::proportional(11.5);
+    let cap = egui::FontId::proportional(9.5);
+    let galleys: Vec<_> = rows
+        .iter()
+        .map(|(label, n, _)| p.layout_no_wrap(format!("{label}  {n}"), font.clone(), theme::TEXT))
+        .collect();
+    let title = p.layout_no_wrap("DXCC COVERAGE".into(), cap, theme::CYAN_DIM);
+
+    const SWATCH: f32 = 9.0;
+    let w = galleys.iter().map(|g| g.size().x).fold(title.size().x, f32::max) + SWATCH + 26.0;
+    let h = galleys.iter().map(|g| g.size().y + 3.0).sum::<f32>() + title.size().y + 18.0;
+    let panel = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - w - 12.0, rect.bottom() - h - 12.0),
+        egui::vec2(w, h),
+    );
+    if !rect.contains_rect(panel) {
+        return; // too small a window to be worth crowding
+    }
+    p.rect_filled(panel, 0, theme::FILL.gamma_multiply(0.82));
+    chrome::paint_cut_border(p, panel, theme::LINE_LIT, egui::Color32::TRANSPARENT);
+
+    let mut y = panel.top() + 7.0;
+    let x = panel.left() + 10.0;
+    let title_h = title.size().y;
+    p.galley(egui::pos2(x, y), title, theme::CYAN_DIM);
+    y += title_h + 4.0;
+    for (g, (_, _, color)) in galleys.into_iter().zip(rows) {
+        let dy = g.size().y + 3.0;
+        p.circle_filled(egui::pos2(x + SWATCH * 0.5, y + g.size().y * 0.5), SWATCH * 0.42, color);
+        p.galley(egui::pos2(x + SWATCH + 8.0, y), g, theme::TEXT);
+        y += dy;
+    }
+}
+
 /// The banner that justifies the whole window: a CME whose cone contains the
 /// Earth, with an arrival estimate.
+/// One line saying what the cloud deck is, and what about it is not measured.
+///
+/// The hour it shows is the hour the mosaic is *of*, which is over an hour
+/// behind the clock — the same discipline the aurora footer keeps, and for the
+/// same reason: a picture presented as current when it is not is worse than no
+/// picture. And it says the lightning is simulated, which is not optional. The
+/// storms are real and come out of the imagery; the individual flashes are
+/// invented, and a globe that flickers with plausible-looking strikes has to
+/// admit that rather than let anyone read them as strikes.
+fn clouds_note(ui: &egui::Ui, st: &SolarUi, data: Option<&SolarData>, rect: egui::Rect, now: i64) {
+    if !st.layer(layer::CLOUDS) {
+        return;
+    }
+    let Some(field) = data.and_then(|d| d.clouds.as_ref()) else { return };
+
+    let channels = if field.has_visible { "IR+VIS" } else { "IR only" };
+    let storms = match field.cells.len() {
+        0 => "no deep convection".to_string(),
+        1 => "1 storm".to_string(),
+        n => format!("{n} storms"),
+    };
+    let text = format!(
+        "CLOUDS  {}  ·  {} old  ·  {channels}  ·  {storms}  ·  lightning simulated",
+        timefmt::ymd_hm(field.frame_unix),
+        timefmt::age((now - field.frame_unix).max(0)),
+    );
+
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(text, egui::FontId::proportional(10.5), theme::LINE_LIT);
+    if galley.size().x > rect.width() - 40.0 {
+        return;
+    }
+    p.galley(
+        egui::pos2(rect.left() + 14.0, rect.bottom() - galley.size().y - 8.0),
+        galley,
+        theme::LINE_LIT,
+    );
+}
+
 fn impact_banner(ui: &egui::Ui, data: Option<&SolarData>, rect: egui::Rect, now: i64) {
     let Some(d) = data else { return };
     // The soonest arrival that has not already happened.
@@ -1180,10 +1602,7 @@ fn sun_elevation_azimuth(lat: f64, lon: f64, slat: f64, slon: f64) -> (f64, f64)
 
 /// Fly the AUTO tour, using real elapsed time so the pacing is frame-rate
 /// independent.
-fn advance_tour(ui: &egui::Ui, st: &mut SolarUi, sim_now: f64, frame_time: f64) {
-    let dt = (frame_time - st.last_frame_time) as f32;
-    let first_frame = st.last_frame_time <= 0.0;
-    st.last_frame_time = frame_time;
+fn advance_tour(ui: &egui::Ui, st: &mut SolarUi, sim_now: f64, dt: f32) {
     if !st.view.auto {
         // Hand the pivot back to the focus chips.
         st.focus_override = None;
@@ -1201,7 +1620,7 @@ fn advance_tour(ui: &egui::Ui, st: &mut SolarUi, sim_now: f64, frame_time: f64) 
     // `Tour` is `Copy`, so step a local and write it back rather than fighting
     // the borrow of `st.view` inside it.
     let mut tour = st.tour;
-    let pivot = tour.step(&mut st.view, &b, if first_frame { 1.0 / 60.0 } else { dt }, qso);
+    let pivot = tour.step(&mut st.view, &b, dt, qso);
     st.tour = tour;
     st.focus_override = Some(pivot);
     ui.ctx().request_repaint();

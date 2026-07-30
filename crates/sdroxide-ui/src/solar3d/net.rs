@@ -23,7 +23,7 @@ use ewebsock::{WsMessage, WsReceiver, WsSender};
 
 use sdroxide_proto::solar::{SOLAR_PROTO_VERSION, SolarClientMsg, SolarServerMsg};
 use sdroxide_proto::{decode as proto_decode, encode};
-use sdroxide_solar::{SdoChannel, SolarData, imagery, satellites};
+use sdroxide_solar::{SdoChannel, SolarData, clouds, imagery, satellites};
 
 /// Connection state, as the overlay's status line reports it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -191,6 +191,21 @@ impl SolarClient {
                 let mut d = self.lock();
                 d.aurora = Some(Arc::new(oval));
                 d.aurora_gen += 1;
+            }
+            // Same reasoning as the solar image above: decoding two 1024×512
+            // PNGs and estimating the clear-sky background under them is tens
+            // of milliseconds, and it all happens before the lock is taken.
+            SolarServerMsg::Clouds { infrared, frame_unix, fetched_unix, png } => {
+                let band = if infrared { clouds::Band::Longwave } else { clouds::Band::Visible };
+                if let Some(plane) = clouds::parse_plane(band, &png, frame_unix, fetched_unix) {
+                    let mut d = self.lock();
+                    if infrared {
+                        d.cloud_ir = Some(Arc::new(plane));
+                    } else {
+                        d.cloud_vis = Some(Arc::new(plane));
+                    }
+                    d.rebuild_clouds();
+                }
             }
             SolarServerMsg::Weather { weather, aurora_power, kp_forecast } => {
                 let mut d = self.lock();

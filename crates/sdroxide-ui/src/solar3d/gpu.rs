@@ -14,7 +14,7 @@
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor, wgpu};
 
 use super::mesh;
-use super::scene::{DrawData, Globals, LineInst, Prim, Scene, SpriteInst};
+use super::scene::{DrawData, Flashes, Globals, LineInst, Prim, Scene, SpriteInst};
 
 /// Size every body map is stored at. One size for all of them, because they
 /// live in a single array texture.
@@ -51,6 +51,8 @@ struct Targets {
 pub struct SolarResources {
     body_pipe: wgpu::RenderPipeline,
     aurora_pipe: wgpu::RenderPipeline,
+    cloud_pipe: wgpu::RenderPipeline,
+    cloud_march_pipe: wgpu::RenderPipeline,
     cone_pipe: wgpu::RenderPipeline,
     ring_pipe: wgpu::RenderPipeline,
     line_pipe: wgpu::RenderPipeline,
@@ -97,9 +99,13 @@ pub struct SolarResources {
     sun_gen: u64,
     aurora_tex: wgpu::Texture,
     aurora_view: wgpu::TextureView,
+    cloud_tex: wgpu::Texture,
+    cloud_view: wgpu::TextureView,
+    flash_buf: wgpu::Buffer,
     /// As `sun_gen`, for the OVATION grid. Its size is fixed, so a new grid is
     /// a texture write and never a bind-group rebuild.
     aurora_gen: u64,
+    cloud_gen: u64,
     sampler: wgpu::Sampler,
 
     sample_count: u32,
@@ -147,6 +153,9 @@ fn build(rs: &RenderState) -> SolarResources {
     };
     let body_sh = shader("solar-body", include_str!("../shaders/solar_body.wgsl"));
     let aurora_sh = shader("solar-aurora", include_str!("../shaders/solar_aurora.wgsl"));
+    let cloud_sh = shader("solar-cloud", include_str!("../shaders/solar_cloud.wgsl"));
+    let cloud_march_sh =
+        shader("solar-cloud-march", include_str!("../shaders/solar_cloud_march.wgsl"));
     let cone_sh = shader("solar-cone", include_str!("../shaders/solar_cone.wgsl"));
     let ring_sh = shader("solar-ring", include_str!("../shaders/solar_ring.wgsl"));
     let line_sh = shader("solar-line", include_str!("../shaders/solar_line.wgsl"));
@@ -198,6 +207,8 @@ fn build(rs: &RenderState) -> SolarResources {
                 },
                 count: None,
             },
+            tex_entry(7),
+            uniform_entry(8, false, std::mem::size_of::<Flashes>() as u64),
         ],
     });
     let draw_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -348,6 +359,30 @@ fn build(rs: &RenderState) -> SolarResources {
         depth_state(false, wgpu::CompareFunction::Greater),
         sample_count,
     );
+    // Cloud occludes: a deck hides the coastline under it, so unlike the aurora
+    // these emit real alpha and composite rather than only adding. Still no
+    // depth write, so the shells blend into one deck — and so the far side of
+    // each that clears the planet's silhouette is drawn too, which is the limb,
+    // which is the one place an eighteen-kilometre slab is more than a pixel
+    // thick.
+    let cloud_pipe = make_pipe(
+        "solar-cloud",
+        &draw_layout,
+        &cloud_sh,
+        &[mesh_layout.clone()],
+        Some(premultiplied),
+        depth_state(false, wgpu::CompareFunction::Greater),
+        sample_count,
+    );
+    let cloud_march_pipe = make_pipe(
+        "solar-cloud-march",
+        &draw_layout,
+        &cloud_march_sh,
+        &[mesh_layout.clone()],
+        Some(premultiplied),
+        depth_state(false, wgpu::CompareFunction::Greater),
+        sample_count,
+    );
     let cone_pipe = make_pipe(
         "solar-cone",
         &draw_layout,
@@ -390,15 +425,7 @@ fn build(rs: &RenderState) -> SolarResources {
         sample_count,
     );
     // The blit runs inside egui's pass, which has neither depth nor MSAA.
-    let blit_pipe = make_pipe(
-        "solar-blit",
-        &blit_layout,
-        &blit_sh,
-        &[],
-        None,
-        None,
-        1,
-    );
+    let blit_pipe = make_pipe("solar-blit", &blit_layout, &blit_sh, &[], None, None, 1);
 
     // ── Static meshes ───────────────────────────────────────────────────────
     let (sv, si) = mesh::sphere();
@@ -504,6 +531,34 @@ fn build(rs: &RenderState) -> SolarResources {
     });
     let aurora_view = aurora_tex.create_view(&Default::default());
 
+    // The cloud field: red is optical thickness, green is cloud-top height.
+    // Created empty for the same reason as the aurora grid — zero is "no
+    // cloud", which is the right thing to draw before the first mosaic lands —
+    // and never resized, so a new mosaic is a write and not a reallocation. A
+    // row is 2048 bytes, which is already the 256-byte multiple `write_texture`
+    // insists on, so unlike the 360-wide aurora grid this needs no padding.
+    let cloud_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("solar-cloud-tex"),
+        size: wgpu::Extent3d {
+            width: sdroxide_solar::clouds::GRID_W as u32,
+            height: sdroxide_solar::clouds::GRID_H as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let cloud_view = cloud_tex.create_view(&Default::default());
+    let flash_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("solar-flashes"),
+        size: std::mem::size_of::<Flashes>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("solar-sampler"),
         address_mode_u: wgpu::AddressMode::Repeat,
@@ -524,6 +579,8 @@ fn build(rs: &RenderState) -> SolarResources {
         &aurora_view,
         &border_view,
         &body_maps,
+        &cloud_view,
+        &flash_buf,
         &sampler,
     );
     let draw_bg = make_draw_bg(device, &draw_bgl, &draw_buf);
@@ -531,6 +588,8 @@ fn build(rs: &RenderState) -> SolarResources {
     SolarResources {
         body_pipe,
         aurora_pipe,
+        cloud_pipe,
+        cloud_march_pipe,
         cone_pipe,
         ring_pipe,
         line_pipe,
@@ -571,6 +630,10 @@ fn build(rs: &RenderState) -> SolarResources {
         aurora_tex,
         aurora_view,
         aurora_gen: 0,
+        cloud_tex,
+        cloud_view,
+        flash_buf,
+        cloud_gen: 0,
         sampler,
         sample_count,
         blit_format: rs.target_format,
@@ -589,6 +652,8 @@ fn make_scene_bg(
     aurora: &wgpu::TextureView,
     borders: &wgpu::TextureView,
     body_maps: &wgpu::TextureView,
+    clouds: &wgpu::TextureView,
+    flashes: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -611,6 +676,11 @@ fn make_scene_bg(
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(body_maps),
             },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(clouds),
+            },
+            wgpu::BindGroupEntry { binding: 8, resource: flashes.as_entire_binding() },
         ],
     })
 }
@@ -745,8 +815,7 @@ fn upload_map(
         let mut padded = vec![0u8; (stride * lh) as usize];
         for row in 0..*lh {
             let (src, dst) = ((row * lw) as usize, (row * stride) as usize);
-            padded[dst..dst + *lw as usize]
-                .copy_from_slice(&data[src..src + *lw as usize]);
+            padded[dst..dst + *lw as usize].copy_from_slice(&data[src..src + *lw as usize]);
         }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -812,8 +881,11 @@ fn upload_body_maps(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture
         // Every map is the same size, so a mismatched asset is dropped rather
         // than smeared across the wrong latitudes.
         if img.dimensions() != (BODY_MAP_W, BODY_MAP_H) {
-            eprintln!("sdroxide: {} is {:?}, expected {BODY_MAP_W}×{BODY_MAP_H}",
-                BODY_MAPS[layer].0, img.dimensions());
+            eprintln!(
+                "sdroxide: {} is {:?}, expected {BODY_MAP_W}×{BODY_MAP_H}",
+                BODY_MAPS[layer].0,
+                img.dimensions()
+            );
             continue;
         }
         let mut level = (BODY_MAP_W, BODY_MAP_H, img.into_raw());
@@ -884,10 +956,8 @@ fn halve((w, h, src): &(u32, u32, Vec<u8>)) -> (u32, u32, Vec<u8>) {
 impl SolarResources {
     /// Allocate (or keep) offscreen targets big enough for `size`.
     fn ensure_targets(&mut self, device: &wgpu::Device, size: (u32, u32)) {
-        let want = (
-            size.0.div_ceil(ALLOC_STEP) * ALLOC_STEP,
-            size.1.div_ceil(ALLOC_STEP) * ALLOC_STEP,
-        );
+        let want =
+            (size.0.div_ceil(ALLOC_STEP) * ALLOC_STEP, size.1.div_ceil(ALLOC_STEP) * ALLOC_STEP);
         let want = (want.0.clamp(ALLOC_STEP, self.max_dim), want.1.clamp(ALLOC_STEP, self.max_dim));
         if let Some(t) = &self.targets {
             // Keep the allocation while it fits and is not wildly oversized —
@@ -900,8 +970,7 @@ impl SolarResources {
             }
         }
 
-        let ext =
-            wgpu::Extent3d { width: want.0, height: want.1, depth_or_array_layers: 1 };
+        let ext = wgpu::Extent3d { width: want.0, height: want.1, depth_or_array_layers: 1 };
         let make = |label: &str, format, samples, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -954,7 +1023,10 @@ impl SolarResources {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
-                wgpu::BindGroupEntry { binding: 2, resource: self.blit_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_uniform.as_entire_binding(),
+                },
             ],
         });
 
@@ -1011,6 +1083,8 @@ impl SolarResources {
                 &self.aurora_view,
                 &self.border_view,
                 &self.body_map_view,
+                &self.cloud_view,
+                &self.flash_buf,
                 &self.sampler,
             );
         }
@@ -1071,6 +1145,45 @@ impl SolarResources {
         );
         self.aurora_gen = generation;
     }
+
+    /// Upload the cloud field. Fixed size, so this never touches the bind
+    /// group; the generation guard keeps a megabyte off every frame.
+    ///
+    /// Two channels interleaved: red is optical thickness, green is cloud-top
+    /// height over 0..[`sdroxide_solar::clouds::TOP_MAX_KM`]. Both are already
+    /// bytes in the parsed field, so this is a transpose and nothing else.
+    pub fn set_clouds(
+        &mut self,
+        queue: &wgpu::Queue,
+        field: &sdroxide_solar::CloudField,
+        generation: u64,
+    ) {
+        let (w, h) = (sdroxide_solar::clouds::GRID_W, sdroxide_solar::clouds::GRID_H);
+        if self.cloud_gen == generation || field.opacity.len() != w * h {
+            return;
+        }
+        let mut data = vec![0u8; w * h * 2];
+        for (i, px) in data.chunks_exact_mut(2).enumerate() {
+            px[0] = field.opacity[i];
+            px[1] = field.top[i];
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.cloud_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w as u32 * 2),
+                rows_per_image: Some(h as u32),
+            },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        self.cloud_gen = generation;
+    }
 }
 
 /// Draws one frame of the solar system. Carries the scene by `Arc` so the
@@ -1087,6 +1200,9 @@ pub struct SolarCallback {
     /// Latest auroral oval, on the same terms.
     pub aurora: Option<std::sync::Arc<sdroxide_solar::AuroraOval>>,
     pub aurora_gen: u64,
+    /// Latest cloud field, on the same terms.
+    pub clouds: Option<std::sync::Arc<sdroxide_solar::CloudField>>,
+    pub clouds_gen: u64,
 }
 
 impl CallbackTrait for SolarCallback {
@@ -1114,8 +1230,12 @@ impl CallbackTrait for SolarCallback {
         if let Some(oval) = &self.aurora {
             r.set_aurora(queue, &oval.grid, self.aurora_gen);
         }
+        if let Some(field) = &self.clouds {
+            r.set_clouds(queue, field, self.clouds_gen);
+        }
 
         queue.write_buffer(&r.globals_buf, 0, bytemuck::bytes_of(&self.scene.globals));
+        queue.write_buffer(&r.flash_buf, 0, bytemuck::bytes_of(&self.scene.flashes));
         queue.write_buffer(
             &r.blit_uniform,
             0,
@@ -1227,6 +1347,19 @@ impl CallbackTrait for SolarCallback {
                         pass.set_vertex_buffer(0, r.sphere_vb.slice(..));
                         pass.set_index_buffer(r.sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
                     }
+                    // Sphere mesh again for both cloud paths: the stack slices
+                    // the deck into shells of it, the volume path uses one at
+                    // the top of the slab and marches down from there.
+                    Prim::Cloud => {
+                        pass.set_pipeline(&r.cloud_pipe);
+                        pass.set_vertex_buffer(0, r.sphere_vb.slice(..));
+                        pass.set_index_buffer(r.sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    }
+                    Prim::CloudVolume => {
+                        pass.set_pipeline(&r.cloud_march_pipe);
+                        pass.set_vertex_buffer(0, r.sphere_vb.slice(..));
+                        pass.set_index_buffer(r.sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    }
                     Prim::Cone => {
                         pass.set_pipeline(&r.cone_pipe);
                         pass.set_vertex_buffer(0, r.cone_vb.slice(..));
@@ -1242,7 +1375,7 @@ impl CallbackTrait for SolarCallback {
             }
             pass.set_bind_group(1, &r.draw_bg, &[i as u32 * r.draw_stride]);
             let n = match prim {
-                Prim::Sphere | Prim::Aurora => r.sphere_indices,
+                Prim::Sphere | Prim::Aurora | Prim::Cloud | Prim::CloudVolume => r.sphere_indices,
                 Prim::Cone => r.cone_indices,
                 Prim::Ring => r.ring_indices,
             };
@@ -1315,6 +1448,8 @@ mod tests {
         let shaders = [
             ("solar_body.wgsl", include_str!("../shaders/solar_body.wgsl")),
             ("solar_aurora.wgsl", include_str!("../shaders/solar_aurora.wgsl")),
+            ("solar_cloud.wgsl", include_str!("../shaders/solar_cloud.wgsl")),
+            ("solar_cloud_march.wgsl", include_str!("../shaders/solar_cloud_march.wgsl")),
             ("solar_cone.wgsl", include_str!("../shaders/solar_cone.wgsl")),
             ("solar_ring.wgsl", include_str!("../shaders/solar_ring.wgsl")),
             ("solar_line.wgsl", include_str!("../shaders/solar_line.wgsl")),
@@ -1328,8 +1463,7 @@ mod tests {
                 naga::valid::ValidationFlags::all(),
                 naga::valid::Capabilities::empty(),
             );
-            v.validate(&module)
-                .unwrap_or_else(|e| panic!("{name} failed validation:\n{e:?}"));
+            v.validate(&module).unwrap_or_else(|e| panic!("{name} failed validation:\n{e:?}"));
         }
     }
 

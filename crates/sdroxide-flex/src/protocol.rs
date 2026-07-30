@@ -191,10 +191,8 @@ pub fn pan_rfgain(pan: u32, db: f64) -> String {
 /// is a comma-separated list of decibel values; anything unparsable is skipped
 /// so an unexpected shape costs the gain control, not the connection.
 pub fn parse_rfgain_info(body: &str) -> Vec<f64> {
-    let mut out: Vec<f64> = body
-        .split([',', ' '])
-        .filter_map(|t| t.trim().parse::<f64>().ok())
-        .collect();
+    let mut out: Vec<f64> =
+        body.split([',', ' ']).filter_map(|t| t.trim().parse::<f64>().ok()).collect();
     out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     out.dedup();
     out
@@ -208,7 +206,8 @@ pub fn pan_remove(pan: u32) -> String {
 /// it carries the frequency and mode the operator sees, and it is what
 /// transmits.
 pub fn slice_create(freq_hz: f64, pan: u32, mode: Mode, ant: &str) -> String {
-    let mut s = format!("slice create freq={} pan=0x{pan:08X} mode={}", mhz(freq_hz), mode_to_flex(mode));
+    let mut s =
+        format!("slice create freq={} pan=0x{pan:08X} mode={}", mhz(freq_hz), mode_to_flex(mode));
     if !ant.trim().is_empty() {
         s.push_str(&format!(" ant={}", ant.trim()));
     }
@@ -389,11 +388,14 @@ pub const DAX_AUDIO_RATE_HZ: u32 = 24_000;
 pub fn mode_to_flex(mode: Mode) -> &'static str {
     match mode {
         Mode::Lsb => "LSB",
-        Mode::Usb | Mode::Sstv | Mode::RfPaint | Mode::Spec => "USB",
+        // Hell and WEFAX are rasters on plain SSB, like SSTV.
+        Mode::Usb | Mode::Sstv | Mode::Hell | Mode::Wefax | Mode::RfPaint | Mode::Spec => "USB",
         Mode::Cw => "CW",
         Mode::Am => "AM",
         Mode::Sam => "SAM",
-        Mode::Nfm => "NFM",
+        // RIFP is FSK straight on the carrier over a ~25 kHz channel — the
+        // narrow FM passband is the one that fits it, as it is over CI-V.
+        Mode::Nfm | Mode::Rifp => "NFM",
         Mode::Wfm => "FM",
         Mode::Dsb => "DSB",
         Mode::Digl => "DIGL",
@@ -405,6 +407,7 @@ pub fn mode_to_flex(mode: Mode) -> &'static str {
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
+        | Mode::Js8
         | Mode::Rade => "DIGU",
     }
 }
@@ -498,9 +501,18 @@ mod tests {
         assert_eq!(client_station("Shack 1"), "client station Shack_1");
         assert_eq!(client_udpport(4993), "client udpport 4993");
         assert_eq!(sub("slice all"), "sub slice all");
-        assert_eq!(pan_create(14_100_000.0, 1200, 300), "display pan c freq=14.100000 x=1200 y=300");
-        assert_eq!(pan_center(0x4000_0000, 14_074_000.0), "display pan s 0x40000000 center=14.074000");
-        assert_eq!(pan_bandwidth(0x4000_0000, 192_000.0), "display pan s 0x40000000 bandwidth=0.192000");
+        assert_eq!(
+            pan_create(14_100_000.0, 1200, 300),
+            "display pan c freq=14.100000 x=1200 y=300"
+        );
+        assert_eq!(
+            pan_center(0x4000_0000, 14_074_000.0),
+            "display pan s 0x40000000 center=14.074000"
+        );
+        assert_eq!(
+            pan_bandwidth(0x4000_0000, 192_000.0),
+            "display pan s 0x40000000 bandwidth=0.192000"
+        );
         assert_eq!(
             slice_create(14_074_000.0, 0x4000_0000, Mode::Ft8, "ANT1"),
             "slice create freq=14.074000 pan=0x40000000 mode=DIGU ant=ANT1"

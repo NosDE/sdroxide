@@ -98,7 +98,10 @@ enum Ctrl {
     /// `mode.is_rade()`.
     Visible(bool),
     Message(String),
-    RxReport { call: String, snr: i32 },
+    RxReport {
+        call: String,
+        snr: i32,
+    },
     Shutdown,
 }
 
@@ -222,10 +225,9 @@ impl Roster {
                 true
             }
             "tx_report" => {
-                let (Some(sid), Some(tx)) = (
-                    str_of(args, "sid"),
-                    args.get("transmitting").and_then(Value::as_bool),
-                ) else {
+                let (Some(sid), Some(tx)) =
+                    (str_of(args, "sid"), args.get("transmitting").and_then(Value::as_bool))
+                else {
                     return false;
                 };
                 let s = self.by_sid.entry(sid).or_default();
@@ -579,11 +581,8 @@ impl Reporter {
     }
 
     fn open(&mut self) -> Result<Ws, String> {
-        let host = if self.cfg.host.trim().is_empty() {
-            "qso.freedv.org"
-        } else {
-            self.cfg.host.trim()
-        };
+        let host =
+            if self.cfg.host.trim().is_empty() { "qso.freedv.org" } else { self.cfg.host.trim() };
         let port = if self.cfg.port == 0 { 80 } else { self.cfg.port };
 
         let addr = (host, port)
@@ -973,14 +972,7 @@ pub fn probe(host: &str, port: u16, secs: f64) -> ProbeSummary {
     let (_ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
 
     // Empty callsign and grid force the read-only "view" role.
-    let mut r = Reporter::new(
-        cfg,
-        String::new(),
-        String::new(),
-        feed_tx,
-        event_tx,
-        ctrl_rx,
-    );
+    let mut r = Reporter::new(cfg, String::new(), String::new(), feed_tx, event_tx, ctrl_rx);
     r.run_until(Some(Instant::now() + Duration::from_secs_f64(secs.max(1.0))));
 
     let mut stations: Vec<ProbeStation> = r
@@ -1212,10 +1204,7 @@ mod tests {
         let mut rep = reporter("", "");
         rep.on_event(
             "bulk_update",
-            &json!([[
-                "bulk_update",
-                [["new_connection", connect_ev("s1", "K1ABC", "FN42")]]
-            ]]),
+            &json!([["bulk_update", [["new_connection", connect_ev("s1", "K1ABC", "FN42")]]]]),
             0,
         );
         assert!(rep.roster.by_sid.is_empty());

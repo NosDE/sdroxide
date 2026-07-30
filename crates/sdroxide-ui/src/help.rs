@@ -10,14 +10,21 @@
 use std::collections::HashMap;
 
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, FontFamily, FontId, Layout, Rect, Response,
-    RichText, Sense, Shape, Stroke, Ui, pos2, vec2,
+    self, Align, Color32, CursorIcon, FontFamily, FontId, Layout, Rect, Response, RichText, Sense,
+    Shape, Stroke, Ui, pos2, vec2,
 };
 
 use crate::theme::{self, ThemedScroll};
 
 /// The manual source, embedded from the repository `docs/` directory.
 const MANUAL_MD: &str = include_str!("../../../docs/USER_MANUAL.md");
+
+/// Points one arrow-key press scrolls the manual — a few lines, close to a
+/// wheel notch so the two gestures feel the same.
+const ARROW_STEP: f32 = 56.0;
+/// Fraction of the visible height Page Up/Down travels. The remainder is
+/// deliberate overlap: a full-height jump loses the reader's place.
+const PAGE_FRACTION: f32 = 0.88;
 
 /// Embedded screenshot bytes, keyed by the `images/<name>` path the manual
 /// uses. Everything is baked in so no image files are needed at runtime. The
@@ -42,8 +49,12 @@ fn embedded_image(path: &str) -> Option<&'static [u8]> {
         "10-skimmer.png" => &include_bytes!("../../../docs/images/10-skimmer.png")[..],
         "13-web-client.png" => &include_bytes!("../../../docs/images/13-web-client.png")[..],
         "14-spots-panel.jpg" => &include_bytes!("../../../docs/images/14-spots-panel.jpg")[..],
-        "15-settings-spots.jpg" => &include_bytes!("../../../docs/images/15-settings-spots.jpg")[..],
-        "16-settings-uploads.jpg" => &include_bytes!("../../../docs/images/16-settings-uploads.jpg")[..],
+        "15-settings-spots.jpg" => {
+            &include_bytes!("../../../docs/images/15-settings-spots.jpg")[..]
+        }
+        "16-settings-uploads.jpg" => {
+            &include_bytes!("../../../docs/images/16-settings-uploads.jpg")[..]
+        }
         "17-sats-passes.jpg" => &include_bytes!("../../../docs/images/17-sats-passes.jpg")[..],
         "18-awards.jpg" => &include_bytes!("../../../docs/images/18-awards.jpg")[..],
         "bw_measurement.jpg" | "bw-measurement.jpg" => {
@@ -51,14 +62,27 @@ fn embedded_image(path: &str) -> Option<&'static [u8]> {
         }
         "rit_xit.jpg" => &include_bytes!("../../../docs/images/rit_xit.jpg")[..],
         "rtty.jpg" => &include_bytes!("../../../docs/images/rtty.jpg")[..],
+        "hellschreiber.jpg" => &include_bytes!("../../../docs/images/hellschreiber.jpg")[..],
+        "js8call.jpg" => &include_bytes!("../../../docs/images/js8call.jpg")[..],
         "rfpaint.jpg" => &include_bytes!("../../../docs/images/rfpaint.jpg")[..],
         "sstv.jpg" => &include_bytes!("../../../docs/images/sstv.jpg")[..],
+        "wefax.jpg" => &include_bytes!("../../../docs/images/wefax.jpg")[..],
         "settings-general.jpg" => &include_bytes!("../../../docs/images/settings-general.jpg")[..],
-        "settings-controls-keyboard.jpg" => &include_bytes!("../../../docs/images/settings-controls-keyboard.jpg")[..],
-        "settings-controls-mouse.jpg" => &include_bytes!("../../../docs/images/settings-controls-mouse.jpg")[..],
-        "settings-controls-midi.jpg" => &include_bytes!("../../../docs/images/settings-controls-midi.jpg")[..],
-        "settings-servers-hamlib.jpg" => &include_bytes!("../../../docs/images/settings-servers-hamlib.jpg")[..],
-        "settings-servers-tci.jpg" => &include_bytes!("../../../docs/images/settings-servers-tci.jpg")[..],
+        "settings-controls-keyboard.jpg" => {
+            &include_bytes!("../../../docs/images/settings-controls-keyboard.jpg")[..]
+        }
+        "settings-controls-mouse.jpg" => {
+            &include_bytes!("../../../docs/images/settings-controls-mouse.jpg")[..]
+        }
+        "settings-controls-midi.jpg" => {
+            &include_bytes!("../../../docs/images/settings-controls-midi.jpg")[..]
+        }
+        "settings-servers-hamlib.jpg" => {
+            &include_bytes!("../../../docs/images/settings-servers-hamlib.jpg")[..]
+        }
+        "settings-servers-tci.jpg" => {
+            &include_bytes!("../../../docs/images/settings-servers-tci.jpg")[..]
+        }
         "settings-freedv.jpg" => &include_bytes!("../../../docs/images/settings-freedv.jpg")[..],
 
         "settings-radio-soapysdr.jpg" => {
@@ -73,6 +97,12 @@ fn embedded_image(path: &str) -> Option<&'static [u8]> {
         "settings-radio-tci.jpg" => {
             &include_bytes!("../../../docs/images/settings-radio-tci.jpg")[..]
         }
+        "settings-radio-rtlsdr.jpg" => {
+            &include_bytes!("../../../docs/images/settings-radio-rtlsdr.jpg")[..]
+        }
+        "settings-tle1.jpg" => &include_bytes!("../../../docs/images/settings-tle1.jpg")[..],
+        "settings-tle2.jpg" => &include_bytes!("../../../docs/images/settings-tle2.jpg")[..],
+        "settings-tle3.jpg" => &include_bytes!("../../../docs/images/settings-tle3.jpg")[..],
         "3d-sun.jpg" => &include_bytes!("../../../docs/images/3d-sun.jpg")[..],
         "3d-earth.jpg" => &include_bytes!("../../../docs/images/3d-earth.jpg")[..],
         "3d-cme.jpg" => &include_bytes!("../../../docs/images/3d-cme.jpg")[..],
@@ -157,13 +187,34 @@ pub struct Help {
     /// Slug highlighted in the outline — follows the scroll position, or the
     /// last item the user clicked.
     active: String,
+    /// Scroll the keyboard has asked for but the content pane has not applied
+    /// yet (points, positive = towards the end of the manual). Filled by
+    /// [`Help::grab_keys`] at the top of the frame, spent when the pane draws.
+    key_scroll: f32,
+    /// Content-pane geometry from the last frame — visible height, total height
+    /// and current offset. Page Up/Down and Home/End are expressed in points,
+    /// so they need to know how tall a page is and where the ends are.
+    viewport_h: f32,
+    content_h: f32,
+    offset_y: f32,
 }
 
 impl Default for Help {
     fn default() -> Self {
         let doc = Doc::parse(MANUAL_MD);
         let active = doc.nav.first().map(|n| n.slug.clone()).unwrap_or_default();
-        Help { open: false, doc, textures: HashMap::new(), scroll_to: None, scroll_frames: 0, active }
+        Help {
+            open: false,
+            doc,
+            textures: HashMap::new(),
+            scroll_to: None,
+            scroll_frames: 0,
+            active,
+            key_scroll: 0.0,
+            viewport_h: 0.0,
+            content_h: 0.0,
+            offset_y: 0.0,
+        }
     }
 }
 
@@ -182,6 +233,89 @@ impl Help {
         self.scroll_frames = 3;
     }
 
+    /// While the manual is open, claim the scrolling keys for it.
+    ///
+    /// The events are pulled out of egui's queue rather than merely acted on,
+    /// and this runs *before*
+    /// [`crate::input::InputRuntime::poll_pointer_and_keys`], so an arrow key
+    /// bound to tuning scrolls the manual instead of doing both at once. ←/→
+    /// step whole sections, the only reading-shaped meaning a horizontal key has
+    /// in a document that wraps.
+    pub fn grab_keys(&mut self, ctx: &egui::Context) {
+        use egui::Key;
+
+        if !self.open {
+            return;
+        }
+        // A focused text field elsewhere (the settings dialog can sit on top of
+        // the manual) owns the keyboard; leave its arrows alone.
+        if ctx.egui_wants_keyboard_input() || ctx.memory(|m| m.focused()).is_some() {
+            return;
+        }
+
+        let page = (self.viewport_h * PAGE_FRACTION).max(ARROW_STEP);
+        let mut dy = 0.0f32;
+        // Home/End are absolute, so they are resolved after the scan and win
+        // over any line/page steps in the same batch.
+        let mut jump: Option<bool> = None;
+        let mut section = 0i32;
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                let egui::Event::Key { key, pressed, .. } = e else { return true };
+                // Key repeats arrive as further presses, which is what gives a
+                // held arrow its run-on scroll. Releases are dropped too, so a
+                // binding can never see half a keystroke.
+                let step = match key {
+                    Key::ArrowUp => -ARROW_STEP,
+                    Key::ArrowDown => ARROW_STEP,
+                    Key::PageUp => -page,
+                    Key::PageDown => page,
+                    Key::Home | Key::End => {
+                        if *pressed {
+                            jump = Some(*key == Key::End);
+                        }
+                        return false;
+                    }
+                    Key::ArrowLeft | Key::ArrowRight => {
+                        if *pressed {
+                            section += if *key == Key::ArrowRight { 1 } else { -1 };
+                        }
+                        return false;
+                    }
+                    _ => return true,
+                };
+                if *pressed {
+                    dy += step;
+                }
+                false
+            });
+        });
+
+        if let Some(to_end) = jump {
+            let max = (self.content_h - self.viewport_h).max(0.0);
+            dy = if to_end { max - self.offset_y } else { -self.offset_y };
+        }
+        if section != 0 {
+            self.step_section(section);
+        } else {
+            self.key_scroll += dy;
+        }
+    }
+
+    /// Move `dir` entries through the navigation outline, so ←/→ page the manual
+    /// by section. Clamped rather than wrapped: running off the end of the
+    /// manual by holding a key is not what the operator meant.
+    fn step_section(&mut self, dir: i32) {
+        let n = self.doc.nav.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let cur =
+            self.doc.nav.iter().position(|e| e.slug == self.active).map(|i| i as i32).unwrap_or(0);
+        let i = (cur + dir).clamp(0, n - 1) as usize;
+        self.go_to(self.doc.nav[i].slug.clone());
+    }
+
     /// Draw the help window if open. Self-contained: needs only the egui
     /// context, so it never touches the radio controller.
     pub fn ui(&mut self, ctx: &egui::Context) {
@@ -198,6 +332,11 @@ impl Help {
         // click this frame (below). Held for a few frames so it survives
         // late-loading image layout shifts.
         let mut target = self.scroll_to.clone();
+        // Keyboard scroll banked by `grab_keys`, taken out here so it is spent
+        // exactly once even if the window turns out to be closed or collapsed.
+        // A heading jump in flight wins: it is the more specific request.
+        let key_scroll = std::mem::take(&mut self.key_scroll);
+        let key_scroll = if target.is_some() { 0.0 } else { key_scroll };
 
         let mut open = self.open;
         let resp = egui::Window::new("SDROXIDE MANUAL")
@@ -261,8 +400,7 @@ impl Help {
                     );
 
                     // Divider between the panes.
-                    let (drect, _) =
-                        ui.allocate_exact_size(vec2(9.0, full_h), Sense::hover());
+                    let (drect, _) = ui.allocate_exact_size(vec2(9.0, full_h), Sense::hover());
                     ui.painter().vline(
                         drect.center().x,
                         drect.y_range(),
@@ -288,6 +426,11 @@ impl Help {
                                 .auto_shrink([false, false])
                                 .show_themed(ui, |ui| {
                                     ui.set_width(ui.available_width() - 6.0);
+                                    // `scroll_with_delta` moves the *content*, so
+                                    // scrolling down means shifting it up.
+                                    if key_scroll != 0.0 {
+                                        ui.scroll_with_delta(vec2(0.0, -key_scroll));
+                                    }
                                     let mut heading_tops: Vec<(String, f32)> = Vec::new();
                                     for (idx, block) in self.doc.blocks.iter().enumerate() {
                                         draw_block(
@@ -302,6 +445,13 @@ impl Help {
                                     }
                                     heading_tops
                                 });
+
+                            // Remembered for the next frame's Page/Home/End keys,
+                            // which need to know how tall a page is and how far
+                            // there is left to travel.
+                            self.viewport_h = out.inner_rect.height();
+                            self.content_h = out.content_size.y;
+                            self.offset_y = out.state.offset.y;
 
                             // Scroll-spy: highlight the last heading whose top
                             // has passed the viewport top — but don't fight an
@@ -549,18 +699,15 @@ fn draw_table(
         vec![(inner / cols as f32).max(80.0); cols]
     };
 
-    egui::Frame::new()
-        .stroke(Stroke::new(1.0, theme::LINE_LIT))
-        .inner_margin(0)
-        .show(ui, |ui| {
-            ui.set_width(total);
-            // Header row.
-            table_row(ui, header, &col_w, spacing, theme::FILL, true, actions, idx);
-            for (ri, row) in rows.iter().enumerate() {
-                let fill = if ri % 2 == 0 { theme::ROW_BG } else { theme::PANEL };
-                table_row(ui, row, &col_w, spacing, fill, false, actions, idx);
-            }
-        });
+    egui::Frame::new().stroke(Stroke::new(1.0, theme::LINE_LIT)).inner_margin(0).show(ui, |ui| {
+        ui.set_width(total);
+        // Header row.
+        table_row(ui, header, &col_w, spacing, theme::FILL, true, actions, idx);
+        for (ri, row) in rows.iter().enumerate() {
+            let fill = if ri % 2 == 0 { theme::ROW_BG } else { theme::PANEL };
+            table_row(ui, row, &col_w, spacing, fill, false, actions, idx);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -635,7 +782,6 @@ fn cut_outline(rect: Rect, cut: f32) -> Vec<egui::Pos2> {
         pos2(l, b - cut),
     ]
 }
-
 
 /// An angled section header: a cut-corner bar with a yellow/black hazard tab on
 /// the left and the section title in the techno heading face. Level 1 is the
@@ -871,7 +1017,13 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         // Bullet list.
         if is_bullet(t) {
             let mut items = Vec::new();
-            collect_list(&lines, &mut i, |content| items.push(parse_inline(content)), is_bullet, strip_bullet);
+            collect_list(
+                &lines,
+                &mut i,
+                |content| items.push(parse_inline(content)),
+                is_bullet,
+                strip_bullet,
+            );
             blocks.push(Block::Bullets(items));
             continue;
         }
@@ -1034,7 +1186,9 @@ fn parse_inline(s: &str) -> Vec<Inline> {
         let c = chars[i];
 
         // Inline code — parsed first so its contents are never re-interpreted.
-        if c == '`' && let Some(end) = find_char(&chars, i + 1, '`') {
+        if c == '`'
+            && let Some(end) = find_char(&chars, i + 1, '`')
+        {
             flush(&mut buf, &mut out);
             out.push(Inline::Code(chars[i + 1..end].iter().collect()));
             i = end + 1;
@@ -1042,7 +1196,9 @@ fn parse_inline(s: &str) -> Vec<Inline> {
         }
 
         // Link `[text](href)`.
-        if c == '[' && let Some((text, href, next)) = parse_link(&chars, i) {
+        if c == '['
+            && let Some((text, href, next)) = parse_link(&chars, i)
+        {
             flush(&mut buf, &mut out);
             out.push(Inline::Link { text: parse_inline(&text), href });
             i = next;
@@ -1105,8 +1261,9 @@ fn find_str(chars: &[char], from: usize, target: &[char]) -> Option<usize> {
 /// The closing `_` of an emphasis span: an underscore past non-empty content
 /// (`k > from`) that is followed by a word boundary, so identifiers survive.
 fn find_underscore_close(chars: &[char], from: usize) -> Option<usize> {
-    (from + 1..chars.len())
-        .find(|&k| chars[k] == '_' && chars.get(k + 1).map(|c| !c.is_alphanumeric()).unwrap_or(true))
+    (from + 1..chars.len()).find(|&k| {
+        chars[k] == '_' && chars.get(k + 1).map(|c| !c.is_alphanumeric()).unwrap_or(true)
+    })
 }
 
 /// Parse `[text](href)` at `chars[start] == '['`, returning (text, href, index
@@ -1125,6 +1282,86 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One key-down event, no modifiers.
+    fn press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Run one egui pass with `events` and let the help window claim what it
+    /// wants, returning it plus what survived in the queue.
+    fn grab(help: &mut Help, events: Vec<egui::Event>) -> Vec<egui::Event> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput { events, ..Default::default() });
+        help.grab_keys(&ctx);
+        let left = ctx.input(|i| i.events.clone());
+        let _ = ctx.end_pass();
+        left
+    }
+
+    /// Arrow and page keys must scroll the manual *and* be taken off the queue —
+    /// otherwise the same press also drives whatever the operator has them bound
+    /// to, and reading the manual tunes the radio.
+    #[test]
+    fn scroll_keys_are_claimed_while_open() {
+        let mut help = Help { open: true, viewport_h: 500.0, ..Help::default() };
+        let left = grab(&mut help, vec![press(egui::Key::ArrowDown), press(egui::Key::PageDown)]);
+        assert!(left.is_empty(), "scroll keys should be consumed, got {left:?}");
+        assert!(help.key_scroll > ARROW_STEP, "both keys should have banked scroll");
+
+        // Up cancels down, so a wobble on the keyboard doesn't drift.
+        help.key_scroll = 0.0;
+        grab(&mut help, vec![press(egui::Key::ArrowDown), press(egui::Key::ArrowUp)]);
+        assert_eq!(help.key_scroll, 0.0);
+    }
+
+    /// A closed manual must not touch the keyboard at all.
+    #[test]
+    fn scroll_keys_pass_through_while_closed() {
+        let mut help = Help::default();
+        let left = grab(&mut help, vec![press(egui::Key::ArrowDown)]);
+        assert_eq!(left.len(), 1, "a closed manual must leave the bindings alone");
+        assert_eq!(help.key_scroll, 0.0);
+    }
+
+    /// Home/End travel to the ends of the manual from wherever the pane is, and
+    /// override any line steps arriving in the same batch.
+    #[test]
+    fn home_and_end_reach_the_ends() {
+        let mut help = Help { open: true, viewport_h: 400.0, content_h: 3000.0, ..Help::default() };
+        help.offset_y = 1000.0;
+        grab(&mut help, vec![press(egui::Key::ArrowUp), press(egui::Key::End)]);
+        assert_eq!(help.key_scroll, 3000.0 - 400.0 - 1000.0);
+
+        help.key_scroll = 0.0;
+        grab(&mut help, vec![press(egui::Key::Home)]);
+        assert_eq!(help.key_scroll, -1000.0);
+    }
+
+    /// ←/→ step the outline instead of scrolling, and stop at the ends.
+    #[test]
+    fn left_right_step_sections() {
+        let mut help = Help { open: true, ..Help::default() };
+        let first = help.doc.nav[0].slug.clone();
+        let second = help.doc.nav[1].slug.clone();
+
+        grab(&mut help, vec![press(egui::Key::ArrowRight)]);
+        assert_eq!(help.active, second);
+        assert_eq!(help.scroll_to.as_deref(), Some(second.as_str()));
+        assert_eq!(help.key_scroll, 0.0, "a section jump is not a scroll");
+
+        grab(&mut help, vec![press(egui::Key::ArrowLeft)]);
+        assert_eq!(help.active, first);
+        // Already at the top of the outline: stay put rather than wrapping.
+        grab(&mut help, vec![press(egui::Key::ArrowLeft)]);
+        assert_eq!(help.active, first);
+    }
 
     /// Collect every link href in a run of inline spans (recursing into
     /// emphasis and link text).

@@ -36,10 +36,37 @@ pub enum Mode {
     /// FreeDV RADE V1 (Radio Autoencoder) digital voice — USB underneath, a
     /// neural codec over an OFDM waveform occupying ~1000–1900 Hz of audio.
     Rade,
+    /// Hellschreiber — USB underneath, a facsimile mode that paints a 7×14 dot
+    /// matrix per character straight onto the channel. No sync, no framing, no
+    /// decoder: the receiver free-runs and the operator's eye reads the raster.
+    ///
+    /// Appended last on purpose. `Mode` is postcard-encoded by declaration
+    /// index and serde-serialised into stored configs, so a new variant may only
+    /// go at the end. Where it *appears* is set by [`Mode::ALL`] instead.
+    Hell,
+    /// RIFP (Radio Image Framing Protocol, draft-dulaunoy-rifp-00) — a
+    /// packetised image mode. Unlike every other digital mode here it is not
+    /// USB underneath: the `rifp-cpfsk-4800` profile is continuous-phase FSK
+    /// straight on the carrier, ±4 kHz at 4800 baud, so the dial *is* the
+    /// signal's centre and the channel is ~25 kHz wide. Appended for the same
+    /// reason as [`Mode::Hell`].
+    Rifp,
+    /// HF weather facsimile (WEFAX / radiofax) — USB underneath, an FM
+    /// subcarrier carrying a continuous raster. Receive only: the charts are
+    /// broadcast by meteorological services, and an amateur station has nothing
+    /// to send back. Appended for the same reason as [`Mode::Hell`].
+    Wefax,
+    /// JS8 — the keyboard/messaging mode built on FT8's 8-FSK waveform. Slotted
+    /// like FT8 but conversational rather than a contest exchange: free text,
+    /// directed commands and heartbeats, at one of four speeds chosen in setup.
+    /// Appended for the same reason as [`Mode::Hell`].
+    Js8,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 21] = [
+    /// Every mode, in the order they cycle and appear in the picker — which is
+    /// deliberately *not* the enum's declaration order (see [`Mode::Hell`]).
+    pub const ALL: [Mode; 25] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::Cw,
@@ -53,27 +80,37 @@ impl Mode {
         Mode::Spec,
         Mode::Ft8,
         Mode::Ft4,
+        Mode::Js8,
         Mode::Psk,
         Mode::Rtty,
         Mode::Sstv,
+        Mode::Rifp,
+        Mode::Wefax,
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
+        Mode::Hell,
         Mode::RfPaint,
         Mode::Rade,
     ];
 
-    /// The digital modes handled by a dedicated decode/encode engine over USB
-    /// (slotted FT8/FT4, the continuous keyboard modes, SSTV, and RF Paint).
-    pub const DIGITAL: [Mode; 10] = [
+    /// The digital modes handled by a dedicated decode/encode engine (the
+    /// slotted FT8/FT4 modes, the continuous keyboard modes, Hell, SSTV, RIFP,
+    /// RF Paint). All are USB underneath except RIFP, which is FSK on the
+    /// carrier.
+    pub const DIGITAL: [Mode; 14] = [
         Mode::Ft8,
         Mode::Ft4,
+        Mode::Js8,
         Mode::Psk,
         Mode::Rtty,
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
+        Mode::Hell,
         Mode::Sstv,
+        Mode::Rifp,
+        Mode::Wefax,
         Mode::RfPaint,
         Mode::Rade,
     ];
@@ -84,32 +121,47 @@ impl Mode {
             self,
             Mode::Ft8
                 | Mode::Ft4
+                | Mode::Js8
                 | Mode::Psk
                 | Mode::Rtty
                 | Mode::Sstv
+                | Mode::Rifp
                 | Mode::Olivia
                 | Mode::Thor
                 | Mode::Fsq
+                | Mode::Hell
                 | Mode::RfPaint
                 | Mode::Rade
+                | Mode::Wefax
         )
+    }
+
+    /// True for the modes whose transmit waveform is not single-sideband audio
+    /// on the carrier, so the dial is the signal's centre rather than its lower
+    /// edge. Only RIFP so far: its CPFSK profile keys the carrier itself.
+    pub fn is_carrier_centered(self) -> bool {
+        matches!(self, Mode::Rifp)
     }
 
     /// True for the continuous keyboard text modes (PSK31 / RTTY / Olivia / Thor
     /// / FSQ), as opposed to the slotted FT8/FT4 modes. Drives which decode
     /// engine + panel is used.
     pub fn is_text_modem(self) -> bool {
-        matches!(
-            self,
-            Mode::Psk | Mode::Rtty | Mode::Olivia | Mode::Thor | Mode::Fsq
-        )
+        matches!(self, Mode::Psk | Mode::Rtty | Mode::Olivia | Mode::Thor | Mode::Fsq)
     }
 
     /// True for the slotted FT8/FT4 modes, as opposed to the continuous
     /// keyboard modems and the image modes. Drives the decode-list / callsign
     /// overlays that only make sense for a slot-based decoder.
     pub fn is_slotted(self) -> bool {
-        matches!(self, Mode::Ft8 | Mode::Ft4)
+        matches!(self, Mode::Ft8 | Mode::Ft4 | Mode::Js8)
+    }
+
+    /// True for JS8. Forks the digi panel to the conversation UI and uses its
+    /// own controller: it is slotted like FT8 but carries a chat rather than a
+    /// contest exchange, so the Tx1–Tx6 sequencer has nothing to say about it.
+    pub fn is_js8(self) -> bool {
+        matches!(self, Mode::Js8)
     }
 
     /// True for the FSQ mode (adds a directed-message / contacts / image layer
@@ -122,6 +174,39 @@ impl Mode {
     /// skips the FT8/text-modem overlays.
     pub fn is_sstv(self) -> bool {
         matches!(self, Mode::Sstv)
+    }
+
+    /// True for the RIFP image mode. Shares SSTV's image panel (compose,
+    /// transmit, gallery) over a packetised protocol and its own modem.
+    pub fn is_rifp(self) -> bool {
+        matches!(self, Mode::Rifp)
+    }
+
+    /// True for the modes that drive the image panel — a picture compositor on
+    /// transmit, a live picture and a gallery on receive.
+    pub fn is_image(self) -> bool {
+        matches!(self, Mode::Sstv | Mode::Rifp)
+    }
+
+    /// True for HF weather fax. Its own panel rather than the image one: there
+    /// is nothing to compose and nothing to transmit, and what it needs instead
+    /// — line rate, index of cooperation, phasing and slant — has no counterpart
+    /// in SSTV.
+    pub fn is_wefax(self) -> bool {
+        matches!(self, Mode::Wefax)
+    }
+
+    /// True for the receive-only modes, so the UI can leave the transmit
+    /// controls out rather than showing ones that refuse.
+    pub fn is_rx_only(self) -> bool {
+        matches!(self, Mode::Wefax)
+    }
+
+    /// True for Hellschreiber. Forks the digi panel to the scrolling raster UI:
+    /// unlike the keyboard modems there is nothing to decode into text, so it
+    /// gets its own controller and panel rather than joining `is_text_modem`.
+    pub fn is_hell(self) -> bool {
+        matches!(self, Mode::Hell)
     }
 
     /// True for the RF Paint (Spectrum Painting) mode. Forks the digi panel to
@@ -167,8 +252,12 @@ impl Mode {
             Mode::Olivia => "OLIVIA",
             Mode::Thor => "THOR",
             Mode::Fsq => "FSQ",
+            Mode::Hell => "HELL",
             Mode::RfPaint => "RFPAINT",
             Mode::Rade => "RADE",
+            Mode::Rifp => "RIFP",
+            Mode::Wefax => "WEFAX",
+            Mode::Js8 => "JS8",
         }
     }
 
@@ -188,17 +277,28 @@ impl Mode {
             Mode::Dsb => (-2850.0, 2850.0),
             Mode::Spec => (-5000.0, 5000.0),
             // FT8/FT4 occupy the whole USB audio passband (tones 0..~3500 Hz).
-            // PSK/RTTY/Olivia/Thor/FSQ do the same (the modem filters narrowly
-            // around audio_hz). SSTV occupies the full USB audio passband.
+            // PSK/RTTY/Olivia/Thor/FSQ/Hell do the same (the modem filters
+            // narrowly around audio_hz — and Hell X9 needs nearly all of it).
+            // SSTV occupies the full USB audio passband.
             Mode::Ft8
             | Mode::Ft4
+            | Mode::Js8
             | Mode::Psk
             | Mode::Rtty
             | Mode::Sstv
             | Mode::Olivia
             | Mode::Thor
             | Mode::Fsq
+            | Mode::Hell
             | Mode::RfPaint => (100.0, 3300.0),
+            // The fax subcarrier is 1900 Hz ± 400; the wider passband leaves
+            // room for a receiver tuned a few hundred hertz off, which is the
+            // normal state of affairs on a chart found by ear.
+            Mode::Wefax => (500.0, 3300.0),
+            // RIFP is not a sideband mode: the CPFSK carrier sits *on* the
+            // dial and swings ±4 kHz, so the passband straddles it. 25 kHz is
+            // the profile's recommended occupied bandwidth.
+            Mode::Rifp => (-12_500.0, 12_500.0),
             // RADE V1's OFDM carriers sit between roughly 1060 and 1880 Hz;
             // the wider passband leaves room for the acquisition search to
             // track a signal that is off frequency.
@@ -241,11 +341,9 @@ impl Mode {
                 ("500", 450.0, 950.0),
                 ("1k", 200.0, 1200.0),
             ],
-            Mode::Am | Mode::Sam => &[
-                ("6k", -3000.0, 3000.0),
-                ("10k", -5000.0, 5000.0),
-                ("16k", -8000.0, 8000.0),
-            ],
+            Mode::Am | Mode::Sam => {
+                &[("6k", -3000.0, 3000.0), ("10k", -5000.0, 5000.0), ("16k", -8000.0, 8000.0)]
+            }
             Mode::Nfm => &[("8k", -4000.0, 4000.0), ("16k", -8000.0, 8000.0)],
             Mode::Dsb => &[("5k", -2500.0, 2500.0), ("6k", -3000.0, 3000.0)],
             // Digital modes have a fixed wide passband; no presets.
@@ -253,13 +351,17 @@ impl Mode {
             | Mode::Spec
             | Mode::Ft8
             | Mode::Ft4
+            | Mode::Js8
             | Mode::Psk
             | Mode::Rtty
             | Mode::Sstv
             | Mode::Olivia
             | Mode::Thor
             | Mode::Fsq
+            | Mode::Hell
             | Mode::RfPaint
+            | Mode::Rifp
+            | Mode::Wefax
             | Mode::Rade => &[],
         }
     }

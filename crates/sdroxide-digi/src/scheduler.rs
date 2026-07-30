@@ -19,6 +19,12 @@ impl SlotScheduler {
         SlotScheduler { period_s: p.slot_s, tx_offset_s: p.tx_offset_s }
     }
 
+    /// A scheduler for a period that is not implied by a [`Mode`] — JS8, whose
+    /// slot length is an operator setting.
+    pub fn new(period_s: f64, tx_offset_s: f64) -> Self {
+        SlotScheduler { period_s, tx_offset_s }
+    }
+
     /// Seconds since the Unix epoch as an f64.
     pub fn unix_now(now: SystemTime) -> f64 {
         now.duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)

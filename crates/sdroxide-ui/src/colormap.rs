@@ -9,10 +9,7 @@ fn gradient(anchors: &[(f32, [u8; 3])]) -> [u8; 256 * 4] {
     let mut out = [0u8; 256 * 4];
     for i in 0..256 {
         let t = i as f32 / 255.0;
-        let seg = anchors
-            .windows(2)
-            .find(|w| t <= w[1].0)
-            .unwrap_or(&anchors[anchors.len() - 2..]);
+        let seg = anchors.windows(2).find(|w| t <= w[1].0).unwrap_or(&anchors[anchors.len() - 2..]);
         let (t0, c0) = seg[0];
         let (t1, c1) = seg[1];
         let f = if t1 > t0 { ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) } else { 0.0 };

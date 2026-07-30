@@ -73,7 +73,9 @@ fn qrz_lookup(creds: &Credentials, call: &str) -> Result<CallsignInfo, String> {
         let doc = roxmltree::Document::parse(&body).map_err(|e| e.to_string())?;
         if let Some(err) = tag_text(&doc, "Error") {
             let el = err.to_ascii_lowercase();
-            if attempt == 0 && (el.contains("session") || el.contains("timeout") || el.contains("invalid")) {
+            if attempt == 0
+                && (el.contains("session") || el.contains("timeout") || el.contains("invalid"))
+            {
                 drop_key(&id);
                 continue;
             }
@@ -132,8 +134,7 @@ fn hamqth_lookup(creds: &Credentials, call: &str) -> Result<CallsignInfo, String
                 k
             }
         };
-        let url =
-            format!("https://www.hamqth.com/xml.php?id={key}&callsign={call}&prg=sdroxide");
+        let url = format!("https://www.hamqth.com/xml.php?id={key}&callsign={call}&prg=sdroxide");
         let body = http::get(&url)?;
         let doc = roxmltree::Document::parse(&body).map_err(|e| e.to_string())?;
         if let Some(err) = tag_text(&doc, "error") {
@@ -165,9 +166,8 @@ fn hamqth_login(creds: &Credentials) -> Result<String, String> {
 
 fn parse_hamqth(doc: &roxmltree::Document, call: &str) -> CallsignInfo {
     let mut info = CallsignInfo::for_call(call);
-    info.name = tag_text(doc, "adr_name")
-        .or_else(|| tag_text(doc, "nick"))
-        .filter(|s| !s.is_empty());
+    info.name =
+        tag_text(doc, "adr_name").or_else(|| tag_text(doc, "nick")).filter(|s| !s.is_empty());
     info.qth = tag_text(doc, "qth").or_else(|| tag_text(doc, "adr_city")).filter(|s| !s.is_empty());
     info.grid = tag_text(doc, "grid").filter(|s| !s.is_empty());
     info.state = tag_text(doc, "us_state").filter(|s| !s.is_empty());

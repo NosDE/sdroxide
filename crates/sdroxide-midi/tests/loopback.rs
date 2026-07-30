@@ -106,15 +106,16 @@ fn a_real_port_round_trips_control_changes() {
 
     // A note-on then its release, the shape a PTT button takes.
     src.send(&[0x90, 60, 127]).unwrap();
-    let on = wait_for(&mut h, Duration::from_secs(5), |e| {
-        matches!(e, MidiEvent::Control(c) if c.msg.kind == sdroxide_types::MidiMsgKind::Note)
-    });
+    let on = wait_for(
+        &mut h,
+        Duration::from_secs(5),
+        |e| matches!(e, MidiEvent::Control(c) if c.msg.kind == sdroxide_types::MidiMsgKind::Note),
+    );
     assert!(matches!(on, Some(MidiEvent::Control(c)) if !c.off), "note-on should press");
 
     src.send(&[0x80, 60, 0]).unwrap();
-    let off = wait_for(&mut h, Duration::from_secs(5), |e| {
-        matches!(e, MidiEvent::Control(c) if c.off)
-    });
+    let off =
+        wait_for(&mut h, Duration::from_secs(5), |e| matches!(e, MidiEvent::Control(c) if c.off));
     assert!(off.is_some(), "note-off must arrive, or PTT would never unkey");
 }
 

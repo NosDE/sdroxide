@@ -91,11 +91,8 @@ mod web {
             let solar = search.contains("view=solar");
             let options = web_options(&search);
 
-            let ws_proto = if location.protocol().as_deref() == Ok("https:") {
-                "wss"
-            } else {
-                "ws"
-            };
+            let ws_proto =
+                if location.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
             let host = location.host().unwrap_or_else(|_| "localhost:4950".into());
 
             let runner = eframe::WebRunner::new();

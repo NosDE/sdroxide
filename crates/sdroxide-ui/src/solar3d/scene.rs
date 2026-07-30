@@ -4,7 +4,8 @@
 //! geometry can be reasoned about (and unit-tested) without a GPU.
 
 use eframe::egui::Color32;
-use sdroxide_solar::{AuroraOval, SolarData, aurora, ephem};
+use sdroxide_solar::{AuroraOval, CloudField, SolarData, aurora, clouds, ephem};
+use sdroxide_types::Coverage;
 
 use super::camera::Camera;
 use super::math::{M4, V3, v3};
@@ -31,6 +32,37 @@ pub struct Globals {
     /// x = seconds (animation phase), y = photo/procedural blend for the Sun,
     /// z, w = spare.
     pub misc: [f32; 4],
+}
+
+/// How many lightning flashes may be alight at once.
+///
+/// Across sixty-odd storms flashing at up to four a second, with a tail a third
+/// of a second long, the world average is a couple of dozen — but on a globe
+/// only a handful are ever far enough apart to be told from one another, and a
+/// fixed-size uniform is what keeps this out of a storage buffer the WebGL2
+/// path would not have. The brightest eight win.
+pub const MAX_FLASHES: usize = 8;
+
+/// The lightning alight this instant, as the shaders see it.
+///
+/// A scene-level block rather than per-draw: every shell of the deck has to be
+/// lit by the same flashes, and copying them into twenty-two `DrawData`s would
+/// be the same bytes written twenty-two times.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Flashes {
+    /// xyz = world position inside the tower, w = brightness now. A `w` of zero
+    /// is an unused slot and contributes nothing, so the shader can loop over
+    /// all of them in uniform control flow at a fixed cost.
+    pub items: [[f32; 4]; MAX_FLASHES],
+    /// x = how far the light reaches, in world units. y, z, w spare.
+    pub reach: [f32; 4],
+}
+
+impl Default for Flashes {
+    fn default() -> Self {
+        Flashes { items: [[0.0; 4]; MAX_FLASHES], reach: [1.0, 0.0, 0.0, 0.0] }
+    }
 }
 
 /// Per-draw constants. 192 bytes, uploaded at a dynamic offset.
@@ -222,6 +254,11 @@ pub enum Prim {
     Aurora,
     /// A flat annulus: a planet's ring system.
     Ring,
+    /// The sphere mesh again, as one slice through the cloud deck.
+    Cloud,
+    /// One sphere at the top of the troposphere, with the deck marched through
+    /// it in the fragment shader instead of sliced.
+    CloudVolume,
 }
 
 /// A text label anchored to a point in the scene.
@@ -274,6 +311,8 @@ pub struct Scene {
     /// The star field is a static buffer on the GPU, so it is a flag here
     /// rather than 1500 instances rebuilt every frame.
     pub draw_stars: bool,
+    /// The lightning alight this instant. Shared by every cloud draw.
+    pub flashes: Flashes,
 }
 
 impl Default for Globals {
@@ -389,8 +428,7 @@ pub fn bodies(st: &SolarUi, unix_s: f64) -> Bodies {
             moons.push(MoonBody {
                 index,
                 info: m,
-                pos: pos
-                    + V3::from_f64(m.offset(jd)) * (exaggeration * v.moon_orbit_scale),
+                pos: pos + V3::from_f64(m.offset(jd)) * (exaggeration * v.moon_orbit_scale),
                 radius: m.radius as f32 * exaggeration,
                 parent,
             });
@@ -474,7 +512,10 @@ pub fn build(
             // the procedural surface is what shows offline.
             misc: [anim_t, if sun_img.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
         },
-        draw_stars: st.layer(layer::STARS),
+        // The star field and the graticule below are not layers any more: they
+        // are the backdrop and the coordinate frame the rest is read against,
+        // and a scene without them reads as broken rather than as uncluttered.
+        draw_stars: true,
         ..Default::default()
     };
 
@@ -482,12 +523,13 @@ pub fn build(
     if st.layer(layer::ORBITS) {
         orbits(&mut s, st, &b, &cam);
     }
-    if st.layer(layer::GRID) {
-        grid(&mut s, &b);
-    }
+    grid(&mut s, &b);
     markers(&mut s, st, &b, &cam);
+    if st.layer(layer::AWARDS) {
+        award_heat(&mut s, st, &b, &cam, anim_t);
+    }
     if st.layer(layer::QSO) {
-        digi_traffic(&mut s, st, &b, &cam, anim_t);
+        digi_traffic(&mut s, st, &b, &cam, unix_s, anim_t);
     }
     if let Some(d) = data {
         let now = unix_s as i64;
@@ -499,6 +541,17 @@ pub fn build(
         }
         if st.layer(layer::CME) {
             cones(&mut s, st, &d.cmes, now);
+        }
+        // Before the aurora, and it matters: the deck occludes and the oval
+        // adds, so drawing the oval second puts its glow over the weather —
+        // which is the way round every photograph from orbit has it.
+        if let Some(field) = &d.clouds
+            && st.layer(layer::CLOUDS)
+        {
+            let fade = cloud_deck(&mut s, st, &b, &cam, field);
+            if fade > 0.0 {
+                s.flashes = lightning(&b, &field.cells, unix_s, fade);
+            }
         }
         if let Some(oval) = &d.aurora
             && st.layer(layer::AURORA)
@@ -540,36 +593,69 @@ fn satellites(
         b.earth + V3::from_f64(dir) * (b.earth_r * radii as f32)
     };
 
-    for sat in data.satellites().filter(|s| show_all || s.popular) {
+    for sat in data.satellites() {
+        // A search match is drawn whether or not it otherwise would be: looking
+        // for a satellite that is not on screen is the main reason to search.
+        let hit = st.sat_search_hit(&sat.name, sat.norad_id);
+        if !(show_all || sat.popular || hit) {
+            continue;
+        }
         let Some(state) = sat.at(unix_s) else { continue };
         let pos = place(state.dir_ecliptic, state.radii);
 
         // Geostationary orbits read differently from low ones — one is a fixed
         // relay, the other a pass you have to catch — so they are coloured apart.
         let geo = sat.period_min > 1300.0;
-        let color = if geo { theme::GREEN } else { theme::CYAN_DIM };
+        // A match is pulled out of that scheme entirely rather than merely
+        // brightened: against ninety cyan dots, "a bit lighter" is not findable,
+        // and yellow is the one accent nothing else in this layer uses.
+        let color = match (hit, geo) {
+            (true, _) => theme::YELLOW,
+            (false, true) => theme::GREEN,
+            (false, false) => theme::CYAN_DIM,
+        };
+        let ringed = sat.popular || hit;
 
         s.sprites.push(SpriteInst {
             center: pos.arr(),
-            size_px: if sat.popular { 7.0 } else { 4.0 },
-            color: lin(color, (if sat.popular { 0.95 } else { 0.5 }) * fade),
+            size_px: if hit {
+                10.0
+            } else if sat.popular {
+                7.0
+            } else {
+                4.0
+            },
+            color: lin(color, (if ringed { 0.95 } else { 0.5 }) * fade),
             params: [SPRITE_DOT, 0.0, 0.0, 0.0],
         });
 
-        // Orbit rings only for the curated set: ninety of them at once is noise.
-        if sat.popular {
+        // Orbit rings only for the ringed set: ninety of them at once is noise.
+        // A pasted element set, a subscription with orbits on, and a search
+        // match all land here; a ninety-satellite group without does not.
+        if ringed {
             let path = sat.orbit(unix_s, 96);
+            let (w_px, alpha) = if hit { (2.4, 0.9) } else { (1.3, 0.4) };
             for w in path.windows(2) {
                 s.lines.push(seg(
                     place(w[0].0, w[0].1),
                     place(w[1].0, w[1].1),
-                    1.3,
-                    lin(color, 0.4 * fade),
+                    w_px,
+                    lin(color, alpha * fade),
                 ));
             }
         }
 
-        if st.layer(layer::LABELS) && sat.popular && earth_px > 24.0 {
+        // A match is labelled even with the LABELS layer off and even when it
+        // is not one of the curated few — the name is what was searched for, so
+        // withholding it would defeat the search. The floor is lower than the
+        // ordinary one but not absent: on an Earth twelve pixels across there
+        // is nothing for a label to point at.
+        let labelled = if hit {
+            earth_px > 12.0
+        } else {
+            st.layer(layer::LABELS) && sat.popular && earth_px > 24.0
+        };
+        if labelled {
             // The elevation is what decides whether it is workable right now,
             // so it goes in the label rather than a separate panel.
             let text = match st.qth {
@@ -586,7 +672,7 @@ fn satellites(
             s.labels.push(Label {
                 world: pos.arr(),
                 text,
-                color: lin_color(color, 0.9 * fade),
+                color: lin_color(color, (if hit { 1.0 } else { 0.9 }) * fade),
                 offset: [9.0, -7.0],
                 click: Click::Sat(sat.norad_id),
             });
@@ -714,6 +800,229 @@ fn aurora_edge(s: &mut Scene, b: &Bodies, oval: &AuroraOval, fade: f32) {
             ));
         }
     }
+}
+
+// ── Clouds ──────────────────────────────────────────────────────────────────
+//
+// Same argument as the aurora, one atmosphere lower down. Weather is a depth of
+// air, not a picture stuck on a sphere, and the infrared mosaic hands over the
+// one number that makes that drawable: how cold each cloud top is, and so how
+// high it stands. A thunderhead towers here because it really is fifteen
+// kilometres tall.
+//
+// Two ways to draw it, because they fail differently. The shell stack slices
+// the troposphere into concentric spheres and is cheap and predictable. The
+// volume path marches the slab per pixel and is what makes a flash glow
+// *through* a storm instead of merely brightening its outside. See
+// `shaders/solar_cloud.wgsl` and `shaders/solar_cloud_march.wgsl`.
+
+/// The band of air the weather lives in, kilometres. Marine stratus sits a few
+/// hundred metres up; a tropical anvil stops at the tropopause, which is where
+/// [`clouds::TOP_MAX_KM`] stops too.
+const CLOUD_BOTTOM_KM: f32 = 0.5;
+const CLOUD_TOP_KM: f32 = clouds::TOP_MAX_KM;
+/// Earth mean radius, kilometres — see [`AURORA_EARTH_R_KM`]. Altitudes are
+/// fractions of the radius the globe is *drawn* at, so the deck stays glued to
+/// the surface at any setting of the exaggeration slider.
+const CLOUD_EARTH_R_KM: f32 = 6371.0;
+/// How much the deck's thickness is exaggerated.
+///
+/// The one deliberate lie in this layer, and it is unavoidable: eighteen
+/// kilometres on a six-thousand-kilometre planet is a quarter of one per cent
+/// of the radius, which is a hairline at any zoom short of skimming the surface
+/// — and a hairline cannot be volumetric. Six times over is enough for a storm
+/// to stand up out of the deck and still shallow enough that nobody would mistake
+/// the result for a mountain range.
+const CLOUD_LIFT: f32 = 6.0;
+
+/// How many shells to slice the deck into, given how big the Earth is on screen.
+///
+/// Lower than the aurora's counts at every step, because the aurora covers a
+/// tenth of the planet and leaves the rest early, while cloud covers most of it
+/// and every shell pays for nearly every pixel it crosses.
+pub fn cloud_shell_count(earth_px: f32) -> usize {
+    match earth_px {
+        px if px >= 420.0 => 18,
+        px if px >= 160.0 => 12,
+        px if px >= 50.0 => 7,
+        _ => 4,
+    }
+}
+
+/// Altitude of cloud shell `k` of `n`, kilometres.
+///
+/// Packed towards the bottom, where nearly all the world's cloud is: spacing
+/// them evenly would spend half of them on the thin air above the anvils.
+fn cloud_altitude_km(k: usize, n: usize) -> f32 {
+    let t = if n <= 1 { 0.0 } else { k as f32 / (n - 1) as f32 };
+    CLOUD_BOTTOM_KM + (CLOUD_TOP_KM - CLOUD_BOTTOM_KM) * t.powf(1.7)
+}
+
+/// Radius of a point at altitude `alt_km`, as a multiple of the Earth's own.
+fn cloud_radius(alt_km: f32) -> f32 {
+    1.0 + alt_km * CLOUD_LIFT / CLOUD_EARTH_R_KM
+}
+
+/// The cloud deck, one way or the other.
+///
+/// Returns how strongly it was drawn, so the lightning can be skipped entirely
+/// when there is no deck for it to be inside.
+fn cloud_deck(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera, field: &CloudField) -> f32 {
+    let earth_px = cam.pixels_for(b.earth, b.earth_r);
+    // Later than the aurora's threshold. The oval is a shape, legible at a few
+    // pixels across; a cloud deck at that size is a grey wash that only makes
+    // the planet harder to read.
+    let fade = ((earth_px - 6.0) / 24.0).clamp(0.0, 1.0);
+    if fade <= 0.0 || field.is_empty() {
+        return 0.0;
+    }
+
+    let (ex, ey, ez) = b.earth_basis;
+    let basis = M4::from_basis(ex, ey, ez, V3::ZERO, 1.0).cols;
+    let draw = |prim: Prim, alt: f32, slab: f32, extra: f32| {
+        (
+            prim,
+            DrawData {
+                model: M4::from_basis(ex, ey, ez, b.earth, b.earth_r * cloud_radius(alt)).cols,
+                basis,
+                tint: [1.0; 4],
+                tint2: [0.0; 4],
+                params: [alt, slab, fade, extra],
+                style: [CLOUD_LIFT, CLOUD_BOTTOM_KM, CLOUD_TOP_KM, b.earth_r],
+            },
+        )
+    };
+
+    if st.view.cloud_march {
+        // One sphere at the top of the slab; the shader owns everything under
+        // it. `extra` is the step budget, which has to follow the on-screen
+        // size or a globe filling a 4K window costs forty texture taps in every
+        // one of eight million pixels.
+        let steps = (10.0 + 30.0 * ((earth_px - 60.0) / 500.0).clamp(0.0, 1.0)).round();
+        s.draws.push(draw(Prim::CloudVolume, CLOUD_TOP_KM, CLOUD_TOP_KM - CLOUD_BOTTOM_KM, steps));
+        return fade;
+    }
+
+    // Bottom-up, so the premultiplied "over" blend composites back to front for
+    // the near hemisphere — the far one is behind the opaque planet and never
+    // reaches the blender. Getting this backwards puts the deck's underside on
+    // top of its anvils.
+    let n = cloud_shell_count(earth_px);
+    for k in 0..n {
+        let alt = cloud_altitude_km(k, n);
+        // The slab of air this shell stands for, as with the aurora: it is what
+        // keeps the deck's total opacity independent of how many were drawn.
+        let lo = if k == 0 { alt } else { cloud_altitude_km(k - 1, n) };
+        let hi = if k + 1 == n { alt } else { cloud_altitude_km(k + 1, n) };
+        s.draws.push(draw(Prim::Cloud, alt, ((hi - lo) * 0.5).max(0.05), 0.0));
+    }
+    fade
+}
+
+/// The lightning alight at `unix_s`.
+///
+/// A pure function of the clock, with no state carried between frames. Two
+/// things fall out of that. Scrubbing time backwards replays the same storm
+/// rather than a fresh one, which is what the time chips promise; and the whole
+/// model is testable, because the same instant always gives the same answer.
+///
+/// What is real here and what is not: [`clouds::ConvCell`] — where the storms
+/// are, how big, how tall, and how often each should flash — is measured, out
+/// of the infrared mosaic. The individual strokes are invented. No free
+/// worldwide feed of real strikes exists, so the honest thing is to drive
+/// synthetic flashes from real convection and say so.
+fn lightning(b: &Bodies, cells: &[clouds::ConvCell], unix_s: f64, fade: f32) -> Flashes {
+    /// How long one stroke stays visible. Real return strokes are under a
+    /// millisecond; what the eye keeps is the afterglow through the cloud.
+    const DECAY_S: f64 = 0.055;
+    /// Nothing is worth carrying past this, and bounding it is what lets only
+    /// two scheduling slots be examined per storm.
+    const LIFE_S: f64 = 0.34;
+
+    let mut out = Flashes {
+        // Light dies off over roughly the size of the storm lighting it.
+        reach: [b.earth_r * 0.035, 0.0, 0.0, 0.0],
+        ..Default::default()
+    };
+    let mut lit: Vec<([f32; 4], f32)> = Vec::new();
+
+    for (i, c) in cells.iter().enumerate() {
+        if c.flash_rate <= 0.0 {
+            continue;
+        }
+        let period = 1.0 / c.flash_rate as f64;
+        let slot = (unix_s / period).floor() as i64;
+        // The slot before this one as well, or a flash that began just before a
+        // boundary would be cut off at it.
+        for k in [slot, slot - 1] {
+            let h = hash2(i as u64, k as u64);
+            // Fire somewhere inside the slot rather than on its edge: a storm
+            // that ticked like a metronome would read as an animation, and real
+            // flashes arrive in ragged bursts.
+            let start = k as f64 * period + (h[0] as f64) * period;
+            let age = unix_s - start;
+            if !(0.0..LIFE_S).contains(&age) {
+                continue;
+            }
+            // Most flashes are one stroke; a third of them flicker two or three
+            // times over a tenth of a second, which is the thing that makes
+            // lightning read as lightning rather than as a blinking light.
+            let strokes = if h[1] < 0.68 {
+                1
+            } else if h[1] < 0.92 {
+                2
+            } else {
+                3
+            };
+            let mut bright = 0.0f32;
+            for stroke in 0..strokes {
+                let dt = age - stroke as f64 * (0.04 + 0.05 * h[2] as f64);
+                if dt >= 0.0 {
+                    bright += (-dt / DECAY_S).exp() as f32;
+                }
+            }
+            bright *= fade * (0.55 + 0.45 * h[3]);
+            if bright < 0.02 {
+                continue;
+            }
+            // Scattered across the storm, not all on its centre.
+            let lat = c.lat + (h[4] - 0.5) * 2.0 * c.radius_deg * 0.7;
+            let lon = c.lon + (h[5] - 0.5) * 2.0 * c.radius_deg * 0.7;
+            // Half way up the tower. Above it the anvil lights from below and
+            // under it the deck lights from above, which is what a storm seen
+            // from orbit actually does.
+            let alt = c.top_km * 0.5;
+            let dir = b.surface_dir(lat as f64, lon as f64);
+            let p = b.earth + dir * (b.earth_r * cloud_radius(alt));
+            lit.push(([p.x, p.y, p.z, bright], bright));
+        }
+    }
+
+    // Only the brightest few survive; the rest are already too faint to tell
+    // apart on a globe.
+    lit.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (slot, (item, _)) in out.items.iter_mut().zip(&lit) {
+        *slot = *item;
+    }
+    out
+}
+
+/// Six independent values in 0..1 from two integers.
+///
+/// Deliberately not an RNG: there is no state to advance, so the same storm and
+/// the same slot always give the same flash however the frames fall.
+fn hash2(a: u64, k: u64) -> [f32; 6] {
+    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut out = [0.0f32; 6];
+    for o in &mut out {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        *o = (x >> 40) as f32 / 16_777_216.0;
+    }
+    out
 }
 
 /// A body is named while it is small enough on screen to need naming, and the
@@ -1083,9 +1392,8 @@ fn orbits(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera) {
     // The Moon's path is drawn around the Earth's *current* position, so it
     // reads as a ring on the Earth rather than a smear along the Earth's orbit.
     const MOON_STEPS: usize = 128;
-    let moon_at = |jd: f64| {
-        b.earth + V3::from_f64(ephem::moon_geocentric_vec(jd)) * st.view.moon_orbit_scale
-    };
+    let moon_at =
+        |jd: f64| b.earth + V3::from_f64(ephem::moon_geocentric_vec(jd)) * st.view.moon_orbit_scale;
     let mut prev = moon_at(b.jd);
     for k in 1..=MOON_STEPS {
         let jd = b.jd + 27.321_661 * k as f64 / MOON_STEPS as f64;
@@ -1199,13 +1507,33 @@ fn seg(a: V3, b: V3, width_px: f32, color: [f32; 4]) -> LineInst {
     LineInst { a: a.arr(), width_px, b: b.arr(), _pad: 0.0, color }
 }
 
-/// Decoded FT8/FT4 stations, and the path to the one being worked.
+/// The most history arcs the time-lapse draws at once.
 ///
-/// The flat map in the FT8 panel draws the same information as a great-circle
-/// line across a rectangle; here the path is the *actual* great circle, lifted
-/// off the surface so it arcs through space between the two stations instead of
+/// An hour of a busy 20 m evening is a few thousand decodes. Past a couple of
+/// hundred arcs the globe is a ball of wool in which nothing can be read, so
+/// the newest win — the trail is already a fade, and this is where it ends.
+const MAX_LAPSE_ARCS: usize = 160;
+/// Segments per history arc. The contact being worked gets the full [`arc`];
+/// these are many and short-lived, so they trade smoothness for count.
+const LAPSE_ARC_STEPS: usize = 28;
+/// History arcs bow lower than the active one, so the QSO in progress stands
+/// clear of the traffic behind it instead of being one strand among many.
+const LAPSE_BULGE: f32 = 0.7;
+
+/// Decoded FT8/FT4 stations, the last hour of them, and the path to the one
+/// being worked.
+///
+/// The flat map in the FT8 panel draws the live set as a great-circle line
+/// across a rectangle; here the path is the *actual* great circle, lifted off
+/// the surface so it arcs through space between the two stations instead of
 /// disappearing round the back of the globe.
-fn digi_traffic(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera, anim_t: f32) {
+///
+/// The globe also draws what the panel map has no room for: every decode of the
+/// last hour, as an arc that fades out behind a replay head the operator can
+/// park anywhere in that hour (see [`SolarUi::lapse_head`]). Live, the head sits
+/// at now and the trail is simply "recent activity"; wound back, the same
+/// machinery is a time-lapse of the band.
+fn digi_traffic(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera, now: f64, anim_t: f32) {
     let earth_px = cam.pixels_for(b.earth, b.earth_r);
     // Below this the Earth is too small for a point on its surface to mean
     // anything, same threshold the QTH marker uses.
@@ -1218,27 +1546,213 @@ fn digi_traffic(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera, anim_t: f
         b.earth + (ex * v.x as f32 + ey * v.y as f32 + ez * v.z as f32) * (b.earth_r * lift)
     };
 
-    for (lat, lon, age) in &st.digi.stations {
-        if *age <= 0.0 {
-            continue;
+    // The live dots are a statement about *now*, so they are drawn only while
+    // the replay head is at now. Wound back, the history below is the whole
+    // picture and a set of dots from the present would contradict it.
+    if st.lapse_live() {
+        for (lat, lon, age) in &st.digi.stations {
+            if *age <= 0.0 {
+                continue;
+            }
+            s.sprites.push(SpriteInst {
+                center: to_world(ephem::geodetic_to_body(*lat, *lon), 1.015).arr(),
+                size_px: (4.0 + 3.0 * age).min(earth_px * 0.9),
+                color: lin(theme::TEXT_STRONG, 0.85 * age * fade),
+                params: [SPRITE_DOT, 0.0, 0.0, 0.0],
+            });
         }
-        s.sprites.push(SpriteInst {
-            center: to_world(ephem::geodetic_to_body(*lat, *lon), 1.015).arr(),
-            size_px: (4.0 + 3.0 * age).min(earth_px * 0.9),
-            color: lin(theme::TEXT_STRONG, 0.85 * age * fade),
-            params: [SPRITE_DOT, 0.0, 0.0, 0.0],
-        });
     }
 
     // The arcs need a home to start from.
     let Some(home) = st.qth else { return };
-    for (target, color, width, animated) in [
-        (st.digi.dx, theme::CYAN, 2.4, true),
-        (st.digi.preview, theme::YELLOW, 1.6, false),
-    ] {
+
+    lapse_arcs(s, st, &to_world, home, earth_px, fade, now, anim_t);
+
+    // The contact being worked, and the decode clicked but not yet answered.
+    for (target, color, width, active) in
+        [(st.digi.dx, theme::CYAN, 5.2, true), (st.digi.preview, theme::YELLOW, 1.6, false)]
+    {
         let Some(dx) = target else { continue };
-        arc(s, b, &to_world, home, dx, color, width, fade, animated.then_some(anim_t), st.digi.transmitting);
+        arc(
+            s,
+            b,
+            &to_world,
+            home,
+            dx,
+            color,
+            width,
+            fade,
+            active.then_some(anim_t),
+            st.digi.transmitting,
+        );
     }
+
+    // Name the far end when it is a transmitter rather than a callsign: a
+    // weather-fax or broadcast station. The arc already puts a ring on the spot,
+    // so this only has to say what is standing there — "Nauen" or "Ascension
+    // Island" is the whole point of drawing the path at all.
+    if let (Some(dx), Some(text)) = (st.digi.dx, st.digi.dx_label.as_ref()) {
+        let pos = to_world(ephem::geodetic_to_body(dx.0, dx.1), 1.02);
+        s.labels.push(Label {
+            world: pos.arr(),
+            text: text.clone(),
+            color: lin_color(theme::CYAN, 0.95 * fade),
+            offset: [10.0, -7.0],
+            click: Click::None,
+        });
+    }
+}
+
+/// The last hour of decodes as fading arcs, newest first.
+///
+/// Walking the history backwards is what makes the cap honest: what gets
+/// dropped when a band is wide open is the oldest, faintest end of the trail,
+/// which is the part already on its way out.
+#[allow(clippy::too_many_arguments)]
+fn lapse_arcs(
+    s: &mut Scene,
+    st: &SolarUi,
+    to_world: &impl Fn(sdroxide_solar::Vec3, f32) -> V3,
+    home: (f64, f64),
+    earth_px: f32,
+    fade: f32,
+    now: f64,
+    anim_t: f32,
+) {
+    let head = st.lapse_head(now);
+    let trail = st.lapse_trail_s();
+    let mut drawn = 0usize;
+    for hit in st.digi.history.iter().rev() {
+        let age = head - hit.slot_utc as f64;
+        if age < 0.0 {
+            continue; // not yet decoded, as far as the replay head is concerned
+        }
+        if age > trail {
+            break; // ordered, so everything further back is older still
+        }
+        let k = (1.0 - age / trail) as f32; // 1 at the head, 0 at the tail
+        let alpha = k * k * fade;
+        // Fresh traffic arrives cyan and cools to a dim violet as it ages out,
+        // so "this minute" and "half an hour ago" are told apart by colour and
+        // not only by how faint they are.
+        let color = mix(LAPSE_OLD, theme::CYAN, k);
+
+        let Some(pts) =
+            arc_points(to_world, home, (hit.lat, hit.lon), LAPSE_ARC_STEPS, LAPSE_BULGE)
+        else {
+            continue;
+        };
+        // A spark runs the newest arcs from the station to us — the direction
+        // the signal travelled. Only the freshest quarter of the trail gets
+        // one, or every arc on the globe twinkles at once and none of it reads.
+        let spark = ((k - 0.75) * 4.0).clamp(0.0, 1.0);
+        // Offset per station so they do not march in lockstep.
+        let jitter = (hit.slot_utc.rem_euclid(37) as f32) / 37.0;
+        let sh = 1.0 - (anim_t * 0.4 + jitter).fract();
+        for w in 0..pts.len() - 1 {
+            let mid = (w as f32 + 0.5) / (pts.len() - 1) as f32;
+            let d = (mid - sh).abs();
+            let bright = 1.0 + 3.0 * spark * (-d * d * 260.0).exp();
+            s.lines.push(seg(
+                pts[w],
+                pts[w + 1],
+                1.1 * bright.min(2.6),
+                lin(color, (alpha * bright).min(1.0)),
+            ));
+        }
+        // The station itself, so a trail that has faded to a thread still says
+        // where it lands. Lifted clear of the surface like the live dots, or it
+        // z-fights with the globe it sits on.
+        s.sprites.push(SpriteInst {
+            center: to_world(ephem::geodetic_to_body(hit.lat, hit.lon), 1.015).arr(),
+            size_px: (2.4 + 2.0 * k).min(earth_px * 0.6),
+            color: lin(color, (0.9 * alpha).min(1.0)),
+            params: [SPRITE_DOT, 0.0, 0.0, 0.0],
+        });
+
+        drawn += 1;
+        if drawn >= MAX_LAPSE_ARCS {
+            break;
+        }
+    }
+}
+
+/// What a decode's arc has cooled to at the tail of the trail.
+const LAPSE_OLD: Color32 = Color32::from_rgb(0x5a, 0x3c, 0xa8);
+
+/// Award coverage: every DXCC entity, painted by what the logbook is missing.
+///
+/// A heat map of absence. An entity never worked burns orange-red and breathes;
+/// one worked but unconfirmed is a quiet amber ring; a confirmed one is a dim
+/// green dot that stays out of the way. Read from orbit, the hot patches are
+/// where the log has holes — which is the question this layer answers, and the
+/// reason the confirmed ones are drawn faintest rather than brightest.
+///
+/// The positions are cty.dat's nominal entity centres, so this is "the entity
+/// is around there", not a border map. For an award chase that is exactly the
+/// resolution wanted: the target is the entity, not a spot inside it.
+fn award_heat(s: &mut Scene, st: &SolarUi, b: &Bodies, cam: &Camera, anim_t: f32) {
+    if st.awards.is_empty() {
+        return;
+    }
+    let earth_px = cam.pixels_for(b.earth, b.earth_r);
+    // A marker per entity only means something once the Earth is big enough to
+    // place them on — and there are three hundred of them, so this layer needs
+    // more room than a single QTH ring does before it is worth drawing.
+    let fade = ((earth_px - 40.0) / 120.0).clamp(0.0, 1.0);
+    if fade <= 0.0 {
+        return;
+    }
+    let (ex, ey, ez) = b.earth_basis;
+    let on_earth = |lat: f64, lon: f64, lift: f32| {
+        let d = ephem::geodetic_to_body(lat, lon);
+        b.earth + (ex * d.x as f32 + ey * d.y as f32 + ez * d.z as f32) * (b.earth_r * lift)
+    };
+    // One slow breath across the whole layer, so the missing entities read as
+    // live heat rather than as a static scatter of dots.
+    let beat = 1.0 + 0.18 * (anim_t * 1.6).sin();
+
+    for slot in st.awards.iter() {
+        let (color, size, glow) = match slot.coverage {
+            Coverage::Missing => (AWARD_MISSING, 7.0 * beat, Some(22.0 * beat)),
+            Coverage::Worked => (theme::YELLOW, 5.0, None),
+            Coverage::Confirmed => (theme::GREEN, 3.5, None),
+        };
+        let alpha = match slot.coverage {
+            Coverage::Missing => 0.95,
+            Coverage::Worked => 0.7,
+            Coverage::Confirmed => 0.45,
+        };
+        if let Some(g) = glow {
+            s.sprites.push(SpriteInst {
+                center: on_earth(slot.lat, slot.lon, 1.01).arr(),
+                size_px: g.min(earth_px * 0.5),
+                color: lin(color, 0.3 * fade),
+                params: [SPRITE_GLOW, 0.0, 0.0, 0.0],
+            });
+        }
+        s.sprites.push(SpriteInst {
+            center: on_earth(slot.lat, slot.lon, 1.012).arr(),
+            size_px: size.min(earth_px * 0.25),
+            color: lin(color, alpha * fade),
+            params: [
+                if slot.coverage == Coverage::Confirmed { SPRITE_DOT } else { SPRITE_RING },
+                0.0,
+                0.0,
+                0.0,
+            ],
+        });
+    }
+}
+
+/// The heat of an entity that has never been worked.
+const AWARD_MISSING: Color32 = Color32::from_rgb(0xff, 0x5a, 0x28);
+
+/// Blend two palette colours in sRGB, `t` = 1 giving `b`.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
 }
 
 /// How far an arc spanning `omega` radians bows off the surface, as a fraction
@@ -1254,7 +1768,47 @@ pub fn arc_bulge(omega: f64) -> f32 {
     0.06 + 0.42 * (omega / std::f64::consts::PI) as f32
 }
 
+/// Sample the great-circle arc `from`→`to`, bowed `bulge_scale` × the standard
+/// lift off the surface. Both ends land on the ground. `None` when the two
+/// points are the same place, which has no arc.
+fn arc_points(
+    to_world: &impl Fn(sdroxide_solar::Vec3, f32) -> V3,
+    from: (f64, f64),
+    to: (f64, f64),
+    steps: usize,
+    bulge_scale: f32,
+) -> Option<Vec<V3>> {
+    let a = ephem::geodetic_to_body(from.0, from.1);
+    let c = ephem::geodetic_to_body(to.0, to.1);
+    let omega = a.dot(c).clamp(-1.0, 1.0).acos();
+    if omega < 1e-4 {
+        return None;
+    }
+    let bulge = arc_bulge(omega) * bulge_scale;
+    Some(
+        (0..=steps)
+            .map(|k| {
+                let t = k as f64 / steps as f64;
+                // Spherical interpolation, so the path is the true great circle
+                // rather than a chord through the planet.
+                let s0 = ((1.0 - t) * omega).sin() / omega.sin();
+                let s1 = (t * omega).sin() / omega.sin();
+                let dir = a * s0 + c * s1;
+                let lift = 1.0 + bulge * (std::f64::consts::PI * t).sin() as f32;
+                to_world(dir.normalize(), lift)
+            })
+            .collect(),
+    )
+}
+
 /// A great-circle arc between two points on the globe, bowed out into space.
+///
+/// With `anim` set this is the contact being worked, and it is drawn to be
+/// unmistakable among an hour of traffic: a wide soft halo under a bright core,
+/// a pulse running the path end to end, and rings on both stations. The pulse
+/// runs whichever way the traffic is going — out to them while transmitting,
+/// back to us the rest of the time — and hits far harder on transmit, which is
+/// the one moment the operator wants to see at a glance from across the room.
 #[allow(clippy::too_many_arguments)]
 fn arc(
     s: &mut Scene,
@@ -1269,48 +1823,93 @@ fn arc(
     transmitting: bool,
 ) {
     const STEPS: usize = 96;
-    let a = ephem::geodetic_to_body(from.0, from.1);
-    let c = ephem::geodetic_to_body(to.0, to.1);
-    let omega = a.dot(c).clamp(-1.0, 1.0).acos();
-    if omega < 1e-4 {
-        return;
-    }
-    let bulge = arc_bulge(omega);
+    let Some(pts) = arc_points(to_world, from, to, STEPS, 1.0) else { return };
+    let bulge = arc_bulge({
+        let a = ephem::geodetic_to_body(from.0, from.1);
+        let c = ephem::geodetic_to_body(to.0, to.1);
+        a.dot(c).clamp(-1.0, 1.0).acos()
+    });
 
-    let point = |t: f64| {
-        // Spherical interpolation, so the path is the true great circle rather
-        // than a chord through the planet.
-        let s0 = ((1.0 - t) * omega).sin() / omega.sin();
-        let s1 = (t * omega).sin() / omega.sin();
-        let dir = a * s0 + c * s1;
-        let lift = 1.0 + bulge * (std::f64::consts::PI * t).sin() as f32;
-        to_world(dir.normalize(), lift)
+    // Where the pulse's head is on the path this frame, and how hard it hits.
+    let (head, gain, width_gain) = match anim {
+        // Transmitting: a fast, near-white surge running home → them.
+        Some(t0) if transmitting => ((t0 * 0.55).fract(), 5.0, 3.4),
+        // Receiving: a slower swell coming the other way, them → home.
+        Some(t0) => (1.0 - (t0 * 0.28).fract(), 2.6, 2.2),
+        None => (f32::NAN, 0.0, 1.0),
+    };
+    let pulse_at = |mid: f32| {
+        if gain <= 0.0 {
+            return 1.0;
+        }
+        let d = (mid - head).abs().min(1.0 - (mid - head).abs());
+        1.0 + gain * (-d * d * 160.0).exp()
     };
 
-    let mut prev = point(0.0);
-    for k in 1..=STEPS {
-        let t = k as f64 / STEPS as f64;
-        let p = point(t);
-        let mid = (k as f32 - 0.5) / STEPS as f32;
-        // A travelling bright band along the path while transmitting, the same
-        // cue the flat FT8 map uses for an outgoing transmission.
-        let pulse = match anim {
-            Some(t0) if transmitting => {
-                let head = (t0 * 0.55).fract();
-                let d = (mid - head).abs().min(1.0 - (mid - head).abs());
-                1.0 + 2.6 * (-d * d * 220.0).exp()
-            }
-            _ => 1.0,
+    // A wide, dim halo under the core, so the active path reads as a beam
+    // rather than as one more thread in the web.
+    if anim.is_some() {
+        for w in 0..STEPS {
+            let mid = (w as f32 + 0.5) / STEPS as f32;
+            s.lines.push(seg(
+                pts[w],
+                pts[w + 1],
+                width_px * 2.6,
+                lin(color, (0.12 * pulse_at(mid)).min(0.5) * fade),
+            ));
+        }
+    }
+
+    for w in 0..STEPS {
+        let mid = (w as f32 + 0.5) / STEPS as f32;
+        let pulse = pulse_at(mid);
+        // The crest goes white-hot: colour alone cannot get brighter than the
+        // arc already is, so the pulse borrows the one thing that can.
+        let c = if anim.is_some() {
+            mix(color, theme::TEXT_STRONG, (pulse - 1.0) * 0.4)
+        } else {
+            color
         };
-        s.lines.push(seg(prev, p, width_px * pulse.min(1.9), lin(color, (0.55 * pulse).min(1.0) * fade)));
-        prev = p;
+        s.lines.push(seg(
+            pts[w],
+            pts[w + 1],
+            width_px * pulse.min(width_gain),
+            lin(c, (0.62 * pulse).min(1.0) * fade),
+        ));
     }
 
     // Anchor ticks: a short radial stub at each end, so the arc visibly lands
     // on the surface rather than floating near it.
     for (lat, lon) in [from, to] {
         let d = ephem::geodetic_to_body(lat, lon);
-        s.lines.push(seg(to_world(d, 1.0), to_world(d, 1.0 + bulge * 0.16), width_px, lin(color, 0.7 * fade)));
+        s.lines.push(seg(
+            to_world(d, 1.0),
+            to_world(d, 1.0 + bulge * 0.16),
+            width_px,
+            lin(color, 0.7 * fade),
+        ));
+    }
+
+    if anim.is_some() {
+        // The pulse's head as a glow travelling the path, and a ring on each
+        // station: the endpoints of the QSO in progress, not merely of a line.
+        let k = ((head.clamp(0.0, 1.0) * STEPS as f32) as usize).min(STEPS);
+        s.sprites.push(SpriteInst {
+            center: pts[k].arr(),
+            size_px: 18.0,
+            color: lin(mix(color, theme::TEXT_STRONG, 0.5), 0.85 * fade),
+            params: [SPRITE_GLOW, 0.0, 0.0, 0.0],
+        });
+        // A slow breath on the rings, in step with the pulse's period.
+        let beat = 1.0 + 0.25 * (anim.unwrap_or(0.0) * 3.0).sin();
+        for (lat, lon) in [from, to] {
+            s.sprites.push(SpriteInst {
+                center: to_world(ephem::geodetic_to_body(lat, lon), 1.02).arr(),
+                size_px: 15.0 * beat,
+                color: lin(color, 0.9 * fade),
+                params: [SPRITE_RING, 0.0, 0.0, 0.0],
+            });
+        }
     }
     let _ = b;
 }
@@ -1454,7 +2053,8 @@ mod tests {
         }
 
         let b = bodies(&st, 1_784_937_600.0);
-        let jupiter = b.planets.iter().find(|p| p.planet == sdroxide_solar::Planet::Jupiter).unwrap();
+        let jupiter =
+            b.planets.iter().find(|p| p.planet == sdroxide_solar::Planet::Jupiter).unwrap();
         let radii: Vec<f32> = b
             .moons
             .iter()
@@ -1482,7 +2082,8 @@ mod tests {
         }
         // Mercury is small enough that the cap never binds: it gets the full
         // exaggeration the slider asks for.
-        let mercury = b.planets.iter().find(|p| p.planet == sdroxide_solar::Planet::Mercury).unwrap();
+        let mercury =
+            b.planets.iter().find(|p| p.planet == sdroxide_solar::Planet::Mercury).unwrap();
         assert!((mercury.exaggeration - 20.0).abs() < 0.01);
     }
 
@@ -1519,17 +2120,32 @@ mod tests {
             Camera::from_view(&close, &b, [1600.0, 900.0]).pixels_for(b.earth, b.earth_r)
         };
         for sp in s.sprites.iter().filter(|sp| sp.params[0] != SPRITE_GLOW) {
-            assert!(sp.size_px <= earth_px * 1.5 + 0.01, "marker {} px on a {earth_px} px Earth", sp.size_px);
+            assert!(
+                sp.size_px <= earth_px * 1.5 + 0.01,
+                "marker {} px on a {earth_px} px Earth",
+                sp.size_px
+            );
         }
     }
 
+    /// With every switchable layer off, what is left is what is not a layer:
+    /// the three near bodies, the star field, and the graticule the scene is
+    /// read against.
     #[test]
     fn layers_actually_remove_geometry() {
         let mut st = ui();
         st.view.layers = 0;
         let s = build(&st, None, 1_784_937_600.0, [1600.0, 900.0], 0.0);
-        assert!(s.lines.is_empty(), "layers off but {} lines drawn", s.lines.len());
         assert_eq!(s.draws.len(), 3, "the Sun, the Earth and the Moon are not a layer");
+        assert!(s.draw_stars, "the star field is the backdrop, not a layer");
+
+        // Only the graticule's lines survive; switching a layer back on adds to
+        // them, which is what makes this a real check that the rest went away.
+        let grid_lines = s.lines.len();
+        assert!(grid_lines > 0, "the graticule is always drawn");
+        st.view.layers = layer::ORBITS;
+        let with_orbits = build(&st, None, 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        assert!(with_orbits.lines.len() > grid_lines, "ORBITS added nothing");
     }
 
     #[test]
@@ -1589,7 +2205,8 @@ mod tests {
             assert!((0.0..1.0).contains(&inner), "inner radius {inner} out of range");
             // Scale is the length; the model matrix's first column is the
             // scaled basis vector, so its length is the cone's length.
-            let len = (d.model[0][0].powi(2) + d.model[0][1].powi(2) + d.model[0][2].powi(2)).sqrt();
+            let len =
+                (d.model[0][0].powi(2) + d.model[0][1].powi(2) + d.model[0][2].powi(2)).sqrt();
             let launch = sdroxide_solar::impact::LAUNCH_RADIUS as f32;
             assert!(len >= launch, "cone only {len} Gm long, inside the launch radius");
             assert!(
@@ -1602,7 +2219,9 @@ mod tests {
         // The older event has travelled further.
         let lens: Vec<f32> = cones
             .iter()
-            .map(|(_, d)| (d.model[0][0].powi(2) + d.model[0][1].powi(2) + d.model[0][2].powi(2)).sqrt())
+            .map(|(_, d)| {
+                (d.model[0][0].powi(2) + d.model[0][1].powi(2) + d.model[0][2].powi(2)).sqrt()
+            })
             .collect();
         assert!(lens[1] > lens[0], "the two-day-old CME should be further out");
     }
@@ -1630,7 +2249,20 @@ mod tests {
             dx,
             preview: None,
             transmitting: false,
+            ..Default::default()
         };
+        st
+    }
+
+    /// The same view with an hour of decode history behind it: three stations
+    /// at 0, 10 and 50 minutes before `now`.
+    fn earth_view_with_history(now: i64) -> SolarUi {
+        let mut st = earth_view_with_traffic(None);
+        st.digi.history = std::sync::Arc::new(vec![
+            crate::digi_map::DigiHit { lat: 40.7, lon: -74.0, slot_utc: now - 50 * 60 },
+            crate::digi_map::DigiHit { lat: -33.9, lon: 151.2, slot_utc: now - 10 * 60 },
+            crate::digi_map::DigiHit { lat: 35.7, lon: 139.7, slot_utc: now },
+        ]);
         st
     }
 
@@ -1697,6 +2329,174 @@ mod tests {
         let s = build(&st, None, 1_784_937_600.0, [1600.0, 900.0], 0.0);
         // Only the sub-solar dot is left.
         assert_eq!(s.sprites.iter().filter(|sp| sp.params[0] == SPRITE_DOT).count(), 1);
+    }
+
+    /// The contact being worked has to win against an hour of traffic behind
+    /// it, or the operator cannot find their own QSO on the globe.
+    #[test]
+    fn the_active_arc_is_drawn_far_heavier_than_a_history_arc() {
+        let now = 1_784_937_600i64;
+        let quiet = build(&earth_view_with_history(now), None, now as f64, [1600.0, 900.0], 0.0);
+        let mut st = earth_view_with_history(now);
+        st.digi.dx = Some((35.7, 139.7));
+        let s = build(&st, None, now as f64, [1600.0, 900.0], 0.0);
+
+        let widest = s.lines.iter().map(|l| l.width_px).fold(0.0f32, f32::max);
+        let history_max = 1.1 * 2.6; // a history arc at the peak of its spark
+        assert!(widest > 2.0 * history_max, "the active arc is only {widest} px wide");
+        // …and it carries a glow head and a ring on each of the two stations.
+        let count =
+            |s: &Scene, kind: f32| s.sprites.iter().filter(|sp| sp.params[0] == kind).count();
+        assert_eq!(count(&s, SPRITE_GLOW), count(&quiet, SPRITE_GLOW) + 1);
+        assert_eq!(count(&s, SPRITE_RING), count(&quiet, SPRITE_RING) + 2);
+    }
+
+    /// The pulse is a travelling band, so the arc's brightest segment has to
+    /// move along it as time passes — and transmitting has to hit harder than
+    /// receiving, which is the whole point of the cue.
+    #[test]
+    fn the_active_arc_pulse_travels_and_transmitting_hits_hardest() {
+        let now = 1_784_937_600.0;
+        // Widest line and where it is, over the lines the active arc added.
+        let crest = |tx: bool, t: f32| {
+            let mut st = earth_view_with_traffic(Some((35.7, 139.7)));
+            st.digi.transmitting = tx;
+            let plain = build(&earth_view_with_traffic(None), None, now, [1600.0, 900.0], t);
+            let s = build(&st, None, now, [1600.0, 900.0], t);
+            s.lines[plain.lines.len()..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.width_px))
+                .fold((0, 0.0f32), |a, b| if b.1 > a.1 { b } else { a })
+        };
+
+        let (_, tx_w) = crest(true, 0.0);
+        let (_, rx_w) = crest(false, 0.0);
+        assert!(tx_w > rx_w, "transmit pulse {tx_w} px is no wider than receive's {rx_w}");
+        // Both are heavier than the old flat 2.4 px line this replaced.
+        assert!(rx_w > 4.0, "even the receive arc should be a beam, not a hair: {rx_w} px");
+
+        assert_ne!(crest(true, 0.0).0, crest(true, 0.5).0, "the pulse did not move");
+    }
+
+    /// The last hour, replayed: what the head is parked over decides which
+    /// decodes are on the globe at all.
+    #[test]
+    fn the_time_lapse_shows_the_hour_around_its_replay_head() {
+        let now = 1_784_937_600i64;
+        let mut st = earth_view_with_history(now);
+        st.view.lapse_trail_min = 15.0;
+        // The same view with nothing in the history, as the line-count baseline.
+        let base = {
+            let mut b = earth_view_with_history(now);
+            b.digi.history = Default::default();
+            build(&b, None, now as f64, [1600.0, 900.0], 0.0).lines.len()
+        };
+        let arcs =
+            |st: &SolarUi| build(st, None, now as f64, [1600.0, 900.0], 0.0).lines.len() - base;
+
+        // Live: the decodes from now and ten minutes ago are inside a 15-minute
+        // trail; the one from fifty minutes ago is not.
+        assert_eq!(arcs(&st), 2 * LAPSE_ARC_STEPS);
+
+        // Wound back fifty minutes, only the oldest is at the head.
+        st.set_lapse_back(50.0 * 60.0);
+        assert_eq!(arcs(&st), LAPSE_ARC_STEPS);
+
+        // A decode the head has not reached yet is not on the globe at all.
+        st.set_lapse_back(55.0 * 60.0);
+        assert_eq!(arcs(&st), 0);
+    }
+
+    /// Wound back, "now" is not what is being shown, so the live dots — which
+    /// are a statement about the present — have to go.
+    #[test]
+    fn winding_the_replay_back_drops_the_live_dots() {
+        let now = 1_784_937_600i64;
+        let mut st = earth_view_with_history(now);
+        let dots = |st: &SolarUi| {
+            build(st, None, now as f64, [1600.0, 900.0], 0.0)
+                .sprites
+                .iter()
+                .filter(|sp| sp.params[0] == SPRITE_DOT)
+                .count()
+        };
+        // Three live stations, two history hits inside the trail, the sub-solar dot.
+        assert_eq!(dots(&st), 3 + 2 + 1);
+        st.set_lapse_back(10.0 * 60.0);
+        // The live three are gone; the head sits on the ten-minute-old decode,
+        // with the one from fifty minutes ago still outside the trail.
+        assert_eq!(dots(&st), 1 + 1);
+    }
+
+    /// The award layer is a map of what is *missing*, so an unworked entity has
+    /// to be the loudest thing on it and a confirmed one the quietest.
+    #[test]
+    fn the_award_layer_burns_hottest_where_the_log_has_holes() {
+        let now = 1_784_937_600.0;
+        let mut st = ui();
+        st.view.focus = Focus::Earth.to_u8();
+        st.view.dist = 0.06; // close enough for a per-entity marker to mean something
+        st.view.layers |= layer::AWARDS;
+        let slot = |name, lat, lon, coverage| sdroxide_types::EntitySlot {
+            name,
+            lat,
+            lon,
+            continent: "EU",
+            coverage,
+        };
+        st.awards = std::sync::Arc::new(vec![
+            slot("Mongolia", 46.0, 104.0, Coverage::Missing),
+            slot("Fed. Rep. of Germany", 51.0, 10.0, Coverage::Worked),
+            slot("Japan", 36.0, 138.0, Coverage::Confirmed),
+        ]);
+
+        let s = build(&st, None, now, [1600.0, 900.0], 0.0);
+        // The missing one gets a glow the others do not.
+        let glows = s.sprites.iter().filter(|sp| sp.params[0] == SPRITE_GLOW).count();
+        let quiet = {
+            let mut st = ui();
+            st.view.focus = Focus::Earth.to_u8();
+            st.view.dist = 0.06;
+            build(&st, None, now, [1600.0, 900.0], 0.0)
+        };
+        let base_glows = quiet.sprites.iter().filter(|sp| sp.params[0] == SPRITE_GLOW).count();
+        assert_eq!(glows, base_glows + 1, "only the missing entity should glow");
+
+        // Three markers, and the missing one is the biggest.
+        let added = &s.sprites[quiet.sprites.len()..];
+        assert_eq!(added.len() - 1, 3, "one marker per entity, plus the glow");
+        // Emitted in list order: the missing entity's glow, then a marker each.
+        let sizes: Vec<f32> = added.iter().skip(1).map(|sp| sp.size_px).collect();
+        assert!(
+            sizes[0] > sizes[1] && sizes[1] > sizes[2],
+            "sizes do not rank missing > worked > confirmed: {sizes:?}"
+        );
+
+        // …and switching the layer off takes all of it away again.
+        st.view.layers &= !layer::AWARDS;
+        let off = build(&st, None, now, [1600.0, 900.0], 0.0);
+        assert_eq!(off.sprites.len(), quiet.sprites.len());
+    }
+
+    /// Three hundred markers on a globe a few pixels across is noise, so the
+    /// layer waits until the Earth is worth painting them on.
+    #[test]
+    fn the_award_layer_stays_off_a_distant_earth() {
+        let mut st = ui();
+        st.view.layers |= layer::AWARDS;
+        st.awards = std::sync::Arc::new(vec![sdroxide_types::EntitySlot {
+            name: "Mongolia",
+            lat: 46.0,
+            lon: 104.0,
+            continent: "AS",
+            coverage: Coverage::Missing,
+        }]);
+        // The default view frames the whole Earth orbit: the planet is a dot.
+        let far = build(&st, None, 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        st.awards = Default::default();
+        let none = build(&st, None, 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        assert_eq!(far.sprites.len(), none.sprites.len());
     }
 
     /// A synthetic oval: a solid band from 60° to 75° in both hemispheres, so
@@ -1858,5 +2658,271 @@ mod tests {
         // Roughly isotropic: no hemisphere should hold more than 60%.
         let up = a.iter().filter(|s| s.center[2] > 0.0).count();
         assert!((600..900).contains(&up), "{up}/1500 stars in the +Z hemisphere");
+    }
+
+    // ── Clouds ──────────────────────────────────────────────────────────────
+
+    /// A synthetic field: an overcast band across the tropics with one deep
+    /// convective cell in it, so these tests assert against a shape they know.
+    fn test_field() -> CloudField {
+        let n = clouds::GRID_W * clouds::GRID_H;
+        let mut opacity = vec![0u8; n];
+        let mut top = vec![0u8; n];
+        for row in 0..clouds::GRID_H {
+            let lat = clouds::row_lat(row);
+            if lat.abs() > 25.0 {
+                continue;
+            }
+            for col in 0..clouds::GRID_W {
+                let i = row * clouds::GRID_W + col;
+                opacity[i] = 200;
+                // A tall tower over the Congo, a flat deck everywhere else.
+                let lon = clouds::col_lon(col);
+                let tall = (lat - 0.0).abs() < 5.0 && (lon - 20.0).abs() < 5.0;
+                top[i] = if tall { 240 } else { 60 };
+            }
+        }
+        CloudField {
+            frame_unix: 1_784_937_600,
+            opacity,
+            top,
+            cells: vec![clouds::ConvCell {
+                lat: 0.0,
+                lon: 20.0,
+                radius_deg: 4.0,
+                top_km: 16.0,
+                flash_rate: 2.0,
+            }],
+            has_visible: true,
+        }
+    }
+
+    fn earth_view_with_clouds(field: Option<CloudField>) -> (SolarUi, SolarData) {
+        let mut st = ui();
+        st.view.focus = Focus::Earth.to_u8();
+        st.view.dist = 0.5;
+        let mut data = SolarData::default();
+        data.clouds = field.map(std::sync::Arc::new);
+        (st, data)
+    }
+
+    /// The deck is a stack of slices through the troposphere, and every one of
+    /// them has to sit in the band the weather is actually in — ordered, tiling
+    /// it, and glued to the surface.
+    ///
+    /// The loop over `body_scale` is the one that matters. Altitudes are stored
+    /// as fractions of the radius the globe is *drawn* at, so the deck has to
+    /// stay attached at any setting of the exaggeration slider; expressing them
+    /// in absolute units instead would leave the clouds buried inside a
+    /// twenty-times Earth and orbiting a life-size one.
+    #[test]
+    fn the_deck_is_a_stack_of_slices_through_the_troposphere() {
+        for scale in [1.0f32, 20.0, 60.0] {
+            let (mut st, data) = earth_view_with_clouds(Some(test_field()));
+            st.view.body_scale = scale;
+            let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+            let deck: Vec<_> =
+                s.draws.iter().filter(|(p, _)| *p == Prim::Cloud).map(|(_, d)| *d).collect();
+            assert!(deck.len() >= 4, "only {} shells at scale {scale}", deck.len());
+
+            let mut last = 0.0f32;
+            let mut spanned = 0.0f32;
+            for d in &deck {
+                let alt = d.params[0];
+                let slab = d.params[1];
+                assert!(
+                    (CLOUD_BOTTOM_KM..=CLOUD_TOP_KM).contains(&alt),
+                    "a shell at {alt} km is outside the troposphere"
+                );
+                assert!(alt >= last, "shells are not ordered bottom-up: {alt} after {last}");
+                assert!(slab > 0.0, "a shell standing for no air at all");
+                last = alt;
+                spanned += slab;
+
+                // Radius relative to the globe: a hair above the surface, and
+                // never so far off it that the deck reads as a separate shell.
+                let r = v3(d.model[0][0], d.model[0][1], d.model[0][2]).len();
+                let earth_r = ephem::EARTH_R as f32 * scale;
+                let rel = r / earth_r;
+                assert!(
+                    (1.0..=1.02).contains(&rel),
+                    "shell at {rel}× the Earth's radius at scale {scale}"
+                );
+            }
+            // The slabs have to add up to the band, or the deck's opacity would
+            // depend on how many shells the frame happened to spend.
+            let band = CLOUD_TOP_KM - CLOUD_BOTTOM_KM;
+            assert!(
+                (spanned - band).abs() < band * 0.35,
+                "slabs sum to {spanned} km against a {band} km band"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clouds_layer_removes_the_deck_entirely() {
+        let (mut st, data) = earth_view_with_clouds(Some(test_field()));
+        st.view.layers &= !layer::CLOUDS;
+        let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        assert!(s.draws.iter().all(|(p, _)| !matches!(p, Prim::Cloud | Prim::CloudVolume)));
+        assert_eq!(s.flashes, Flashes::default(), "lightning without a cloud layer");
+    }
+
+    /// No field, no deck. Drawing a clear sky before the first mosaic lands
+    /// would be a claim about the weather rather than an absence of one.
+    #[test]
+    fn no_mosaic_draws_no_weather() {
+        let (st, data) = earth_view_with_clouds(None);
+        let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        assert!(s.draws.iter().all(|(p, _)| !matches!(p, Prim::Cloud | Prim::CloudVolume)));
+    }
+
+    /// The volume switch replaces the whole stack with a single draw.
+    #[test]
+    fn the_volume_switch_swaps_the_stack_for_one_march() {
+        let (mut st, data) = earth_view_with_clouds(Some(test_field()));
+        st.view.cloud_march = true;
+        let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        let marches: Vec<_> =
+            s.draws.iter().filter(|(p, _)| *p == Prim::CloudVolume).map(|(_, d)| *d).collect();
+        assert_eq!(marches.len(), 1);
+        assert!(s.draws.iter().all(|(p, _)| *p != Prim::Cloud));
+        // The step budget has to be a usable number of steps, and within the
+        // ceiling the shader's loop is bounded by.
+        let steps = marches[0].params[3];
+        assert!((4.0..=40.0).contains(&steps), "step budget {steps}");
+    }
+
+    /// Cloud is under the aurora, and the aurora only adds light — so the deck
+    /// has to be composited first or the oval ends up behind the weather.
+    #[test]
+    fn the_deck_is_drawn_under_the_aurora() {
+        let mut st = ui();
+        st.view.focus = Focus::Earth.to_u8();
+        st.view.dist = 0.5;
+        let mut data = SolarData::default();
+        data.clouds = Some(std::sync::Arc::new(test_field()));
+        data.aurora = Some(std::sync::Arc::new(test_oval()));
+        let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+
+        let last_cloud = s.draws.iter().rposition(|(p, _)| *p == Prim::Cloud).expect("no deck");
+        let first_aurora = s.draws.iter().position(|(p, _)| *p == Prim::Aurora).expect("no oval");
+        assert!(last_cloud < first_aurora, "the aurora was drawn under the clouds");
+        // Each run stays contiguous, or the draw loop rebinds a pipeline per
+        // shell instead of once per stack.
+        let first_cloud = s.draws.iter().position(|(p, _)| *p == Prim::Cloud).expect("no deck");
+        assert!(s.draws[first_cloud..=last_cloud].iter().all(|(p, _)| *p == Prim::Cloud));
+    }
+
+    /// A cloud deck on a twenty-pixel Earth is a grey wash that only makes the
+    /// planet harder to read, so it fades out before it gets there.
+    #[test]
+    fn the_deck_fades_out_with_a_distant_earth() {
+        let mut st = ui();
+        st.view.focus = Focus::Sun.to_u8();
+        let mut data = SolarData::default();
+        data.clouds = Some(std::sync::Arc::new(test_field()));
+        let s = build(&st, Some(&data), 1_784_937_600.0, [1600.0, 900.0], 0.0);
+        assert!(s.draws.iter().all(|(p, _)| !matches!(p, Prim::Cloud | Prim::CloudVolume)));
+        assert_eq!(s.flashes, Flashes::default());
+    }
+
+    /// Lightning is a function of the clock and nothing else.
+    ///
+    /// This is what lets the time chips scrub backwards and replay the same
+    /// storm rather than a fresh one, and it is what makes the model testable at
+    /// all. A frame counter or an RNG would give a different answer every time
+    /// the same instant was drawn.
+    #[test]
+    fn lightning_is_a_function_of_the_clock() {
+        let (st, data) = earth_view_with_clouds(Some(test_field()));
+        let at = |t: f64| build(&st, Some(&data), t, [1600.0, 900.0], 0.0).flashes;
+
+        let a = at(1_784_937_600.0);
+        assert_eq!(a, at(1_784_937_600.0), "the same instant gave two different storms");
+
+        // Over a minute at two flashes a second something has to strike, and the
+        // picture has to change as the clock runs.
+        let mut lit_frames = 0;
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..600 {
+            let f = at(1_784_937_600.0 + i as f64 * 0.1);
+            let lit = f.items.iter().filter(|s| s[3] > 0.0).count();
+            assert!(lit <= MAX_FLASHES, "{lit} flashes at once");
+            if lit > 0 {
+                lit_frames += 1;
+                seen.insert(f.items[0][3].to_bits());
+            }
+        }
+        assert!(lit_frames > 20, "only {lit_frames}/600 frames had any lightning");
+        assert!(seen.len() > 10, "the flashes never changed brightness");
+    }
+
+    /// A flash is inside the cloud that is making it: within the slab, and near
+    /// enough to the storm the field put there.
+    #[test]
+    fn lightning_strikes_inside_the_storm_that_made_it() {
+        let (st, data) = earth_view_with_clouds(Some(test_field()));
+        let b = bodies(&st, 1_784_937_600.0);
+        let cell = data.clouds.as_ref().expect("field").cells[0];
+        let want = b.surface_dir(cell.lat as f64, cell.lon as f64);
+
+        let mut checked = 0;
+        for i in 0..600 {
+            let f = build(&st, Some(&data), 1_784_937_600.0 + i as f64 * 0.1, [1600.0, 900.0], 0.0)
+                .flashes;
+            for item in f.items.iter().filter(|s| s[3] > 0.0) {
+                let p = v3(item[0], item[1], item[2]) - b.earth;
+                let rel = p.len() / b.earth_r;
+                let top = 1.0 + CLOUD_TOP_KM * CLOUD_LIFT / CLOUD_EARTH_R_KM;
+                assert!((1.0..=top).contains(&rel), "a flash at {rel}× the Earth's radius");
+                // Within the storm's own footprint, generously: the jitter is
+                // 70% of its radius and the tower leans nowhere.
+                let cos = p.normalize().dot(want);
+                let limit = (cell.radius_deg * 1.2).to_radians().cos();
+                assert!(cos > limit, "a flash {:.1}° from its storm", cos.acos().to_degrees());
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "only {checked} flashes to check");
+    }
+
+    /// A storm that is not working does not flash. The rate comes out of the
+    /// imagery, so a zero there has to mean silence rather than a default.
+    #[test]
+    fn a_quiet_cell_never_flashes() {
+        let mut field = test_field();
+        field.cells[0].flash_rate = 0.0;
+        let (st, data) = earth_view_with_clouds(Some(field));
+        for i in 0..200 {
+            let f =
+                build(&st, Some(&data), 1_784_937_600.0 + i as f64 * 0.05, [1600.0, 900.0], 0.0)
+                    .flashes;
+            assert!(f.items.iter().all(|s| s[3] == 0.0), "a cell with no rate flashed");
+        }
+    }
+
+    /// The flash block is a uniform, so its size is a contract with the shaders.
+    #[test]
+    fn the_flash_block_is_the_size_the_shaders_expect() {
+        assert_eq!(std::mem::size_of::<Flashes>(), 16 * (MAX_FLASHES + 1));
+        assert_eq!(std::mem::size_of::<Flashes>() % 16, 0);
+    }
+
+    /// `SUN OBS` is one chip standing for two layers, so it has to gate both —
+    /// and a mask that a settings file left with only one of them set must read
+    /// as lit and clear to nothing, not flip to the other one. That is the bug
+    /// an XOR toggle would have.
+    #[test]
+    fn the_sun_observation_chip_covers_both_of_its_layers() {
+        assert_eq!(layer::SUN_OBS, layer::SPOTS | layer::FLARES);
+
+        let mut st = ui();
+        st.view.layers = layer::SPOTS;
+        assert!(st.layer(layer::SUN_OBS), "half a pair should still light the chip");
+        st.set_layers(layer::SUN_OBS, false);
+        assert!(!st.layer(layer::SPOTS) && !st.layer(layer::FLARES), "one click left half on");
+        st.set_layers(layer::SUN_OBS, true);
+        assert!(st.layer(layer::SPOTS) && st.layer(layer::FLARES), "the next click left half off");
     }
 }

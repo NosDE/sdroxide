@@ -510,10 +510,7 @@ mod tests {
         for chunk in audio.chunks(512) {
             decoded.push_str(&rx.process(chunk));
         }
-        assert!(
-            decoded.contains(msg),
-            "decoded {decoded:?} did not contain {msg:?}"
-        );
+        assert!(decoded.contains(msg), "decoded {decoded:?} did not contain {msg:?}");
         // Sent-char progress reached the whole message.
         assert_eq!(tx.sent_chars(), tx.total_chars());
     }

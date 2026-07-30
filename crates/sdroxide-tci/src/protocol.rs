@@ -172,11 +172,7 @@ pub fn modulation(rx: u32, mode: &str) -> String {
     format!("modulation:{rx},{mode};")
 }
 pub fn trx(rx: u32, on: bool, tci_source: bool) -> String {
-    if on && tci_source {
-        format!("trx:{rx},true,tci;")
-    } else {
-        format!("trx:{rx},{on};")
-    }
+    if on && tci_source { format!("trx:{rx},true,tci;") } else { format!("trx:{rx},{on};") }
 }
 pub fn iq_samplerate(hz: u32) -> String {
     format!("iq_samplerate:{hz};")
@@ -302,20 +298,23 @@ pub fn parse_status(text: &str) -> Vec<(String, String)> {
 pub fn mode_to_tci(mode: Mode) -> &'static str {
     match mode {
         Mode::Lsb => "lsb",
-        Mode::Usb | Mode::Sstv | Mode::RfPaint => "usb",
+        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::RfPaint => "usb",
         Mode::Cw => "cw",
         Mode::Am => "am",
         Mode::Sam => "sam",
-        Mode::Nfm => "nfm",
+        // RIFP centres on the dial and swings ±4 kHz: FM, not a sideband.
+        Mode::Nfm | Mode::Rifp => "nfm",
         Mode::Wfm => "wfm",
         Mode::Digu
         | Mode::Ft8
+        | Mode::Js8
         | Mode::Ft4
         | Mode::Psk
         | Mode::Rtty
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
+        | Mode::Hell
         | Mode::Rade => "digu",
         Mode::Digl => "digl",
         Mode::Dsb => "dsb",

@@ -15,9 +15,13 @@ pub enum Band {
     M10,
     M6,
     M2,
-    Cm70,
-    Cm23,
     Gen,
+    /// 70 cm. Appended rather than placed after [`Band::M2`] because `Band` is
+    /// postcard-encoded by declaration index and stored in band stacks and
+    /// memories; [`Band::ALL`] puts it where it belongs on screen.
+    M70,
+    /// 23 cm, appended for the same reason as [`Band::M70`].
+    M23,
 }
 
 impl Band {
@@ -34,8 +38,8 @@ impl Band {
         Band::M10,
         Band::M6,
         Band::M2,
-        Band::Cm70,
-        Band::Cm23,
+        Band::M70,
+        Band::M23,
         Band::Gen,
     ];
 
@@ -53,8 +57,8 @@ impl Band {
             Band::M10 => "10M",
             Band::M6 => "6M",
             Band::M2 => "2M",
-            Band::Cm70 => "70CM",
-            Band::Cm23 => "23CM",
+            Band::M70 => "70CM",
+            Band::M23 => "23CM",
             Band::Gen => "GEN",
         }
     }
@@ -75,8 +79,8 @@ impl Band {
             Band::M10 => Some((28_000_000.0, 29_700_000.0)),
             Band::M6 => Some((50_000_000.0, 52_000_000.0)),
             Band::M2 => Some((144_000_000.0, 146_000_000.0)),
-            Band::Cm70 => Some((430_000_000.0, 440_000_000.0)),
-            Band::Cm23 => Some((1_240_000_000.0, 1_300_000_000.0)),
+            Band::M70 => Some((430_000_000.0, 440_000_000.0)),
+            Band::M23 => Some((1_240_000_000.0, 1_300_000_000.0)),
             Band::Gen => None,
         }
     }
@@ -105,10 +109,13 @@ impl Band {
             Band::M10 => (28_400_000.0, Mode::Usb),
             Band::M6 => (50_150_000.0, Mode::Usb),
             Band::M2 => (145_500_000.0, Mode::Nfm),
-            Band::Cm70 => (433_500_000.0, Mode::Nfm),
+            // 70 cm opens on the RIFP calling frequency: it is the band this
+            // mode is meant for, and the band stack overrides this the moment
+            // the operator tunes anywhere else.
+            Band::M70 => (crate::RIFP_CALLING_HZ, Mode::Rifp),
             // The SSB/CW calling frequency: on 23 cm that is where the
             // activity is, FM simplex being nearly deserted.
-            Band::Cm23 => (1_296_200_000.0, Mode::Usb),
+            Band::M23 => (1_296_200_000.0, Mode::Usb),
             Band::Gen => (7_200_000.0, Mode::Am),
         }
     }

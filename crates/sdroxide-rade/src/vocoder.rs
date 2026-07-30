@@ -143,10 +143,7 @@ mod tests {
             enc.encode(&vec![0i16; enc.frame_size()], &mut feats).expect("encode");
         }
         assert_eq!(feats.len(), 4 * n_features());
-        assert!(matches!(
-            enc.encode(&[0i16; 7], &mut feats),
-            Err(RadeError::BadLength { .. })
-        ));
+        assert!(matches!(enc.encode(&[0i16; 7], &mut feats), Err(RadeError::BadLength { .. })));
     }
 
     #[test]

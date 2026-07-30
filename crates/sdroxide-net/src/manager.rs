@@ -210,14 +210,12 @@ impl SpotManager {
         let qrz = self.cfg.qrz.clone();
         let hamqth = self.cfg.hamqth.clone();
         let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            match crate::lookup::lookup(provider, &qrz, &hamqth, &call) {
-                Ok(info) => {
-                    let _ = tx.send(NetEvent::Callsign(info));
-                }
-                Err(e) => {
-                    let _ = tx.send(NetEvent::Status(Some(format!("Lookup {call}: {e}"))));
-                }
+        std::thread::spawn(move || match crate::lookup::lookup(provider, &qrz, &hamqth, &call) {
+            Ok(info) => {
+                let _ = tx.send(NetEvent::Callsign(info));
+            }
+            Err(e) => {
+                let _ = tx.send(NetEvent::Status(Some(format!("Lookup {call}: {e}"))));
             }
         });
     }

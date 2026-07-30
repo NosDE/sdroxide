@@ -10,7 +10,6 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use eframe::egui;
-use sdroxide_types::SstvMode;
 
 /// Height of the header strip, in pixels.
 const HEADER_H: usize = 16;
@@ -64,17 +63,20 @@ pub fn crop_scale(src_rgb: &[u8], sw: u16, sh: u16, w: u16, h: u16) -> Vec<u8> {
         .into_raw()
 }
 
-/// Build the final transmit image: crop/scale the source to the mode size, add
-/// the header strip, then the message overlay. Returns `(rgb, w, h)`.
+/// Build the final transmit image: crop/scale the source to `(w, h)`, add the
+/// header strip, then the message overlay. Returns `(rgb, w, h)`.
+///
+/// The size is the caller's: SSTV takes it from the line format, RIFP from the
+/// operator, since the protocol fixes none of its own.
 pub fn compose(
-    mode: SstvMode,
+    w: u16,
+    h: u16,
     src_rgb: &[u8],
     sw: u16,
     sh: u16,
     message: &str,
     callsign: &str,
 ) -> (Vec<u8>, u16, u16) {
-    let (w, h) = mode.dimensions();
     let mut img = crop_scale(src_rgb, sw, sh, w, h);
     draw_header(&mut img, w as usize, h as usize, callsign);
     draw_message(&mut img, w as usize, h as usize, message);
@@ -131,7 +133,18 @@ fn draw_header(img: &mut [u8], w: usize, h: usize, callsign: &str) {
         // Right: program name + version.
         let brand = format!("SDRoxide v{}", env!("CARGO_PKG_VERSION"));
         let tw = text_width(&brand, &font, scale);
-        draw_text(img, w, h, w as f32 - tw - 4.0, baseline, &brand, &font, scale, (235, 235, 235), 1.0);
+        draw_text(
+            img,
+            w,
+            h,
+            w as f32 - tw - 4.0,
+            baseline,
+            &brand,
+            &font,
+            scale,
+            (235, 235, 235),
+            1.0,
+        );
     }
 }
 

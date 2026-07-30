@@ -33,8 +33,8 @@ fn sample(name: &str) -> PathBuf {
 
 /// 16-bit mono WAV as `+/-1.0` floats, with its sample rate.
 fn read_wav(path: &PathBuf) -> (Vec<f32>, f64) {
-    let mut r = hound::WavReader::open(path)
-        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut r =
+        hound::WavReader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let spec = r.spec();
     assert_eq!(spec.channels, 1);
     let s = r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();

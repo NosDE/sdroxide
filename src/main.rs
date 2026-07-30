@@ -6,6 +6,7 @@ mod hpsdr_source;
 mod icom_source;
 mod local_controller;
 mod null_source;
+mod rtlsdr_source;
 mod server_main;
 mod tci_source;
 
@@ -53,7 +54,7 @@ struct Cli {
     gain: Option<f64>,
 
     /// Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8,
-    /// FT4, PSK, RTTY, SSTV, OLIVIA, THOR, FSQ)
+    /// FT4, PSK, RTTY, SSTV, RIFP, OLIVIA, THOR, FSQ)
     #[arg(long)]
     mode: Option<sdroxide_types::Mode>,
 
@@ -119,13 +120,35 @@ struct Cli {
     /// Console spectrum width in characters
     #[arg(long, default_value_t = 100)]
     width: usize,
+
+    /// Allow transmit on any frequency the hardware supports, not just the
+    /// amateur bands
+    ///
+    /// Overrides `tx_ham_only` in config.toml for this run only, and puts a
+    /// warning on screen that has to be dismissed by hand. For licensed
+    /// out-of-band use — MARS/CAP, a commercial or experimental licence, a
+    /// dummy load — where transmitting outside the amateur allocations is
+    /// something you are authorised to do. Everywhere else it is an offence,
+    /// and the band edges are the last thing standing between a mistyped
+    /// frequency and an interference complaint.
+    #[arg(long)]
+    oob_tx: bool,
+}
+
+impl Cli {
+    /// Whether the engine should refuse to key outside the amateur bands.
+    ///
+    /// The flag can only ever *loosen* the config, never tighten it: a build
+    /// without it behaves exactly as before.
+    fn tx_ham_only(&self, settings: &Settings) -> bool {
+        settings.tx_ham_only && !self.oob_tx
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -151,15 +174,15 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(secs) = cli.tx_tune {
         let (source, caps) = open_source(&cli, &settings)?;
-        return tx_tune_test(source, caps, &settings, secs.clamp(0.2, 10.0));
+        return tx_tune_test(source, caps, cli.tx_ham_only(&settings), secs.clamp(0.2, 10.0));
     }
     if let Some(secs) = cli.ft8_cq {
         let (source, caps) = open_source(&cli, &settings)?;
-        return ft8_cq_test(source, caps, &settings, secs.clamp(16.0, 60.0));
+        return ft8_cq_test(source, caps, cli.tx_ham_only(&settings), secs.clamp(16.0, 60.0));
     }
     if let Some(secs) = cli.rade_rx {
         let (source, caps) = open_source(&cli, &settings)?;
-        return rade_rx_test(source, caps, &settings, secs.clamp(2.0, 120.0));
+        return rade_rx_test(source, caps, cli.tx_ham_only(&settings), secs.clamp(2.0, 120.0));
     }
     // Before any radio setup: the probe talks to the network and nothing else.
     if let Some(secs) = cli.freedv_reporter_probe {
@@ -172,6 +195,7 @@ fn main() -> anyhow::Result<()> {
             source,
             caps,
             &settings,
+            cli.tx_ham_only(&settings),
             cli.mode,
             port,
             cli.web_root.clone(),
@@ -179,16 +203,19 @@ fn main() -> anyhow::Result<()> {
         );
     }
     if let Some(target) = &cli.connect {
-        let url = if target.contains("://") {
-            target.clone()
-        } else {
-            format!("ws://{target}/ws")
-        };
+        let url = if target.contains("://") { target.clone() } else { format!("ws://{target}/ws") };
         return gui_main::run_remote(&url);
     }
 
     let (source, caps) = open_source(&cli, &settings)?;
-    gui_main::run(source, caps, &settings, cli.mode, Some(reopen_factory(&cli)))
+    gui_main::run(
+        source,
+        caps,
+        &settings,
+        cli.tx_ham_only(&settings),
+        cli.mode,
+        Some(reopen_factory(&cli)),
+    )
 }
 
 /// Factory the engine calls to rebuild the interface at runtime: when the
@@ -216,7 +243,7 @@ fn reopen_factory(cli: &Cli) -> sdroxide_radio::ReopenFn {
 fn tx_tune_test(
     source: Box<dyn IqSource>,
     caps: sdroxide_types::DeviceCaps,
-    settings: &Settings,
+    tx_ham_only: bool,
     secs: f64,
 ) -> anyhow::Result<()> {
     use sdroxide_types::{Command, RadioEvent};
@@ -225,10 +252,7 @@ fn tx_tune_test(
     let mut handles = sdroxide_radio::start_engine(
         source,
         caps,
-        sdroxide_radio::EngineConfig {
-            tx_ham_only: settings.tx_ham_only,
-            ..Default::default()
-        },
+        sdroxide_radio::EngineConfig { tx_ham_only, ..Default::default() },
     );
     let engine_thread = handles.thread.take();
     std::thread::sleep(Duration::from_millis(400));
@@ -269,7 +293,7 @@ fn tx_tune_test(
 fn ft8_cq_test(
     source: Box<dyn IqSource>,
     caps: sdroxide_types::DeviceCaps,
-    settings: &Settings,
+    tx_ham_only: bool,
     secs: f64,
 ) -> anyhow::Result<()> {
     use sdroxide_types::{Command, DigiConfig, Mode, RadioEvent, RxId};
@@ -279,7 +303,7 @@ fn ft8_cq_test(
         source,
         caps,
         sdroxide_radio::EngineConfig {
-            tx_ham_only: settings.tx_ham_only,
+            tx_ham_only,
             initial_mode: Some(Mode::Ft8),
             ..Default::default()
         },
@@ -393,7 +417,7 @@ fn freedv_reporter_probe(host_arg: &str, secs: f64) -> anyhow::Result<()> {
 fn rade_rx_test(
     source: Box<dyn IqSource>,
     caps: sdroxide_types::DeviceCaps,
-    settings: &Settings,
+    tx_ham_only: bool,
     secs: f64,
 ) -> anyhow::Result<()> {
     use sdroxide_types::{Command, Mode, RadioEvent, RxId};
@@ -407,7 +431,7 @@ fn rade_rx_test(
         source,
         caps,
         sdroxide_radio::EngineConfig {
-            tx_ham_only: settings.tx_ham_only,
+            tx_ham_only,
             initial_mode: Some(Mode::Rade),
             audio: Some(sdroxide_radio::AudioParams { producer, out_rate: 48_000.0 }),
             ..Default::default()
@@ -465,8 +489,30 @@ fn device_filter(cli: &Cli, settings: &Settings) -> String {
     cli.device.clone().unwrap_or_else(|| settings.device_args.clone())
 }
 
-#[cfg(feature = "soapy")]
 fn probe(cli: &Cli, settings: &Settings) -> anyhow::Result<()> {
+    // RTL-SDR first, and in every build: the native driver needs no system
+    // library, so this half of `--probe` works even in the non-SoapySDR
+    // variant. It is the field-diagnosis tool for "does this machine see my
+    // dongle, and may this user have it?".
+    probe_rtlsdr();
+    probe_soapy(cli, settings)
+}
+
+fn probe_rtlsdr() {
+    let devices = sdroxide_rtlsdr::list();
+    if devices.is_empty() {
+        println!("No RTL-SDR dongles found on USB.");
+    } else {
+        println!("=== RTL-SDR (native USB driver) ===");
+        for (i, d) in devices.iter().enumerate() {
+            println!("  {}: {}  [usb {:04x}:{:04x}]", i, d.label(), d.vid, d.pid);
+        }
+    }
+    println!();
+}
+
+#[cfg(feature = "soapy")]
+fn probe_soapy(cli: &Cli, settings: &Settings) -> anyhow::Result<()> {
     let filter = device_filter(cli, settings);
     let devices = enumerate_devices(&filter).context("SoapySDR enumeration failed")?;
     if devices.is_empty() {
@@ -484,8 +530,9 @@ fn probe(cli: &Cli, settings: &Settings) -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "soapy"))]
-fn probe(_cli: &Cli, _settings: &Settings) -> anyhow::Result<()> {
-    bail!("this build has no SoapySDR support (built with --no-default-features)")
+fn probe_soapy(_cli: &Cli, _settings: &Settings) -> anyhow::Result<()> {
+    println!("This build has no SoapySDR support (built with --no-default-features).");
+    Ok(())
 }
 
 #[cfg(feature = "soapy")]
@@ -513,7 +560,8 @@ fn print_caps(caps: &sdroxide_types::DeviceCaps) {
         }
     }
     if !caps.sample_rates.is_empty() {
-        let list: Vec<String> = caps.sample_rates.iter().map(|r| format!("{:.3}", r / 1e6)).collect();
+        let list: Vec<String> =
+            caps.sample_rates.iter().map(|r| format!("{:.3}", r / 1e6)).collect();
         println!("  rates (Msps)  : {}", list.join(", "));
     }
     for &(lo, hi) in &caps.rate_ranges {
@@ -586,6 +634,7 @@ fn open_configured_source(
         Backend::Cat => open_cat_source(radio),
         Backend::Hpsdr => open_hpsdr_source(radio, cli.freq),
         Backend::Tci => open_tci_source(radio, cli.freq),
+        Backend::RtlSdr => open_rtlsdr_source(radio, cli.freq),
         Backend::Flex => open_flex_source(radio, cli.freq),
         Backend::Icom => open_icom_source(radio, cli.freq),
         Backend::Soapy => open_soapy_source(cli, settings),
@@ -645,9 +694,9 @@ fn open_cat_source(radio: &RadioConfig) -> anyhow::Result<(Box<dyn IqSource>, De
     Ok((Box::new(src), caps))
 }
 
-/// Build the HPSDR (ethernet SDR, Protocol 2) source from radio.json. The target
-/// IP is the manual override, else the persisted selection, else the first
-/// Protocol-2 device found by a discovery scan.
+/// Build the HPSDR (ethernet SDR) source from radio.json. The target IP is the
+/// manual override, else the persisted selection, else the first device found by
+/// a discovery scan; the protocol is detected when the connection opens.
 fn open_hpsdr_source(
     radio: &RadioConfig,
     center_hz: f64,
@@ -657,32 +706,94 @@ fn open_hpsdr_source(
     } else {
         let found = sdroxide_hpsdr::discover_default();
         let dev = found.iter().find(|d| d.supported()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no HPSDR (Protocol 2) device found on the network — enter a target IP in Settings"
-            )
+            anyhow::anyhow!("no HPSDR device found on the network — enter a target IP in Settings")
         })?;
         dev.ip.parse().with_context(|| format!("discovered HPSDR IP {:?}", dev.ip))?
     };
 
-    let src = hpsdr_source::HpsdrSource::open(ip, radio.hpsdr.sample_rate_hz, center_hz)
+    let src = hpsdr_source::HpsdrSource::open(ip, &radio.hpsdr, center_hz)
         .context("opening HPSDR device")?;
-    let caps = hpsdr_caps(src.board(), src.sample_rate_hz(), src.protocol());
+    let caps = hpsdr_caps(src.board(), src.sample_rate_hz(), src.protocol(), src.has_lna_gain());
     Ok((Box::new(src), caps))
 }
 
 /// Capabilities for an HPSDR board: wideband IQ (not `audio_mode`), TX-capable,
-/// half-duplex, HF+6m coverage. The board enforces its own limits. Protocol 1
-/// boards top out at 384 kHz.
-fn hpsdr_caps(board: &str, sample_rate: f64, protocol: u8) -> DeviceCaps {
+/// half-duplex. The board enforces its own limits. Protocol 1 boards top out at
+/// 384 kHz, and a Hermes-Lite 2 samples at 76.8 MHz, so its Nyquist limit is
+/// 38.4 MHz — tuning past that on one only aliases.
+fn hpsdr_caps(board: &str, sample_rate: f64, protocol: u8, has_lna: bool) -> DeviceCaps {
+    let hermes_lite = sdroxide_hpsdr::board_has_lna_gain(board);
+    let nyquist = if hermes_lite { 38_400_000.0 } else { 61_440_000.0 };
+    let gains = if has_lna {
+        vec![sdroxide_types::GainElement {
+            name: sdroxide_hpsdr::LNA_GAIN_ELEMENT.into(),
+            direction: sdroxide_types::Direction::Rx,
+            min_db: sdroxide_hpsdr::LNA_GAIN_MIN_DB,
+            max_db: sdroxide_hpsdr::LNA_GAIN_MAX_DB,
+            step_db: 1.0,
+        }]
+    } else {
+        Vec::new()
+    };
     DeviceCaps {
         driver: "hpsdr".into(),
         label: format!("{board} (HPSDR P{protocol}, {:.3} Msps)", sample_rate / 1e6),
         rx_channels: 1,
         tx_channels: 1,
         audio_mode: false,
-        freq_ranges_rx: vec![(0.0, 61_440_000.0)],
-        freq_ranges_tx: vec![(1_800_000.0, 54_000_000.0)],
+        freq_ranges_rx: vec![(0.0, nyquist)],
+        freq_ranges_tx: vec![(1_800_000.0, if hermes_lite { 30_000_000.0 } else { 54_000_000.0 })],
         sample_rates: sdroxide_types::HpsdrConfig::rates_for(protocol).to_vec(),
+        gains,
+        ..DeviceCaps::default()
+    }
+}
+
+/// Build the RTL-SDR source from radio.json. The dongle is picked by USB
+/// serial, or the first one found when none is configured.
+fn open_rtlsdr_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    let src = rtlsdr_source::RtlSdrSource::open(&radio.rtlsdr, center_hz)
+        .context("opening RTL-SDR dongle")?;
+    let caps = rtlsdr_caps(&src);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for an RTL-SDR: wideband IQ, receive only.
+///
+/// The frequency ranges are the interesting part. A Blog V4 upconverts HF in
+/// hardware, so it is continuous from DC. Anything else reaches HF only through
+/// direct sampling, which tops out at the ADC's Nyquist limit — leaving a gap
+/// between there and the tuner's 24 MHz floor. Overlapping or disjoint ranges
+/// are both fine: `DeviceCaps::can_rx_hz` is an `any` over the list.
+fn rtlsdr_caps(src: &rtlsdr_source::RtlSdrSource) -> DeviceCaps {
+    let rate = src.sample_rate_hz();
+    let freq_ranges_rx = if src.is_blog_v4() {
+        vec![(0.0, 1_766_000_000.0)]
+    } else if src.hf_capable() {
+        vec![(0.0, 14_400_000.0), (24_000_000.0, 1_766_000_000.0)]
+    } else {
+        vec![(24_000_000.0, 1_766_000_000.0)]
+    };
+    DeviceCaps {
+        driver: "rtlsdr".into(),
+        label: format!("{} ({}, {:.3} Msps)", src.describe(), src.tuner(), rate / 1e6),
+        rx_channels: 1,
+        tx_channels: 0,
+        audio_mode: false,
+        freq_ranges_rx,
+        sample_rates: sdroxide_types::RtlSdrConfig::SAMPLE_RATES.to_vec(),
+        gains: vec![sdroxide_types::GainElement {
+            name: sdroxide_types::RtlSdrConfig::TUNER_GAIN_ELEMENT.into(),
+            direction: sdroxide_types::Direction::Rx,
+            min_db: 0.0,
+            max_db: sdroxide_types::RtlSdrConfig::GAIN_MAX_DB,
+            // The hardware only has 29 discrete steps; a request is snapped to
+            // the nearest and reported back, so a fine slider is honest enough.
+            step_db: 0.1,
+        }],
         ..DeviceCaps::default()
     }
 }
@@ -810,8 +921,8 @@ fn open_icom_source(
     radio: &RadioConfig,
     center_hz: f64,
 ) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
-    let src = icom_source::IcomSource::open(&radio.icom, center_hz)
-        .context("connecting to the Icom")?;
+    let src =
+        icom_source::IcomSource::open(&radio.icom, center_hz).context("connecting to the Icom")?;
     let caps = icom_caps(src.model(), &radio.icom.ip);
     Ok((Box::new(src), caps))
 }
@@ -858,5 +969,40 @@ fn synthetic_caps(label: &str) -> DeviceCaps {
         tx_channels: 0,
         freq_ranges_rx: vec![(0.0, 6e9)],
         ..DeviceCaps::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(oob: bool) -> Cli {
+        let mut c = Cli::parse_from(["sdroxide"]);
+        c.oob_tx = oob;
+        c
+    }
+
+    /// `--oob-tx` may only ever *loosen* the lockout. A build that never passes
+    /// it has to behave exactly as it did before the flag existed, and no
+    /// combination of flags may turn the lockout on when the config has turned
+    /// it off — that would be a surprise in the dangerous direction.
+    #[test]
+    fn the_flag_only_ever_loosens_the_band_lockout() {
+        let locked = Settings { tx_ham_only: true, ..Settings::default() };
+        let open = Settings { tx_ham_only: false, ..Settings::default() };
+
+        assert!(cli(false).tx_ham_only(&locked), "the default must keep the lockout");
+        assert!(!cli(true).tx_ham_only(&locked), "--oob-tx must lift it");
+        // Already unlocked in the config: the flag changes nothing either way.
+        assert!(!cli(false).tx_ham_only(&open));
+        assert!(!cli(true).tx_ham_only(&open));
+    }
+
+    /// The flag is opt-in on the command line and nowhere else.
+    #[test]
+    fn the_flag_is_off_unless_asked_for() {
+        assert!(!Cli::parse_from(["sdroxide"]).oob_tx);
+        assert!(Cli::parse_from(["sdroxide", "--oob-tx"]).oob_tx);
+        assert!(Settings::default().tx_ham_only, "the shipped default is locked");
     }
 }

@@ -156,9 +156,8 @@ struct RawOvation {
 /// empty or malformed one must leave the previous picture on screen rather than
 /// blanking the oval.
 pub fn parse_ovation(json: &str) -> Option<AuroraOval> {
-    let raw: RawOvation = serde_json::from_str(json)
-        .map_err(|e| tracing::warn!("OVATION parse failed: {e}"))
-        .ok()?;
+    let raw: RawOvation =
+        serde_json::from_str(json).map_err(|e| tracing::warn!("OVATION parse failed: {e}")).ok()?;
     if raw.coordinates.is_empty() {
         return None;
     }
@@ -174,8 +173,7 @@ pub fn parse_ovation(json: &str) -> Option<AuroraOval> {
         grid[row * GRID_W + col] = value.clamp(0, 100) as u8;
     }
 
-    let observed_unix =
-        raw.observation_time.as_deref().and_then(timefmt::parse_unix).unwrap_or(0);
+    let observed_unix = raw.observation_time.as_deref().and_then(timefmt::parse_unix).unwrap_or(0);
     Some(AuroraOval {
         observed_unix,
         // A grid with no forecast stamp is valid for when it was observed;
@@ -469,10 +467,19 @@ mod tests {
 
     #[test]
     fn the_power_index_matches_noaas_activity_table() {
-        for (gw, level) in
-            [(0.0, 1), (4.9, 1), (5.0, 2), (7.0, 3), (12.0, 4), (16.0, 5), (25.0, 6), (40.0, 7),
-             (60.0, 8), (120.0, 9), (200.0, 10)]
-        {
+        for (gw, level) in [
+            (0.0, 1),
+            (4.9, 1),
+            (5.0, 2),
+            (7.0, 3),
+            (12.0, 4),
+            (16.0, 5),
+            (25.0, 6),
+            (40.0, 7),
+            (60.0, 8),
+            (120.0, 9),
+            (200.0, 10),
+        ] {
             assert_eq!(HemisphericPower::index(gw), level, "{gw} GW");
         }
         assert_eq!(HemisphericPower::words(3.0), "quiet");

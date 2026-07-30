@@ -29,19 +29,13 @@ pub fn show(ui: &mut Ui, id: egui::Id, hz: f64, wheel: WheelSettings) -> Option<
             let step = 10i64.pow(p);
             let digit = (freq / step) % 10;
             let leading_zero = p > 0 && freq < step;
-            let color = if leading_zero {
-                Color32::from_gray(70)
-            } else {
-                Color32::from_rgb(255, 209, 66)
-            };
+            let color =
+                if leading_zero { Color32::from_gray(70) } else { Color32::from_rgb(255, 209, 66) };
 
             let resp = ui
                 .add(
                     Label::new(
-                        RichText::new(format!("{digit}"))
-                            .monospace()
-                            .size(DIGIT_SIZE)
-                            .color(color),
+                        RichText::new(format!("{digit}")).monospace().size(DIGIT_SIZE).color(color),
                     )
                     .sense(Sense::click()),
                 )
@@ -83,9 +77,7 @@ pub fn show(ui: &mut Ui, id: egui::Id, hz: f64, wheel: WheelSettings) -> Option<
                 }
             }
         }
-        ui.add(Label::new(
-            RichText::new(" Hz").size(12.0).color(Color32::from_gray(140)),
-        ));
+        ui.add(Label::new(RichText::new(" Hz").size(12.0).color(Color32::from_gray(140))));
     });
 
     (freq != orig).then_some(freq as f64)

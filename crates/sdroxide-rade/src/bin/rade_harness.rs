@@ -228,12 +228,7 @@ fn rx(
     Ok(())
 }
 
-fn tx(
-    input: &Path,
-    output: &Path,
-    features_path: Option<PathBuf>,
-    no_eoo: bool,
-) -> Result<()> {
+fn tx(input: &Path, output: &Path, features_path: Option<PathBuf>, no_eoo: bool) -> Result<()> {
     let (audio, rate) = read_wav(input)?;
     eprintln!("input: {} samples @ {rate} Hz ({:.1} s)", audio.len(), audio.len() as f64 / rate);
 
@@ -249,9 +244,9 @@ fn tx(
     let mut pcm = Vec::with_capacity(frame);
 
     let emit = |block: &[f32],
-                    rade: &mut Rade,
-                    iq: &mut Vec<Complex32>,
-                    out: &mut Option<BufWriter<File>>|
+                rade: &mut Rade,
+                iq: &mut Vec<Complex32>,
+                out: &mut Option<BufWriter<File>>|
      -> Result<()> {
         if let Some(f) = out.as_mut() {
             for v in block {
@@ -304,8 +299,7 @@ fn tx(
 
 /// Read a 16-bit mono WAV as `+/-1.0` floats, returning the samples and rate.
 fn read_wav(path: &Path) -> Result<(Vec<f32>, f64)> {
-    let mut r = hound::WavReader::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let mut r = hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
     let spec = r.spec();
     if spec.channels != 1 {
         bail!("{}: expected mono, got {} channels", path.display(), spec.channels);
@@ -313,10 +307,8 @@ fn read_wav(path: &Path) -> Result<(Vec<f32>, f64)> {
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
         bail!("{}: expected 16-bit PCM", path.display());
     }
-    let samples = r
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / 32768.0))
-        .collect::<Result<Vec<_>, _>>()?;
+    let samples =
+        r.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0)).collect::<Result<Vec<_>, _>>()?;
     Ok((samples, spec.sample_rate as f64))
 }
 

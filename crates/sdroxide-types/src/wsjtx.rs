@@ -26,12 +26,7 @@ pub struct WsjtxConfig {
 
 impl Default for WsjtxConfig {
     fn default() -> Self {
-        WsjtxConfig {
-            enabled: false,
-            host: "127.0.0.1".into(),
-            port: 2237,
-            id: "WSJT-X".into(),
-        }
+        WsjtxConfig { enabled: false, host: "127.0.0.1".into(), port: 2237, id: "WSJT-X".into() }
     }
 }
 

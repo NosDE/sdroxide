@@ -81,14 +81,10 @@ impl eframe::App for SolarApp {
         // does. `preview` has no equivalent: a clicked-but-unanswered decode is
         // state of the main window, which this tab is not.
         let now_t = ui.input(|i| i.time);
-        self.stations.observe(&self.net.decodes, now_t);
+        self.stations.observe(&self.net.decodes, now_t, crate::time::now_unix());
         self.state.set_qth(&self.net.my_grid.clone());
-        self.state.digi = self.stations.traffic(
-            now_t,
-            self.net.dx_grid.as_deref(),
-            None,
-            self.net.transmitting,
-        );
+        self.state.digi =
+            self.stations.traffic(now_t, self.net.dx_grid.as_deref(), None, self.net.transmitting);
 
         overlay::ui(ui, &mut self.state);
 

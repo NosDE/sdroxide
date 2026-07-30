@@ -62,7 +62,11 @@ pub fn grid_bearing(a: &str, b: &str) -> Option<f64> {
 }
 
 /// Points sampled along the great-circle path a→b as (lat, lon), inclusive.
-pub fn great_circle_points((lat1, lon1): (f64, f64), (lat2, lon2): (f64, f64), n: usize) -> Vec<(f64, f64)> {
+pub fn great_circle_points(
+    (lat1, lon1): (f64, f64),
+    (lat2, lon2): (f64, f64),
+    n: usize,
+) -> Vec<(f64, f64)> {
     let (p1, l1) = (lat1.to_radians(), lon1.to_radians());
     let (p2, l2) = (lat2.to_radians(), lon2.to_radians());
     let d = {

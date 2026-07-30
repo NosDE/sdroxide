@@ -12,6 +12,8 @@ pub mod chrome;
 mod colormap;
 mod digi_map;
 mod download;
+mod fuzzy;
+mod hell;
 mod help;
 mod input;
 #[cfg(feature = "remote")]
@@ -25,6 +27,7 @@ pub mod theme;
 mod time;
 mod view;
 mod waterfall_gpu;
+mod wefax;
 mod widgets;
 
 pub use app::SdroxideApp;

@@ -68,8 +68,7 @@ fn exp_int_e1(x: f32) -> f32 {
     if x < 1.0 {
         -x.ln() - 0.577_215_66
             + x * (0.999_991_93
-                + x * (-0.249_910_55
-                    + x * (0.055_199_68 + x * (-0.009_760_04 + x * 0.001_078_57))))
+                + x * (-0.249_910_55 + x * (0.055_199_68 + x * (-0.009_760_04 + x * 0.001_078_57))))
     } else {
         let num = x * x + 2.334_733 * x + 0.250_621;
         let den = x * x + 3.330_657 * x + 1.681_534;
@@ -119,8 +118,7 @@ impl SpectralNr {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(N);
         let ifft = planner.plan_fft_inverse(N);
-        let scratch_len =
-            fft.get_inplace_scratch_len().max(ifft.get_inplace_scratch_len());
+        let scratch_len = fft.get_inplace_scratch_len().max(ifft.get_inplace_scratch_len());
         // Periodic Hann window.
         let window: Vec<f32> = (0..N)
             .map(|n| 0.5 - 0.5 * (std::f32::consts::TAU * n as f32 / N as f32).cos())
@@ -222,9 +220,7 @@ impl SpectralNr {
             } else if k == half {
                 0.5 * (self.mag[half].powi(2) + self.mag[half - 1].powi(2))
             } else {
-                0.25 * self.mag[k - 1].powi(2)
-                    + 0.5 * power
-                    + 0.25 * self.mag[k + 1].powi(2)
+                0.25 * self.mag[k - 1].powi(2) + 0.5 * power + 0.25 * self.mag[k + 1].powi(2)
             };
 
             if !self.learned {

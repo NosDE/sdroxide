@@ -69,8 +69,8 @@ fn run<F>(
             }
             Err(e) => {
                 if last_err.as_deref() != Some(e.as_str()) {
-                    let _ = events
-                        .send(NetEvent::Status(Some(format!("{} feed: {e}", kind.label()))));
+                    let _ =
+                        events.send(NetEvent::Status(Some(format!("{} feed: {e}", kind.label()))));
                     last_err = Some(e);
                 }
             }

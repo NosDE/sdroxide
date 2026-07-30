@@ -4,10 +4,10 @@
 //! "Apply / reconnect".
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use sdroxide_radio::{Complex32, EngineConfig, IqSource, Result, start_engine};
+use sdroxide_radio::{Complex32, EngineConfig, EngineSwap, IqSource, Result, start_engine};
 use sdroxide_types::{DeviceCaps, RadioEvent};
 
 const RATE: f64 = 48_000.0;
@@ -66,6 +66,38 @@ impl IqSource for Online {
     }
 }
 
+/// A dongle: it holds its device exclusively, so it has to be stood down
+/// *before* its replacement is built. `claimed` stands in for the kernel's
+/// claim on the USB interface — the factory below refuses to open anything
+/// while it is still held, exactly as a second `claim_interface` is refused.
+struct Exclusive {
+    claimed: Arc<AtomicBool>,
+}
+
+impl IqSource for Exclusive {
+    fn sample_rate(&self) -> f64 {
+        RATE
+    }
+    fn center_hz(&self) -> f64 {
+        CENTER
+    }
+    fn set_center_hz(&mut self, _hz: f64) -> Result<()> {
+        Ok(())
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        std::thread::sleep(Duration::from_millis(5));
+        let n = buf.len().min(256);
+        buf[..n].fill(Complex32::new(0.0, 0.0));
+        Ok(n)
+    }
+    fn describe(&self) -> String {
+        "dongle".into()
+    }
+    fn release(&mut self) {
+        self.claimed.store(false, Ordering::SeqCst);
+    }
+}
+
 fn caps(driver: &str) -> DeviceCaps {
     DeviceCaps {
         driver: driver.into(),
@@ -116,6 +148,50 @@ fn offline_interface_attaches_by_itself() {
         after_connect,
         "a connected interface must not be reopened again"
     );
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}
+
+/// Applying a settings change on a running dongle must not fail against the
+/// dongle itself. The outgoing source is released before the factory runs, so
+/// the replacement finds the device free rather than "held by another program".
+#[test]
+fn a_settings_change_releases_the_running_device_first() {
+    let claimed = Arc::new(AtomicBool::new(true));
+    let held = Arc::clone(&claimed);
+    let reopen: sdroxide_radio::ReopenFn = Box::new(move |_center: f64| {
+        if held.load(Ordering::SeqCst) {
+            return Err("the device is held by another program".into());
+        }
+        Ok((Box::new(Online) as Box<dyn IqSource>, caps("live")))
+    });
+
+    let cfg = EngineConfig { reopen: Some(reopen), ..Default::default() };
+    let source = Exclusive { claimed: Arc::clone(&claimed) };
+    let mut h = start_engine(Box::new(source), caps("dongle"), cfg);
+    let thread = h.thread.take();
+
+    // Settings → Radio → Apply.
+    h.swap_tx.send(EngineSwap::ReopenSource).expect("engine is running");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut swapped = false;
+    let mut failure = None;
+    while !swapped && Instant::now() < deadline {
+        while let Ok(ev) = h.event_rx.try_recv() {
+            match ev {
+                RadioEvent::Capabilities(c) => swapped |= c.driver == "live",
+                RadioEvent::Notice(Some(n)) if n.contains("failed") => failure = Some(n),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(failure, None, "the interface change reported an error");
+    assert!(swapped, "the engine should have swapped to the new interface");
 
     drop(h.cmd_tx);
     if let Some(t) = thread {

@@ -114,7 +114,24 @@ impl RemoteController {
                 self.pending.push_back(RadioEvent::SstvImage { image_id, mode, w, h, png })
             }
             ServerMsg::SstvStatus(s) => self.pending.push_back(RadioEvent::SstvStatus(s)),
+            ServerMsg::WefaxLine { image_id, y, gray } => {
+                self.pending.push_back(RadioEvent::WefaxLine { image_id, y, gray })
+            }
+            ServerMsg::WefaxImage { image_id, w, h, png } => {
+                self.pending.push_back(RadioEvent::WefaxImage { image_id, w, h, png })
+            }
+            ServerMsg::WefaxStatus(s) => self.pending.push_back(RadioEvent::WefaxStatus(s)),
+            ServerMsg::RifpRows { image_id, y, w, h, rows } => {
+                self.pending.push_back(RadioEvent::RifpRows { image_id, y, w, h, rows })
+            }
+            ServerMsg::RifpImage { image_id, meta, png } => {
+                self.pending.push_back(RadioEvent::RifpImage { image_id, meta, png })
+            }
+            ServerMsg::RifpStatus(s) => self.pending.push_back(RadioEvent::RifpStatus(s)),
             ServerMsg::DigiImage { png } => self.pending.push_back(RadioEvent::DigiImage { png }),
+            ServerMsg::HellColumns { seq, rows, cols } => {
+                self.pending.push_back(RadioEvent::HellColumns { seq, rows, cols })
+            }
             ServerMsg::VoiceStatus(v) => {
                 self.voice_recording = v.recording.is_some();
                 self.pending.push_back(RadioEvent::VoiceStatus(v));
@@ -124,9 +141,9 @@ impl RemoteController {
             ServerMsg::CallsignResult(c) => self.pending.push_back(RadioEvent::CallsignResult(c)),
             ServerMsg::Upload(r) => self.pending.push_back(RadioEvent::Upload(r)),
             ServerMsg::Confirmations(r) => self.pending.push_back(RadioEvent::Confirmations(r)),
-            ServerMsg::RigctldStatus { running, addr, clients, error } => self
-                .pending
-                .push_back(RadioEvent::RigctldStatus { running, addr, clients, error }),
+            ServerMsg::RigctldStatus { running, addr, clients, error } => {
+                self.pending.push_back(RadioEvent::RigctldStatus { running, addr, clients, error })
+            }
             ServerMsg::TciServerStatus { running, addr, clients, error } => self
                 .pending
                 .push_back(RadioEvent::TciServerStatus { running, addr, clients, error }),
@@ -174,17 +191,16 @@ impl RadioController for RemoteController {
                 }
                 WsEvent::Message(WsMessage::Binary(bytes)) => match decode::<ServerMsg>(&bytes) {
                     Ok(msg) => self.on_server_msg(msg),
-                    Err(e) => self.pending.push_back(RadioEvent::ConnectionLost(format!(
-                        "protocol error: {e}"
-                    ))),
+                    Err(e) => self
+                        .pending
+                        .push_back(RadioEvent::ConnectionLost(format!("protocol error: {e}"))),
                 },
                 WsEvent::Message(_) => {}
                 WsEvent::Error(e) => {
                     self.pending.push_back(RadioEvent::ConnectionLost(e));
                 }
                 WsEvent::Closed => {
-                    self.pending
-                        .push_back(RadioEvent::ConnectionLost("connection closed".into()));
+                    self.pending.push_back(RadioEvent::ConnectionLost("connection closed".into()));
                 }
             }
         }

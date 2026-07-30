@@ -97,11 +97,7 @@ fn rotate_ccw(src: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
 pub fn image_bitmap(bytes: &[u8]) -> Option<(Vec<u8>, u16, u16)> {
     let img = image::load_from_memory(bytes).ok()?;
     let img = img
-        .resize(
-            FREQ_BINS as u32,
-            IMG_MAX_ROWS as u32,
-            image::imageops::FilterType::Triangle,
-        )
+        .resize(FREQ_BINS as u32, IMG_MAX_ROWS as u32, image::imageops::FilterType::Triangle)
         .to_luma8();
     let (w, h) = (img.width() as u16, img.height() as u16);
     let mut gray = img.into_raw();
@@ -134,9 +130,7 @@ pub fn gray_to_png(gray: &[u8], w: u16, h: u16) -> Option<Vec<u8>> {
     }
     let img = image::RgbImage::from_raw(w as u32, h as u32, rgb)?;
     let mut buf = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .ok()?;
+    image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png).ok()?;
     Some(buf.into_inner())
 }
 

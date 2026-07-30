@@ -119,7 +119,9 @@ impl Cache {
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .map(
+            |c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' },
+        )
         .collect();
     if s.is_empty() || s.starts_with('.') { format!("_{s}") } else { s }
 }

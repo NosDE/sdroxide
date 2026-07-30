@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use sdroxide_types::{
     CallsignInfo, Command, Decode, DeviceCaps, DigiStatus, MemoryChannel, Meters, QsoRecord,
-    RadioState, SkimmerSpot, Spot, SpectrumFrame, SstvMode, SstvStatus, UploadResult, VoiceStatus,
+    RadioState, RifpMeta, RifpStatus, SkimmerSpot, SpectrumFrame, Spot, SstvMode, SstvStatus,
+    UploadResult, VoiceStatus,
 };
 
 /// Bump on any incompatible change to the message enums (this includes the
@@ -62,7 +63,47 @@ use sdroxide_types::{
 /// v19: voice keyer — `Command::VoiceRecord`/`VoicePlay`/`VoicePreview`/
 /// `VoiceClear`/`VoiceRename` and `ServerMsg::VoiceStatus` (both extend the
 /// postcard discriminant space).
-pub const PROTO_VERSION: u16 = 19;
+/// v20: Hellschreiber — `ServerMsg::HellColumns` plus `DigiConfig`'s
+/// `hell_variant` / `hell_rx_agc`, which both ends must agree on because
+/// `DigiStatus` carries the config. (`Mode::Hell` alone would have been
+/// compatible: it is appended to the enum, so no existing discriminant moves.)
+/// v21: FT8 DXpedition mode — `DigiConfig`'s `dxped_mode` / `fox_slots`,
+/// `DigiStatus.fox_queue`, and `Decode.rr73_to` (the RR73 half of a Fox
+/// message, which is how a Hound learns its contact completed). Postcard is not
+/// self-describing, so both ends must agree on every one of those fields.
+/// v22: clock-offset monitoring — `DigiStatus.clock_offset_s`.
+/// v23: directed CQs — `Decode.cq_dx` became `Decode.cq_to`, the modifier
+/// itself (`DX`, `EU`, `JA`, `POTA`, …) rather than a single DX flag.
+/// v24: the FT8/FT4 call queue — `Command::DigiQueueAdd`/`DigiQueueRemove` and
+/// `DigiStatus.call_queue`.
+/// v25: automatic transmit-frequency choice — `DigiConfig.auto_tx_freq`.
+/// v26: RIFP (draft-dulaunoy-rifp-00) — `Mode::Rifp` and `Band::M70` (both
+/// appended, so no existing discriminant moves), `Command::RifpTx` /
+/// `RifpDropSession`, `ServerMsg::RifpRows` / `RifpImage` / `RifpStatus`, and
+/// `DigiConfig`'s `rifp_*` fields, which both ends must agree on because
+/// `DigiStatus` carries the config.
+/// v27: WFM broadcast stereo — `RxState.wfm_stereo`, `Meters.stereo` and
+/// `Command::SetWfmStereo`. The command is appended so no existing discriminant
+/// moves, but postcard is not self-describing, so the two added struct fields
+/// change the layout of every message carrying `RadioState` or `Meters`.
+/// v28: JS8 — `Mode::Js8`, the `js8_*` fields on `DigiConfig`, and
+/// `DigiStatus.js8` carrying the heard list, the reassembled conversation and
+/// transmit-queue progress. No message enum gained a variant, but postcard is
+/// not self-describing and the added struct fields change the layout of every
+/// message carrying `DigiConfig` or `DigiStatus`.
+/// v29: JS8 beaconing — `DigiConfig`'s `js8_hb_ack` (answer a heard heartbeat
+/// with a signal report) and `js8_hb_anywhere` (beacon on the working frequency
+/// instead of the 500–1000 Hz sub-band), plus `Js8Status.hb_hz`, the frequency
+/// the last beacon actually went out on. `Js8Status.next_hb_in_s` is now
+/// populated rather than always `None`, which is a behaviour change but not a
+/// layout one. Both ends must agree on the three added fields, postcard being
+/// what it is.
+/// v30: broadcast station labels — new `SpotKind::Broadcast`, which extends the
+/// postcard discriminant space of `ServerMsg::Spots` exactly as `FreeDv` did in
+/// v14. The engine never emits it (the stations are synthesised client-side from
+/// a bundled table), but the enum both ends decode has changed shape, so they
+/// must agree on it.
+pub const PROTO_VERSION: u16 = 30;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -93,10 +134,16 @@ pub struct AudioCaps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Hello { proto: u16, audio: AudioCaps },
+    Hello {
+        proto: u16,
+        audio: AudioCaps,
+    },
     Command(Command),
     /// 20 ms mic frame in the codec negotiated at Hello.
-    MicFrame { seq: u32, payload: Vec<u8> },
+    MicFrame {
+        seq: u32,
+        payload: Vec<u8>,
+    },
     Ping(u64),
 }
 
@@ -115,7 +162,10 @@ pub enum ServerMsg {
     Spectrum(SpectrumFrame),
     Meters(Meters),
     Memories(Vec<MemoryChannel>),
-    RxAudio { seq: u32, payload: Vec<u8> },
+    RxAudio {
+        seq: u32,
+        payload: Vec<u8>,
+    },
     Pong(u64),
     /// Another client already holds the (single) session.
     Busy,
@@ -127,11 +177,61 @@ pub enum ServerMsg {
     // Skimmers (CW etc.).
     SkimmerSpots(Vec<SkimmerSpot>),
     // SSTV image mode.
-    SstvLine { image_id: u32, y: u16, rgb: Vec<u8> },
-    SstvImage { image_id: u32, mode: SstvMode, w: u16, h: u16, png: Vec<u8> },
+    SstvLine {
+        image_id: u32,
+        y: u16,
+        rgb: Vec<u8>,
+    },
+    SstvImage {
+        image_id: u32,
+        mode: SstvMode,
+        w: u16,
+        h: u16,
+        png: Vec<u8>,
+    },
     SstvStatus(SstvStatus),
+    // Weather fax (receive only).
+    WefaxLine {
+        image_id: u32,
+        y: u16,
+        gray: Vec<u8>,
+    },
+    WefaxImage {
+        image_id: u32,
+        w: u16,
+        h: u16,
+        png: Vec<u8>,
+    },
+    WefaxStatus(sdroxide_types::WefaxStatus),
+    // RIFP image mode.
+    /// Reassembled raster rows of an incoming picture (grayscale, `w` per row).
+    RifpRows {
+        image_id: u32,
+        y: u16,
+        w: u16,
+        h: u16,
+        rows: Vec<u8>,
+    },
+    /// A completed, digest-verified picture (PNG bytes) and its manifest facts.
+    RifpImage {
+        image_id: u32,
+        meta: RifpMeta,
+        png: Vec<u8>,
+    },
+    RifpStatus(RifpStatus),
     /// FSQ image: a completed received picture (PNG bytes).
-    DigiImage { png: Vec<u8> },
+    DigiImage {
+        png: Vec<u8>,
+    },
+    /// Hellschreiber: a batch of received dot columns, column-major, 0 = black.
+    /// `seq` is the absolute column index so a client can detect a dropped
+    /// batch — this lane drops rather than blocks when it backs up, and Hell has
+    /// no framing of its own to resynchronise against.
+    HellColumns {
+        seq: u64,
+        rows: u8,
+        cols: Vec<u8>,
+    },
     /// Voice keyer: slot contents plus what is being recorded or transmitted.
     VoiceStatus(VoiceStatus),
     // Network cockpit.
@@ -141,10 +241,20 @@ pub enum ServerMsg {
     Upload(UploadResult),
     Confirmations(Vec<QsoRecord>),
     /// Built-in TCI server status (listener up, bind address, client count).
-    TciServerStatus { running: bool, addr: String, clients: usize, error: Option<String> },
+    TciServerStatus {
+        running: bool,
+        addr: String,
+        clients: usize,
+        error: Option<String>,
+    },
     /// Built-in rigctld server status, so the settings dialog on a remote
     /// client can show what the engine's listener is doing.
-    RigctldStatus { running: bool, addr: String, clients: usize, error: Option<String> },
+    RigctldStatus {
+        running: bool,
+        addr: String,
+        clients: usize,
+        error: Option<String>,
+    },
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtoError> {
@@ -201,6 +311,48 @@ mod tests {
             }),
         ];
         for m in &sstv {
+            let bytes = encode(m).unwrap();
+            let back: ServerMsg = decode(&bytes).unwrap();
+            assert_eq!(&back, m);
+        }
+
+        // RIFP carries pixels, a manifest summary, and a per-chunk map.
+        let rifp = [
+            ServerMsg::RifpRows { image_id: 2, y: 11, w: 4, h: 20, rows: vec![9, 8, 7, 6] },
+            ServerMsg::RifpImage {
+                image_id: 2,
+                meta: RifpMeta {
+                    session: "0123456789abcdef".into(),
+                    filename: "oe1test.png".into(),
+                    sender: Some("OE1TEST".into()),
+                    hint: None,
+                    media_type: "image/png".into(),
+                    content_encoding: "identity".into(),
+                    width: 320,
+                    height: 240,
+                    bits_per_pixel: 4,
+                    encoded_size: 9_000,
+                    chunk_count: 47,
+                    chunks_first_pass: 45,
+                },
+                png: vec![0x89, 0x50, 0x4e, 0x47],
+            },
+            ServerMsg::RifpStatus(RifpStatus {
+                tx_active: true,
+                tx_progress: 0.25,
+                sessions: vec![sdroxide_types::RifpSession {
+                    session: "0123456789abcdef".into(),
+                    sender: None,
+                    have_manifest: true,
+                    have: 3,
+                    total: 47,
+                    map: vec![0b0000_0111],
+                    idle_s: 2,
+                }],
+                ..RifpStatus::default()
+            }),
+        ];
+        for m in &rifp {
             let bytes = encode(m).unwrap();
             let back: ServerMsg = decode(&bytes).unwrap();
             assert_eq!(&back, m);

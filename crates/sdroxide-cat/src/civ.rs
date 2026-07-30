@@ -46,18 +46,23 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         Mode::Usb
         | Mode::Digu
         | Mode::Ft8
+        | Mode::Js8
         | Mode::Ft4
         | Mode::Psk
         | Mode::Rtty
         | Mode::Sstv
+        | Mode::Wefax
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
+        | Mode::Hell
         | Mode::RfPaint
         | Mode::Rade => 0x01,
         Mode::Am | Mode::Sam | Mode::Dsb => 0x02,
         Mode::Cw => 0x03,
-        Mode::Nfm | Mode::Wfm => 0x05,
+        // RIFP is FSK on the carrier, so a CAT rig has to be in FM for the
+        // dial to mean what RIFP means by it.
+        Mode::Nfm | Mode::Wfm | Mode::Rifp => 0x05,
         Mode::Spec => 0x01,
     }
 }
@@ -292,8 +297,11 @@ mod tests {
         buf.extend_from_slice(&frame(0x70, 0x03, &encode_freq(7_055_000.0))); // "reply"
         let frames = parse_frames(&mut buf);
         // Both parse; the freq one is cmd 0x03 with 5 data bytes.
-        let freqs: Vec<f64> =
-            frames.iter().filter(|f| f.cmd == 0x03 && f.data.len() >= 5).filter_map(|f| decode_freq(&f.data)).collect();
+        let freqs: Vec<f64> = frames
+            .iter()
+            .filter(|f| f.cmd == 0x03 && f.data.len() >= 5)
+            .filter_map(|f| decode_freq(&f.data))
+            .collect();
         assert_eq!(freqs, vec![7_055_000.0]);
         assert!(buf.is_empty());
     }

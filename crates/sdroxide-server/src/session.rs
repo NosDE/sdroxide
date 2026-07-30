@@ -98,8 +98,7 @@ async fn run_session(socket: &mut WebSocket, shared: &Arc<Shared>) {
     // --- register lanes -----------------------------------------------
     let (rel_tx, mut rel_rx) = mpsc::channel::<ServerMsg>(256);
     let (aud_tx, mut aud_rx) = mpsc::channel::<ServerMsg>(8);
-    *shared.session.lock().unwrap() =
-        Some(SessionTx { reliable: rel_tx, audio: aud_tx, rx_codec });
+    *shared.session.lock().unwrap() = Some(SessionTx { reliable: rel_tx, audio: aud_tx, rx_codec });
 
     let (mut ws_tx, mut ws_rx) = futures_util::StreamExt::split(socket);
 

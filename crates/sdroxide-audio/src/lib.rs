@@ -249,13 +249,11 @@ fn alsa_cards() -> HashMap<String, AlsaCard> {
                     let id = head[lb + 1..rb].trim().to_string();
                     // Header tail after "]: <driver> - <shortname>".
                     let shortname = head[rb + 1..].split(" - ").nth(1).unwrap_or("").trim();
-                    let pretty = prettify_longname(lines.get(i + 1).map(|s| s.trim()).unwrap_or(""));
+                    let pretty =
+                        prettify_longname(lines.get(i + 1).map(|s| s.trim()).unwrap_or(""));
                     // Vendor = longname with the model (shortname) trimmed off.
-                    let vendor = pretty
-                        .strip_suffix(shortname)
-                        .unwrap_or(&pretty)
-                        .trim()
-                        .to_string();
+                    let vendor =
+                        pretty.strip_suffix(shortname).unwrap_or(&pretty).trim().to_string();
                     let usbid = std::fs::read_to_string(format!("/proc/asound/card{index}/usbid"))
                         .map(|s| s.trim().to_string())
                         .unwrap_or_default();
@@ -544,15 +542,7 @@ pub fn start_output(
         "audio output running"
     );
 
-    Ok((
-        AudioOutput {
-            _stream: stream,
-            sample_rate: rate as f64,
-            channels,
-            underruns,
-        },
-        producer,
-    ))
+    Ok((AudioOutput { _stream: stream, sample_rate: rate as f64, channels, underruns }, producer))
 }
 
 #[cfg(test)]

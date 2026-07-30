@@ -105,8 +105,13 @@ impl IcomHandle {
         // Log in, then acknowledge the token twice — the radio only starts
         // talking after the second acknowledgement.
         let mut inner_seq = 0u16;
-        let login =
-            control::login(control.local_sid, control.remote_sid, inner_seq, &cfg.username, &cfg.password);
+        let login = control::login(
+            control.local_sid,
+            control.remote_sid,
+            inner_seq,
+            &cfg.username,
+            &cfg.password,
+        );
         inner_seq += 1;
         control.send_tracked(login);
 
@@ -525,9 +530,7 @@ impl Worker {
         match msg {
             Ctrl::SetFreq(hz) => self.send_civ(civ::set_freq_frame(self.civ_addr, hz)),
             Ctrl::SetMode(m) => self.send_civ(civ::set_mode_frame(self.civ_addr, m)),
-            Ctrl::SetSquelch(level) => {
-                self.send_civ(civ::set_squelch_frame(self.civ_addr, level))
-            }
+            Ctrl::SetSquelch(level) => self.send_civ(civ::set_squelch_frame(self.civ_addr, level)),
             Ctrl::SetPtt(on) => {
                 self.ptt = on;
                 if !on {

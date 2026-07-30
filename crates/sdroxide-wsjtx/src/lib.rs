@@ -96,7 +96,10 @@ impl WsjtxUdp {
     /// sending both is what WSJT-X does.
     pub fn qso_logged(&self, q: &QsoRecord) {
         self.send(msg::qso_logged(&self.id, q));
-        self.send(msg::logged_adif(&self.id, &sdroxide_types::qso_log_to_adif(std::slice::from_ref(q))));
+        self.send(msg::logged_adif(
+            &self.id,
+            &sdroxide_types::qso_log_to_adif(std::slice::from_ref(q)),
+        ));
     }
 
     /// We're going away — clients drop us from their station lists.

@@ -181,11 +181,7 @@ fn convert_cme(r: RawCme) -> Option<CmeEvent> {
 
     let analysis = match chosen {
         Some(a) => Some(CmeAnalysis {
-            t21_5_unix: a
-                .time21_5
-                .as_deref()
-                .and_then(timefmt::parse_unix)
-                .unwrap_or(start_unix),
+            t21_5_unix: a.time21_5.as_deref().and_then(timefmt::parse_unix).unwrap_or(start_unix),
             lat_deg: a.latitude?,
             lon_west_deg: a.longitude?,
             half_angle_deg: a.half_angle.unwrap_or(DEFAULT_HALF_ANGLE),
@@ -204,9 +200,7 @@ fn convert_cme(r: RawCme) -> Option<CmeEvent> {
                     .unwrap_or(start_unix),
                 lat_deg: lat,
                 lon_west_deg: lon,
-                half_angle_deg: fallback
-                    .and_then(|a| a.half_angle)
-                    .unwrap_or(DEFAULT_HALF_ANGLE),
+                half_angle_deg: fallback.and_then(|a| a.half_angle).unwrap_or(DEFAULT_HALF_ANGLE),
                 speed_km_s: fallback.and_then(|a| a.speed).unwrap_or(DEFAULT_SPEED),
                 kind: fallback.and_then(|a| a.kind.clone()).unwrap_or_default(),
                 estimated: true,
@@ -319,17 +313,19 @@ mod tests {
         // Some fixture records have no source region and no end time.
         assert!(flares.iter().any(|f| f.location.is_some()));
 
-        let sev = |c: &str| FlareEvent {
-            id: String::new(),
-            begin_unix: 0,
-            peak_unix: 0,
-            end_unix: None,
-            class: c.into(),
-            location: None,
-            active_region: None,
-            link: String::new(),
-        }
-        .severity();
+        let sev = |c: &str| {
+            FlareEvent {
+                id: String::new(),
+                begin_unix: 0,
+                peak_unix: 0,
+                end_unix: None,
+                class: c.into(),
+                location: None,
+                active_region: None,
+                link: String::new(),
+            }
+            .severity()
+        };
         assert!(sev("X2.4") > sev("M1.1"));
         assert!(sev("M9.9") > sev("M1.0"));
         assert!(sev("C1.0") > sev("B5.0"));
@@ -343,9 +339,10 @@ mod tests {
         assert_eq!(parse_flares("[]").unwrap().len(), 0);
         assert!(parse_cmes("not json").is_err());
         // A record missing every optional field must still parse.
-        assert_eq!(parse_cmes(r#"[{"activityID":"x","startTime":"2026-01-01T00:00Z"}]"#)
-            .unwrap()
-            .len(), 1);
+        assert_eq!(
+            parse_cmes(r#"[{"activityID":"x","startTime":"2026-01-01T00:00Z"}]"#).unwrap().len(),
+            1
+        );
         // ...and one missing the *required* start time is skipped, not fatal.
         assert_eq!(parse_cmes(r#"[{"activityID":"x"}]"#).unwrap().len(), 0);
     }

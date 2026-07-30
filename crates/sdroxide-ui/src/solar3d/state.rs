@@ -95,9 +95,7 @@ impl Focus {
             Focus::Moon => "Moon",
             Focus::EarthMoon => "Earth + Moon",
             Focus::Planet(p) => p.name(),
-            Focus::Satellite(i) => {
-                sdroxide_solar::planets::MOONS.get(i).map_or("Sun", |m| m.name)
-            }
+            Focus::Satellite(i) => sdroxide_solar::planets::MOONS.get(i).map_or("Sun", |m| m.name),
         }
     }
 
@@ -147,6 +145,33 @@ pub struct SolarUi {
     pub data: Option<Arc<Mutex<SolarData>>>,
     /// FT8/FT4 traffic to plot on the globe.
     pub digi: DigiTraffic,
+    /// Award coverage to paint: every DXCC entity, placed, and how far along it
+    /// is in the logbook. Republished by the host whenever the log changes.
+    ///
+    /// Empty in the browser tab: the logbook lives in the main window, and the
+    /// `/solar-ws` relay carries live data rather than the operator's records.
+    /// The layer chip goes away with it rather than pretending to paint.
+    pub awards: std::sync::Arc<Vec<sdroxide_types::EntitySlot>>,
+    /// Where the activity time-lapse's replay head sits, in seconds before now.
+    /// Zero is live, which is where it starts every run: a globe that came back
+    /// up showing forty minutes ago would read as a stalled feed.
+    pub lapse_back_s: f64,
+    /// Whether the replay head is sweeping forward on its own.
+    pub lapse_playing: bool,
+    /// The operator's satellite additions: their own element sets (already
+    /// pushed into the feed) and the frequency entries that override the
+    /// built-in table in the pass window. Republished by the host whenever the
+    /// settings dialog changes them.
+    ///
+    /// Empty in the browser tab, which has no settings dialog of its own — the
+    /// built-in table shows through there.
+    pub sat_cfg: std::sync::Arc<sdroxide_types::SatConfig>,
+    /// What has been typed into the satellite search box.
+    ///
+    /// Matching satellites are drawn with their orbit and label whether or not
+    /// they would otherwise be — searching for a satellite that is not on
+    /// screen is the main reason to search at all.
+    pub sat_search: String,
     /// Satellite whose pass table is open, by catalogue number.
     pub selected_sat: Option<u64>,
     /// Cached pass prediction: which satellite, from what QTH, computed when,
@@ -163,6 +188,17 @@ pub struct SolarUi {
     /// Set when the target changes, so the next frame — which has the bodies
     /// placed already — can pull the camera in to frame whatever was picked.
     pub retarget: bool,
+}
+
+/// ASCII-case-insensitive substring test.
+///
+/// Allocation-free because this runs once per satellite per frame, and the
+/// alternative — uppercasing both sides — is two `String`s ninety times at
+/// sixty frames a second. Satellite designators are ASCII, so folding only
+/// ASCII case loses nothing.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// A cached pass prediction for one satellite.
@@ -186,10 +222,20 @@ pub struct DigiTraffic {
     pub stations: Vec<(f64, f64, f32)>,
     /// The station currently being worked.
     pub dx: Option<(f64, f64)>,
+    /// A name for the `dx` end, when it is a named transmitter rather than a
+    /// callsign the operator can already read off the panel — a weather-fax
+    /// station or a broadcast station. `None` leaves the arc unlabelled, which
+    /// is right for a QSO: the call is on screen twice already.
+    pub dx_label: Option<String>,
     /// A decode the operator has clicked but not yet answered.
     pub preview: Option<(f64, f64)>,
     /// True while transmitting, which animates the arc.
     pub transmitting: bool,
+    /// The last hour of located decodes, oldest first — what the activity
+    /// time-lapse replays. Shared rather than copied: republishing a few
+    /// thousand of these every frame is the one part of this that would cost
+    /// anything.
+    pub history: std::sync::Arc<Vec<crate::digi_map::DigiHit>>,
 }
 
 impl SolarUi {
@@ -210,6 +256,11 @@ impl SolarUi {
             sim_offset_s: 0.0,
             data: None,
             digi: DigiTraffic::default(),
+            awards: Default::default(),
+            lapse_back_s: 0.0,
+            lapse_playing: false,
+            sat_search: String::new(),
+            sat_cfg: Default::default(),
             selected_sat: None,
             sat_passes: None,
             focus_override: None,
@@ -244,12 +295,64 @@ impl SolarUi {
         self.view.auto = false;
     }
 
+    /// True when the activity replay head is at the present moment, which is
+    /// where it stays unless the operator winds it back.
+    pub fn lapse_live(&self) -> bool {
+        self.lapse_back_s <= 0.0
+    }
+
+    /// Wall clock the replay head is showing, given the scene's timestamp.
+    ///
+    /// It is offset from the scene's own clock rather than from the real one,
+    /// so scrubbing the whole scene with the Time chips carries the replay with
+    /// it instead of leaving the traffic behind at a Sun that has moved.
+    pub fn lapse_head(&self, sim_now: f64) -> f64 {
+        sim_now - self.lapse_back_s.max(0.0)
+    }
+
+    /// How long a decode's arc stays on the globe behind the head, in seconds.
+    pub fn lapse_trail_s(&self) -> f64 {
+        (self.view.lapse_trail_min as f64 * 60.0).clamp(30.0, crate::digi_map::HISTORY_S as f64)
+    }
+
+    /// Park the replay head `back_s` seconds before now, clamped to the hour of
+    /// history that exists.
+    pub fn set_lapse_back(&mut self, back_s: f64) {
+        self.lapse_back_s = back_s.clamp(0.0, crate::digi_map::HISTORY_S as f64);
+    }
+
+    /// Whether a satellite matches what is in the search box.
+    ///
+    /// Case-insensitive substring on the name, and on the catalogue number as
+    /// text so `25544` finds the ISS. An empty box matches *nothing* rather
+    /// than everything: this drives a highlight, and highlighting all ninety
+    /// would be the same as highlighting none.
+    pub fn sat_search_hit(&self, name: &str, norad_id: u64) -> bool {
+        let q = self.sat_search.trim();
+        if q.is_empty() {
+            return false;
+        }
+        contains_ignore_ascii_case(name, q) || contains_ignore_ascii_case(&norad_id.to_string(), q)
+    }
+
     pub fn layer(&self, bit: u32) -> bool {
         self.view.layers & bit != 0
     }
 
-    pub fn toggle_layer(&mut self, bit: u32) {
-        self.view.layers ^= bit;
+    /// Turn every bit in `mask` on or off together.
+    ///
+    /// One chip may stand for more than one layer — `SUN OBS` is the sunspots
+    /// and the flares — and XOR is the wrong operator for that. A mask holding
+    /// only one of a pair, which any settings file written before the two chips
+    /// merged may well hold, would flip to holding only the *other* one. A chip
+    /// like that is lit when any of its bits are set, so clicking it has to mean
+    /// "all of you, off".
+    pub fn set_layers(&mut self, mask: u32, on: bool) {
+        if on {
+            self.view.layers |= mask;
+        } else {
+            self.view.layers &= !mask;
+        }
     }
 }
 
@@ -298,6 +401,37 @@ mod tests {
             assert_eq!(sdroxide_solar::planets::MOONS[*i].parent, sdroxide_solar::Planet::Jupiter);
         }
         assert_eq!(after[0].label(), "Io");
+    }
+
+    /// The search has to find a satellite by any part of its designator or by
+    /// its catalogue number, and an empty box has to match nothing.
+    #[test]
+    fn the_search_matches_names_and_catalogue_numbers() {
+        let mut st = SolarUi::new(Solar3dView::default());
+        // Nothing typed: nothing highlighted, or every satellite would be.
+        assert!(!st.sat_search_hit("ISS", 25544));
+        st.sat_search = "   ".into();
+        assert!(!st.sat_search_hit("ISS", 25544));
+
+        st.sat_search = "iss".into();
+        assert!(st.sat_search_hit("ISS", 25544));
+        assert!(!st.sat_search_hit("AO-73", 39444));
+        // Substrings anywhere, in either case.
+        st.sat_search = "o-7".into();
+        assert!(st.sat_search_hit("AO-73", 39444));
+        assert!(st.sat_search_hit("ao-7", 7530));
+        assert!(!st.sat_search_hit("RS-44", 44909));
+        // ...and by catalogue number, which is how you find one whose
+        // designator you cannot remember.
+        st.sat_search = "25544".into();
+        assert!(st.sat_search_hit("ISS", 25544));
+        assert!(!st.sat_search_hit("ISS", 25545));
+        // Surrounding whitespace is not part of the query.
+        st.sat_search = "  QO-100 ".into();
+        assert!(st.sat_search_hit("QO-100", 43700));
+        // A query longer than the name cannot match it.
+        st.sat_search = "QO-100-AND-MORE".into();
+        assert!(!st.sat_search_hit("QO-100", 43700));
     }
 
     #[test]

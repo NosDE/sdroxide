@@ -191,10 +191,8 @@ fn parse_dx_line(line: &str, now: i64) -> Option<Spot> {
     // Cluster nodes append alert BEL bytes (and occasionally other control /
     // non-UTF-8 bytes) to spot lines; map them to spaces so they don't show as
     // tofu and don't glue onto the trailing time token.
-    let cleaned: String = line
-        .chars()
-        .map(|c| if c.is_control() || c == '\u{FFFD}' { ' ' } else { c })
-        .collect();
+    let cleaned: String =
+        line.chars().map(|c| if c.is_control() || c == '\u{FFFD}' { ' ' } else { c }).collect();
     let line = cleaned.trim();
     let rest = line.strip_prefix("DX de ").or_else(|| line.strip_prefix("Dx de "))?;
     let (spotter, after) = rest.split_once(':')?;
@@ -210,10 +208,9 @@ fn parse_dx_line(line: &str, now: i64) -> Option<Spot> {
     }
     let mut comment_toks: Vec<&str> = toks.collect();
     // Drop a trailing time token like "1230Z".
-    if comment_toks
-        .last()
-        .is_some_and(|t| t.len() >= 4 && t.ends_with('Z') && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit()))
-    {
+    if comment_toks.last().is_some_and(|t| {
+        t.len() >= 4 && t.ends_with('Z') && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+    }) {
         comment_toks.pop();
     }
     let comment = comment_toks.join(" ");
@@ -256,7 +253,8 @@ mod tests {
 
     #[test]
     fn parses_standard_spot() {
-        let s = parse_dx_line("DX de W3LPL:     14025.0  DL9XYZ       CW  loud   1230Z", 100).unwrap();
+        let s =
+            parse_dx_line("DX de W3LPL:     14025.0  DL9XYZ       CW  loud   1230Z", 100).unwrap();
         assert_eq!(s.call, "DL9XYZ");
         assert_eq!(s.spotter, "W3LPL");
         assert_eq!(s.freq_hz, 14_025_000.0);

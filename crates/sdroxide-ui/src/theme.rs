@@ -40,94 +40,108 @@ pub const SCROLL_HANDLE: Color32 = Color32::from_rgb(0x17, 0x8e, 0xad);
 pub const SCROLL_HANDLE_HOVER: Color32 = CYAN;
 pub const SCROLL_HANDLE_DRAG: Color32 = PINK;
 
+/// A colour per continent, so a list of decodes reads as a map at a glance —
+/// which way the band is open is visible before a single callsign is read.
+/// Anything unrecognised comes back grey.
+pub fn continent_color(code: &str) -> Color32 {
+    match code {
+        "EU" => Color32::from_rgb(0x7c, 0xa8, 0xff),
+        "NA" => Color32::from_rgb(0x46, 0xe0, 0x7d),
+        "SA" => Color32::from_rgb(0xff, 0xa5, 0x3f),
+        "AS" => Color32::from_rgb(0xff, 0x7a, 0xd9),
+        "AF" => Color32::from_rgb(0xff, 0xd2, 0x3f),
+        "OC" => Color32::from_rgb(0x3f, 0xe0, 0xd8),
+        "AN" => Color32::from_rgb(0xd0, 0xe4, 0xf4),
+        _ => Color32::from_gray(110),
+    }
+}
+
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
 
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(|style| {
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(16.0, FontFamily::Name("chakra-bold".into()))),
+            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        ]
+        .into();
 
-    style.text_styles = [
-        (TextStyle::Heading, FontId::new(16.0, FontFamily::Name("chakra-bold".into()))),
-        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
-    ]
-    .into();
+        style.spacing.item_spacing = egui::vec2(7.0, 5.0);
+        style.spacing.button_padding = egui::vec2(7.0, 3.0);
+        // Fixed slider width: otherwise sliders expand to fill the row, so a
+        // module with a slider balloons and pushes later modules off-screen
+        // instead of letting `horizontal_wrapped` wrap them.
+        style.spacing.slider_width = 84.0;
+        style.spacing.combo_width = 84.0;
 
-    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
-    style.spacing.button_padding = egui::vec2(7.0, 3.0);
-    // Fixed slider width: otherwise sliders expand to fill the row, so a
-    // module with a slider balloons and pushes later modules off-screen
-    // instead of letting `horizontal_wrapped` wrap them.
-    style.spacing.slider_width = 84.0;
-    style.spacing.combo_width = 84.0;
+        // egui's default scrollbars float over the content as a 2 px hairline that
+        // only fades in on hover — easy to miss and hard to grab. Use solid bars of
+        // a constant width that are always fully opaque.
+        style.spacing.scroll = egui::style::ScrollStyle {
+            bar_width: 9.0,
+            handle_min_length: 24.0,
+            bar_inner_margin: 3.0,
+            bar_outer_margin: 0.0,
+            // Take the handle colour from `fg_stroke` instead of the (near-black)
+            // widget fill, so bars we don't paint by hand — combo popups, menus —
+            // still get a handle that stands out from the gutter.
+            foreground_color: true,
+            ..egui::style::ScrollStyle::solid()
+        };
 
-    // egui's default scrollbars float over the content as a 2 px hairline that
-    // only fades in on hover — easy to miss and hard to grab. Use solid bars of
-    // a constant width that are always fully opaque.
-    style.spacing.scroll = egui::style::ScrollStyle {
-        bar_width: 9.0,
-        handle_min_length: 24.0,
-        bar_inner_margin: 3.0,
-        bar_outer_margin: 0.0,
-        // Take the handle colour from `fg_stroke` instead of the (near-black)
-        // widget fill, so bars we don't paint by hand — combo popups, menus —
-        // still get a handle that stands out from the gutter.
-        foreground_color: true,
-        ..egui::style::ScrollStyle::solid()
-    };
+        let v = &mut style.visuals;
+        v.dark_mode = true;
+        v.panel_fill = PANEL;
+        v.window_fill = PANEL;
+        v.extreme_bg_color = INPUT_BG;
+        v.faint_bg_color = Color32::from_rgb(0x0e, 0x16, 0x26);
+        v.code_bg_color = INPUT_BG;
 
-    let v = &mut style.visuals;
-    v.dark_mode = true;
-    v.panel_fill = PANEL;
-    v.window_fill = PANEL;
-    v.extreme_bg_color = INPUT_BG;
-    v.faint_bg_color = Color32::from_rgb(0x0e, 0x16, 0x26);
-    v.code_bg_color = INPUT_BG;
+        v.window_stroke = Stroke::new(1.0, PINK);
+        v.window_corner_radius = CornerRadius::ZERO;
+        v.menu_corner_radius = CornerRadius::ZERO;
 
-    v.window_stroke = Stroke::new(1.0, PINK);
-    v.window_corner_radius = CornerRadius::ZERO;
-    v.menu_corner_radius = CornerRadius::ZERO;
+        v.selection.bg_fill = CYAN;
+        v.selection.stroke = Stroke::new(1.0, INK_ON_CYAN);
+        v.hyperlink_color = CYAN;
+        v.warn_fg_color = YELLOW;
+        v.error_fg_color = PINK;
+        v.slider_trailing_fill = true;
 
-    v.selection.bg_fill = CYAN;
-    v.selection.stroke = Stroke::new(1.0, INK_ON_CYAN);
-    v.hyperlink_color = CYAN;
-    v.warn_fg_color = YELLOW;
-    v.error_fg_color = PINK;
-    v.slider_trailing_fill = true;
+        let sharp = CornerRadius::ZERO;
+        v.widgets.noninteractive.bg_fill = PANEL;
+        v.widgets.noninteractive.weak_bg_fill = PANEL;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.noninteractive.corner_radius = sharp;
 
-    let sharp = CornerRadius::ZERO;
-    v.widgets.noninteractive.bg_fill = PANEL;
-    v.widgets.noninteractive.weak_bg_fill = PANEL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.noninteractive.corner_radius = sharp;
+        v.widgets.inactive.bg_fill = FILL;
+        v.widgets.inactive.weak_bg_fill = FILL;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE_LIT);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.corner_radius = sharp;
 
-    v.widgets.inactive.bg_fill = FILL;
-    v.widgets.inactive.weak_bg_fill = FILL;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE_LIT);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.inactive.corner_radius = sharp;
+        v.widgets.hovered.bg_fill = FILL_HOVER;
+        v.widgets.hovered.weak_bg_fill = FILL_HOVER;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, CYAN_DIM);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.2, TEXT_STRONG);
+        v.widgets.hovered.corner_radius = sharp;
 
-    v.widgets.hovered.bg_fill = FILL_HOVER;
-    v.widgets.hovered.weak_bg_fill = FILL_HOVER;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, CYAN_DIM);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.2, TEXT_STRONG);
-    v.widgets.hovered.corner_radius = sharp;
+        v.widgets.active.bg_fill = FILL_ACTIVE;
+        v.widgets.active.weak_bg_fill = FILL_ACTIVE;
+        v.widgets.active.bg_stroke = Stroke::new(1.0, CYAN);
+        v.widgets.active.fg_stroke = Stroke::new(1.2, CYAN);
+        v.widgets.active.corner_radius = sharp;
 
-    v.widgets.active.bg_fill = FILL_ACTIVE;
-    v.widgets.active.weak_bg_fill = FILL_ACTIVE;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, CYAN);
-    v.widgets.active.fg_stroke = Stroke::new(1.2, CYAN);
-    v.widgets.active.corner_radius = sharp;
-
-    v.widgets.open.bg_fill = FILL_ACTIVE;
-    v.widgets.open.weak_bg_fill = FILL_ACTIVE;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, CYAN_DIM);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_STRONG);
-    v.widgets.open.corner_radius = sharp;
-
+        v.widgets.open.bg_fill = FILL_ACTIVE;
+        v.widgets.open.weak_bg_fill = FILL_ACTIVE;
+        v.widgets.open.bg_stroke = Stroke::new(1.0, CYAN_DIM);
+        v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_STRONG);
+        v.widgets.open.corner_radius = sharp;
     });
 }
 
@@ -218,9 +232,7 @@ fn install_fonts(ctx: &egui::Context) {
     );
     fonts.font_data.insert(
         "chakra-bold".into(),
-        Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/ChakraPetch-SemiBold.ttf"
-        ))),
+        Arc::new(FontData::from_static(include_bytes!("../assets/fonts/ChakraPetch-SemiBold.ttf"))),
     );
     // Angular techno monospace for the FT8 decode list (Share Tech Mono, OFL).
     fonts.font_data.insert(
@@ -238,9 +250,7 @@ fn install_fonts(ctx: &egui::Context) {
     if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
         mono.insert(0, "cyber-mono".into());
     }
-    fonts
-        .families
-        .insert(FontFamily::Name("cyber-mono".into()), vec!["cyber-mono".to_string()]);
+    fonts.families.insert(FontFamily::Name("cyber-mono".into()), vec!["cyber-mono".to_string()]);
     // Bold family for headings, falling back through the proportional stack.
     let mut bold_stack = vec!["chakra-bold".to_string()];
     if let Some(prop) = fonts.families.get(&FontFamily::Proportional) {

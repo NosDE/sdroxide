@@ -360,9 +360,8 @@ impl Worker {
         let cb = move |_stamp: u64, bytes: &[u8], _: &mut ()| {
             let Some(c) = message::parse(bytes) else { return };
             if let Ok(mut e) = echo.lock() {
-                e.entry(key(&c.msg))
-                    .or_insert(Echo { sent: None, received: None })
-                    .received = Some((c.value, Instant::now()));
+                e.entry(key(&c.msg)).or_insert(Echo { sent: None, received: None }).received =
+                    Some((c.value, Instant::now()));
             }
             if ev.try_send(MidiEvent::Control(c)).is_ok() {
                 wake();

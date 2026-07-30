@@ -1,18 +1,25 @@
-# sdroxide
+# SDR Oxide
 
 A PowerSDR/Thetis-style software-defined-radio transceiver client in Rust, with
 pluggable radio backends (**SoapySDR**, **OpenHPSDR**, **TCI**, and **CAT**), an
 [egui](https://github.com/emilk/egui) GUI, and a cyberpunk theme. It runs as a **native desktop application** and, from the same
 binary, as a **server that streams the same UI to a web browser** over
-WebSocket. It includes an integrated, persistent **logbook**, full **FT8/FT4**
-digital-mode operation, and **built-in TCI and Hamlib rigctld servers** so
-third-party programs like WSJT-X can use it as their radio.
+WebSocket. It includes an integrated, persistent **logbook**, many digital modes like **FT8/FT4**
+built-in, and **TCI and Hamlib rigctld servers** so third-party programs like WSJT-X can use it as their radio.
 
-<img width="2351" height="984" alt="image" src="https://github.com/user-attachments/assets/6130eb56-9486-414c-b4b8-ceeb366d812c" />
+<hr/>
 
-<img width="2422" height="984" alt="image" src="https://github.com/user-attachments/assets/2b502c2b-f37c-43be-9eb9-e55eaea04419" />
+<img width="1496" height="933" alt="image" src="https://github.com/user-attachments/assets/9d88118c-0efe-45c5-9918-8ee2bb91b700" />
 
+<hr/>
 
+<img width="1682" height="1212" alt="image" src="https://github.com/user-attachments/assets/aa08f5d3-ec62-4d91-9dd0-13bde1b0ae43" />
+
+<hr/>
+
+<img width="1496" height="933" alt="image" src="https://github.com/user-attachments/assets/902a73ff-c8bf-43cd-9fc3-884d40ce4b04" />
+
+<hr/>
 
 > ## [User Manual](docs/USER_MANUAL.md)
 
@@ -34,11 +41,18 @@ One binary, three ways to run it:
 - **Bandplan overlay** — a colour-coded strip along the bottom of the waterfall
   that labels allocations (ham bands, broadcast, CB, AM); it shows coarse bands
   when zoomed out and CW/digital/SSB sub-segments when zoomed into a ham band.
-- **Modes** — SSB (USB/LSB), CW, AM, SAM, NFM, WFM, DSB, DIGU/DIGL, a
-  spectrum-only mode, **FT8/FT4**, the keyboard modes **PSK31**, **RTTY**,
-  **Olivia**, **THOR** and **FSQ** (with directed messaging + images), image
-  **SSTV** (Scottie, Martin, Robot), and transmit-only **RF Paint** (spectrum
-  painting of text and images onto the waterfall).
+- **Modes** — SSB (USB/LSB), CW, AM, SAM, NFM, WFM (with broadcast
+  pilot-tone **stereo**), DSB, DIGU/DIGL, a
+  spectrum-only mode, **FT8/FT4**, **JS8** (all four speeds, with directed
+  messaging, heartbeats and multi-frame free text), the keyboard modes
+  **PSK31**, **RTTY**,
+  **Olivia**, **THOR** and **FSQ** (with directed messaging + images),
+  **Hellschreiber** (all seven Feld Hell / FSK Hell variants, on a scrolling
+  raster), image **SSTV** (Scottie, Martin, Robot), image **RIFP**
+  (draft-dulaunoy-rifp-00 — packetised, checksummed pictures over a 4800-baud
+  CPFSK modem), receive-only **weather fax** (WEFAX/radiofax charts with a
+  station picker, phasing and slant correction), and transmit-only **RF Paint**
+  (spectrum painting of text and images onto the waterfall).
 - **Receiver** — hang AGC, draggable passband filter edges (on the spectrum and
   the waterfall), noise blanker, auto-notch, **neural (RNNoise) or spectral noise
   reduction**, squelch, a second sub-receiver, RIT/XIT, VFO A/B with split,
@@ -63,8 +77,6 @@ One binary, three ways to run it:
   are all stored under `~/.config/sdroxide/`.
 
 ## FT8 / FT4
-
-<img width="1683" height="933" alt="image" src="https://github.com/user-attachments/assets/02a4b70d-7590-4a71-aacb-56814132b691" />
 
 Selecting FT8 or FT4 switches the panadapter to a zoomed sub-band waterfall with
 a decode list and an auto-sequencing QSO panel:
@@ -132,6 +144,29 @@ left and a transmit compositor on the right:
   with "SDRoxide" and the version. **TX** sends; **ABORT TX** stops.
 - **Modes:** Scottie 1 / 2 / DX, Martin 1 / 2, Robot 72, Robot 36. Band buttons
   tune to that band's SSTV calling frequency (e.g. 20 m = 14.230 MHz).
+
+## RIFP
+
+Selecting **RIFP** opens the same image panel over the **Radio Image Framing
+Protocol** ([draft-dulaunoy-rifp-00](https://datatracker.ietf.org/doc/draft-dulaunoy-rifp/)):
+a picture is encoded, split into numbered chunks, and sent as CRC-protected
+frames behind a JSON manifest, with the complete object verified by CRC-32 and
+SHA-256 before it is shown. Interoperates both ways with the
+[reference implementation](https://github.com/adulau/rifp) across every encoding
+either side can produce.
+
+- **Radio profile** `rifp-cpfsk-4800`: continuous-phase binary FSK, 4800 baud,
+  ±4 kHz, sent on the carrier rather than in a sideband — **the dial is the
+  centre of the signal**. ⚠ Its ~25 kHz channel does not fit a narrow-band
+  segment; the panel warns wherever it does not, and band buttons land in the
+  segments where it does — 10 m FM, the 6 m and 2 m all-modes parts, and 70 cm,
+  where a **433.920** chip jumps to the calling frequency the draft names.
+- **Encodings:** CCITT Group 4 facsimile, PNG, JPEG, and the packed grayscale
+  raster raw / RLE8 / ZLIB — or Auto, which sends whichever comes out smallest.
+  1, 2, 4 or 8 bits per pixel, with optional dithering.
+- **Receive** shows every transfer being reassembled with a per-chunk map of
+  what has arrived, paints the raw raster row by row as it lands, and adds a
+  picture to the gallery only once its digest checks out.
 
 ## RF Paint
 
@@ -214,8 +249,16 @@ the **Spots** and **Uploads** tabs of the Settings dialog, and surfaced by the
 - **Spot feeds** — connect a **DX cluster** (telnet) and poll **POTA**, **SOTA**
   and **PSK Reporter**. Spots appear as clickable, colour-coded markers along the
   bottom of the waterfall (and as dots on the FT8 world map); the **SPOTS** window
-  lists them with per-source filters. **Click a spot** to tune the VFO, set the
-  mode, and pre-fill a new log entry — one click from "heard" to "working".
+  lists them with per-source filters and a **fuzzy search** over calls, station
+  names, sites and frequencies. **Click a spot** to tune the VFO, set the mode,
+  and pre-fill a new log entry — one click from "heard" to "working".
+- **Broadcast stations** — a bundled list of **longwave and shortwave broadcasters**
+  with their real transmitter sites labels the big AM carriers on the waterfall, so
+  225 kHz reads as *Polskie Radio Program 1, Solec Kujawski*. Only what is on air
+  now is shown, and tuning one draws a **great-circle arc from your grid to the
+  transmitter** on the 3D globe. Seeded to
+  `~/.config/sdroxide/broadcast_stations.json` on first run and never overwritten,
+  so your corrections and local additions stick.
 - **Callsign lookup** — auto-fill name, QTH, grid and state from **QRZ.com** or
   **HamQTH** on a spot click, at QSO start, or when you type a call (or press
   **LOOKUP** in the entry form).
@@ -233,14 +276,21 @@ other ham software). See the [User Manual](docs/USER_MANUAL.md) for setup steps.
 
 ## Radio backends
 
-sdroxide can drive six kinds of radio, selected on the **Radio** tab of the
+sdroxide can drive seven kinds of radio, selected on the **Radio** tab of the
 Settings window. Backend, serial, and radio-audio changes apply live when you
 press **Apply / reconnect**. A radio that isn't there yet at startup — or that
 drops mid-session — is retried in the background and attaches by itself, so
 starting sdroxide before the rig is fine:
 
+- **RTL-SDR (USB)** — an RTL2832U dongle, driven directly over USB by a native
+  pure-Rust driver. **No SoapySDR and no libusb needed**, so it works in every
+  build including the standard `.msi` and `.dmg`. Covers the R820T, R820T2 and
+  R828D tuners, which is effectively every dongle still sold. HF works through
+  an RTL-SDR Blog V4's built-in upconverter, or on other sticks by direct
+  sampling the ADC's Q branch (the V3's HF port). Bias tee and ppm correction
+  are on the Radio tab; see "RTL-SDR permissions" under Building.
 - **SoapySDR** — any [SoapySDR](https://github.com/pothosware/SoapySDR) device
-  (wideband IQ). See below.
+  (wideband IQ) — HackRF, Airspy, PlutoSDR and friends. See below.
 - **OpenHPSDR** — Hermes/Metis-family Ethernet SDRs on the LAN (Protocol 1 and
   2). Press **Discover** to scan for devices, or enter the IP manually; pick a
   DDC sample rate (48 kHz–1536 kHz). Not yet hardware-verified — testers can run
@@ -267,9 +317,11 @@ starting sdroxide before the rig is fine:
   (±2.5 kHz to ±500 kHz, and the radio's SPAN button moves it); audio is the
   demodulated receiver output, since the protocol carries no IQ.
 
-The wideband-IQ backends (SoapySDR, HPSDR, TCI, FlexRadio) drive the full
-panadapter, the CW/PSK/RTTY skimmers, and internal demodulation; a CAT rig
-feeding demodulated audio shows only a narrow audio-band slice.
+The wideband-IQ backends (RTL-SDR, SoapySDR, HPSDR, TCI, FlexRadio) drive the
+full panadapter, the CW/PSK/RTTY skimmers, and internal demodulation; a CAT rig
+or a networked Icom feeding demodulated audio shows only a narrow audio-band
+slice — though an Icom hands over its own wideband scope for the waterfall.
+RTL-SDR is receive-only; the others can transmit.
 
 ## Built-in TCI server
 
@@ -334,6 +386,22 @@ It has been developed against a **HackRF One** (half-duplex TX) and a
 
 ## Building
 
+### Toolchain
+
+Install Rust with [rustup](https://rustup.rs/) rather than your distribution's
+`rust`/`cargo` package. The workspace is edition 2024, so it needs Rust 1.85 or
+newer, and the browser client needs a second compilation target that only
+rustup can add:
+
+```sh
+rustup target add wasm32-unknown-unknown
+```
+
+A distro-packaged cargo cannot add targets itself — some distros ship the wasm
+standard library as a separate package, but the usual symptom is that the native
+build works fine and the web client build fails on the missing target. Migrating
+to rustup is the shortest way out.
+
 The RADE digital-voice codec is vendored as a git submodule, so clone with:
 
 ```sh
@@ -342,30 +410,185 @@ git clone --recurse-submodules https://github.com/dividebysandwich/sdroxide
 git submodule update --init --recursive
 ```
 
-You need the SoapySDR development libraries and the driver module(s) for your
-radio installed (e.g. `soapysdr`, `soapysdr-module-hackrf`,
-`soapysdr-module-lms7` on Arch/Debian-style distros).
+### What depends on what
 
-Building RADE additionally needs **CMake**, a **C compiler**, **libclang**
-(for `bindgen`) and **autoconf / automake / libtool** — its build fetches and
-compiles a FARGAN-enabled Opus from source. That fetch means the *first* build
-needs network access; later builds reuse it. It is also the slow part of a clean
-build: RADE's model weights are ~110 MB of generated C.
+The native binary and the browser client are two separate builds. Only one
+combination couples them, and it couples them at *compile* time:
+
+| You want | Build | Web client needed? |
+| --- | --- | --- |
+| Native desktop UI | `cargo build --release` | no |
+| Native remote client (`--connect`) | `cargo build --release` | no |
+| Server, client served from a directory | `cargo build --release`, run with `--web-root` | yes, at run time |
+| Server, client baked into the binary | `cargo build --release --features embed-web` | **yes, before you compile** |
+
+`embed-web` embeds `crates/sdroxide-web/dist` with `rust-embed`, so that
+directory has to exist *while cargo compiles the server*. It is `.gitignore`d
+and therefore absent from a fresh clone, so reaching for `--features embed-web`
+first thing fails with:
+
+```
+#[derive(RustEmbed)] folder '.../crates/sdroxide-web/dist' does not exist
+```
+
+Build the web client first (below) and it compiles. Nothing else in the
+workspace depends on the wasm crate — plain `cargo build --release` never
+touches it.
+
+You do not need `embed-web` to run a server. Without it `--server` still
+serves the WebSocket backend for native `--connect` clients; pass `--web-root`
+to serve a Trunk-built directory, or browse to the HTTP port and get a one-line
+placeholder saying the client wasn't built.
+
+### System dependencies
+
+A native build needs a C toolchain and a handful of libraries on top of Rust:
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config cmake autoconf automake libtool \
+                 libclang-dev libasound2-dev libopus-dev
+# Arch
+sudo pacman -S base-devel pkgconf cmake autoconf automake libtool clang alsa-lib opus
+# macOS
+brew install pkg-config cmake autoconf automake libtool opus
+```
+
+- **ALSA** (`libasound2-dev` / `alsa-lib`) is not optional on Linux: the audio
+  device layer and the MIDI control input both link it. macOS and Windows use
+  their own system audio APIs.
+- **CMake**, a **C compiler**, **libclang** (for `bindgen`) and **autoconf /
+  automake / libtool** are for RADE, whose build fetches and compiles a
+  FARGAN-enabled Opus from source. That fetch means the *first* build needs
+  network access; later builds reuse it. It is also the slow part of a clean
+  build: RADE's model weights are ~110 MB of generated C.
+- **libopus** is strictly optional, but installing it avoids a CMake 4 problem —
+  see below.
+
+For the **SoapySDR** backend you need its development libraries and the driver
+module(s) for your radio (e.g. `soapysdr`, `soapysdr-module-hackrf`,
+`soapysdr-module-lms7` on Arch/Debian-style distros). Everything else — including
+the RTL-SDR backend — needs no SDR system library at all, so
+`cargo build --release --no-default-features` gives a working binary with no
+SoapySDR installed.
+
+#### "Compatibility with CMake < 3.5 has been removed" on CMake 4
+
+Two unrelated Opus builds happen during a full build, which makes this error
+easy to misattribute:
+
+- **RADE's Opus** — the patched, FARGAN-enabled one that `vendor/rade_c` fetches
+  and builds with **autotools**. Every CMake file involved — the vendored ones
+  and the wrapper project `crates/sdroxide-rade/build.rs` generates — requires
+  3.16 and configures cleanly under CMake 4.
+- **The server's Opus** — audio compression for browser and native remote
+  clients, via the `opus` → `audiopus_sys` crates. On Unix `audiopus_sys` probes
+  `pkg-config` for a system Opus and, if it finds none, compiles its own
+  vendored copy **with CMake**. That copy starts with
+  `cmake_minimum_required(VERSION 3.1)`.
+
+CMake 4.0 removed support for pre-3.5 minimums, so on a machine with CMake ≥ 4
+and no system Opus the build stops with:
+
+```
+CMake Error at CMakeLists.txt:1 (cmake_minimum_required):
+  Compatibility with CMake < 3.5 has been removed from CMake.
+```
+
+The bare `CMakeLists.txt` there is
+`~/.cargo/registry/src/*/audiopus_sys-0.2.2/opus/CMakeLists.txt`, not anything
+under `vendor/rade_c` — editing the RADE sources or the generated wrapper has no
+effect on it, and 0.2.2 is `audiopus_sys`'s newest release, so there is no
+version bump to pick up either. Fix it from either end:
+
+```sh
+# Install a system Opus and no CMake build happens at all (see the lists above).
+sudo apt install libopus-dev pkg-config
+
+# Or configure the vendored copy anyway — this is what the release workflow
+# does. CMake 3.x ignores the variable, so it is harmless to leave set.
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+```
+
+The two are not quite equivalent: on glibc Linux `audiopus_sys` links a
+*system* Opus dynamically, so a binary built with `libopus-dev` present needs
+libopus installed wherever it runs, while the vendored route builds it in. Set
+`OPUS_STATIC=1` to link the system one statically instead, or `OPUS_LIB_DIR` to
+point at a libopus that `pkg-config` cannot see.
+
+### Native binary
 
 ```sh
 cargo build --release
 ./target/release/sdroxide --probe        # verify your device is seen
 ```
 
+### Browser client
+
 The browser client is a separate WebAssembly crate built with
-[Trunk](https://trunkrs.dev/):
+[Trunk](https://github.com/trunk-rs/trunk) 0.21 or newer (CI pins 0.21.14).
+Install it with `cargo install --locked trunk`, or drop a prebuilt binary from
+its releases page on your `PATH`:
 
 ```sh
 cd crates/sdroxide-web && trunk build --release
 ```
 
-Build the server with `--features embed-web` to bake the web client into the
-binary so `--server` needs no `--web-root`.
+Output lands in `crates/sdroxide-web/dist`. Trunk downloads `wasm-bindgen-cli`
+and `wasm-opt` itself the first time, so that run needs network access too.
+
+While working on the UI, skip the embed step entirely and point the server at
+the directory — a plain `trunk build` (debug) is much faster, and a browser
+reload picks up a rebuild:
+
+```sh
+cd crates/sdroxide-web && trunk build && cd ../..
+./target/release/sdroxide --server --web-root crates/sdroxide-web/dist
+```
+
+### Server with the client baked in
+
+Build in this order, then the binary is self-contained and `--server` needs no
+`--web-root`:
+
+```sh
+(cd crates/sdroxide-web && trunk build --release)   # 1. produces dist/
+cargo build --release --features embed-web          # 2. embeds dist/
+```
+
+One wrinkle worth knowing: only a **release** build actually bakes the files in.
+A debug build with `embed-web` reads them off disk at run time from the path
+recorded at compile time, which is why a debug server picks up a rebuilt web
+client without recompiling — and why a release binary does not.
+
+### RTL-SDR permissions
+
+The RTL-SDR backend talks to the dongle directly over USB, so the invoking user
+needs access to it.
+
+**Linux.** Install the packaged udev rule and replug the dongle:
+
+```sh
+sudo cp packaging/linux/60-sdroxide-rtlsdr.rules /usr/lib/udev/rules.d/
+sudo udevadm control --reload
+```
+
+The `.deb` installs this for you. If your distribution's `rtl-sdr` package is
+already installed, its rules cover the same ids and you need not do anything.
+The `dvb_usb_rtl28xxu` DVB driver does **not** need blacklisting — sdroxide
+detaches it automatically and the kernel rebinds it when the dongle is
+unplugged.
+
+**Windows.** The dongle must be bound to **WinUSB**, which you do once with
+[Zadig](https://zadig.akeo.ie/). This is the same step SDR#, gqrx and every
+libusb-based program require, so if the dongle already works with any of them
+there is nothing to do. Note that Zadig replaces the DVB driver, so the stick
+stops working as a TV tuner.
+
+**macOS.** Nothing to do.
+
+If a dongle is present but sdroxide cannot open it, `--probe` says so in words
+rather than errnos.
 
 ## Running
 
@@ -374,9 +597,13 @@ binary so `--server` needs no `--web-root`.
 sdroxide --freq 14074000 --mode ft8
 
 # Server: DSP + hardware here, UI in a browser at http://<host>:4950
+# (needs a web client: either an embed-web build, or --web-root as below)
 sdroxide --server
 
-# Desktop UI driven by a remote server:
+# Server serving a Trunk-built client from disk instead of an embedded one:
+sdroxide --server --web-root crates/sdroxide-web/dist
+
+# Desktop UI driven by a remote server (no web client involved):
 sdroxide --connect 192.168.1.10:4950
 ```
 
@@ -392,15 +619,16 @@ sdroxide --connect 192.168.1.10:4950
 | `--freq <HZ>` | Center frequency in Hz (default `14200000`). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC / moderate). |
-| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 PSK RTTY OLIVIA THOR FSQ SSTV RFPAINT RADE`. |
+| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE`. |
 | `--server` | Run as a server: HTTP web client + WebSocket streaming backend. |
 | `--connect <HOST[:PORT]>` | Connect as a native remote client to a running server. |
 | `--port <PORT>` | Server port (default: from config, `4950`). |
-| `--web-root <DIR>` | Directory with the Trunk-built web client (default: embedded assets with `--features embed-web`). |
+| `--web-root <DIR>` | Directory with the Trunk-built web client, e.g. `crates/sdroxide-web/dist` (default: embedded assets with `--features embed-web`). |
 | `--fft <N>` | Spectrum FFT size (default `4096`). |
 | `--tx-tune <SECS>` | Headless TX smoke test: key a tune carrier at minimal drive, then exit. |
 | `--ft8-cq <SECS>` | Headless FT8 smoke test: call CQ at minimal power, then exit. |
 | `--rade-rx <SECS>` | Headless RADE smoke test: receive for SECS seconds and report whether the modem synced. Pair with `--file`. |
+| `--oob-tx` | Lift the amateur-band transmit lockout for this run, for licensed out-of-band use. Shows a warning that must be dismissed by hand; never persisted, so it has to be passed again every launch. |
 | console extras | `--fps <N>` lines/sec, `--width <CHARS>`, `--db-floor <dBFS>`, `--db-ceil <dBFS>`. |
 
 ## Keyboard shortcuts
@@ -425,7 +653,8 @@ them, plus PTT, band, mode, filter and much else, are rebindable on the
 | Action | Result |
 | --- | --- |
 | Left-click | Tune the active VFO to that frequency. In FT8/FT4, sets the TX audio offset instead. |
-| **Shift** + left-click | Tune VFO B (sub-receiver) to that frequency. |
+| **Shift** + left-click | Place the second receiver: the sub-receiver when SUB is on, VFO B otherwise. Works over a spot box and in FT8/FT4 too. |
+| Drag inside the sub-receiver's passband | Tune the sub-receiver (violet, when SUB is on) instead of panning. |
 | Left-drag | Grab and slide the spectrum — pans the view and tunes along with it. |
 | Right-drag | Pan the view only (no tuning). |
 | Scroll wheel | Zoom in/out around the cursor. |

@@ -36,7 +36,9 @@ enum MsgKind {
 
 /// Read the `i3` (bits 74–76) and `n3` (bits 71–73) message-type fields.
 fn msg_kind(bits77: &[u8; 77]) -> MsgKind {
-    let field = |start: usize| (bits77[start] & 1) << 2 | (bits77[start + 1] & 1) << 1 | (bits77[start + 2] & 1);
+    let field = |start: usize| {
+        (bits77[start] & 1) << 2 | (bits77[start + 1] & 1) << 1 | (bits77[start + 2] & 1)
+    };
     match (field(74), field(71)) {
         (0, 0) => MsgKind::FreeText,
         (0, 1) => MsgKind::Fox,
@@ -45,6 +47,68 @@ fn msg_kind(bits77: &[u8; 77]) -> MsgKind {
         (3, _) => MsgKind::RttyRu,
         (4, _) => MsgKind::NonStandard,
         _ => MsgKind::Other,
+    }
+}
+
+/// What we already know about the message we are hoping to decode.
+///
+/// Every message that advances a QSO is addressed to us, and once we are
+/// working someone it comes from them as well — so 58 of the 77 bits are known
+/// before the signal arrives. Handing them to the decoder as *a-priori* bits
+/// lets the LDPC stage treat them as given instead of solving for them, which
+/// is worth several dB on the one message we most want to hear.
+///
+/// It cannot mislead us: mfsk-core only attempts the AP decode after an
+/// ordinary one has already failed, and the result still has to pass CRC-14. A
+/// stale or wrong hint costs the attempt and nothing else.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApHints {
+    /// Our own callsign — the addressee of everything we are waiting for.
+    pub my_call: String,
+    /// The station we are working, if any.
+    pub dx_call: Option<String>,
+}
+
+impl ApHints {
+    /// The callsigns to seed the hash table with, so a hashed `<...>` naming
+    /// either of them resolves on first sight.
+    pub fn calls(&self) -> Vec<String> {
+        [Some(self.my_call.as_str()), self.dx_call.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `(call1, call2)` for the message layout: `<to> <from> …`, so our call is
+    /// first and the station we're working second. `None` when we don't even
+    /// know our own callsign, which is the only case with nothing to say.
+    fn calls_for_hint(&self) -> Option<(&str, Option<&str>)> {
+        let me = self.my_call.trim();
+        if me.is_empty() {
+            return None;
+        }
+        Some((me, self.dx_call.as_deref().map(str::trim).filter(|c| !c.is_empty())))
+    }
+
+    fn ft8(&self) -> Option<mfsk_core::ft8::decode::ApHint> {
+        let (me, dx) = self.calls_for_hint()?;
+        let h = mfsk_core::ft8::decode::ApHint::new().with_call1(me);
+        Some(match dx {
+            Some(dx) => h.with_call2(dx),
+            None => h,
+        })
+    }
+
+    fn ft4(&self) -> Option<mfsk_core::msg::ApHint> {
+        let (me, dx) = self.calls_for_hint()?;
+        let h = mfsk_core::msg::ApHint::new().with_call1(me);
+        Some(match dx {
+            Some(dx) => h.with_call2(dx),
+            None => h,
+        })
     }
 }
 
@@ -80,16 +144,33 @@ impl Ft8Modem {
     /// to our stable [`Decode`] inside its own arm — the only place that
     /// reads raw mfsk-core fields.
     ///
+    /// `ap` is what we already know about the message we are waiting for (see
+    /// [`ApHints`]); `listening_hz` is where we are tuned, which is the only
+    /// place FT4's a-priori pass can search. The FT8 pass applies the hint
+    /// across the whole band, so it ignores `listening_hz`.
+    ///
     /// Takes `&mut self` because every callsign heard is folded into the hash
     /// table, which is what lets a later `<...>` message name a real station.
-    pub fn decode_slot(&mut self, audio_12k: &[i16], slot_utc: i64) -> Vec<Decode> {
+    pub fn decode_slot(
+        &mut self,
+        audio_12k: &[i16],
+        slot_utc: i64,
+        ap: &ApHints,
+        listening_hz: f32,
+    ) -> Vec<Decode> {
         let mode = self.mode;
         let ht = &self.hashes;
-        let decodes: Vec<Decode> = match mode {
+        let mut decodes: Vec<Decode> = match mode {
             Mode::Ft4 => {
                 let depth = mfsk_core::core::pipeline::DecodeDepth::BpAllOsd;
                 mfsk_core::ft4::decode::decode_frame_with_options(
-                    audio_12k, AUDIO_MIN_HZ, AUDIO_MAX_HZ, SYNC_MIN, None, depth, MAX_CAND,
+                    audio_12k,
+                    AUDIO_MIN_HZ,
+                    AUDIO_MAX_HZ,
+                    SYNC_MIN,
+                    None,
+                    depth,
+                    MAX_CAND,
                 )
                 .into_iter()
                 .filter_map(|r| {
@@ -100,8 +181,18 @@ impl Ft8Modem {
             }
             _ => {
                 let depth = mfsk_core::ft8::decode::DecodeDepth::BpAllOsd;
-                mfsk_core::ft8::decode::decode_frame(
-                    audio_12k, AUDIO_MIN_HZ, AUDIO_MAX_HZ, SYNC_MIN, None, depth, MAX_CAND,
+                // With no hint this is bit-for-bit the plain `decode_frame`;
+                // with one, every candidate that fails an ordinary decode gets a
+                // second attempt with our two callsigns' bits locked.
+                mfsk_core::ft8::decode::decode_frame_with_ap(
+                    audio_12k,
+                    AUDIO_MIN_HZ,
+                    AUDIO_MAX_HZ,
+                    SYNC_MIN,
+                    None,
+                    depth,
+                    MAX_CAND,
+                    ap.ft8().as_ref(),
                 )
                 .into_iter()
                 .filter_map(|r| {
@@ -110,6 +201,28 @@ impl Ft8Modem {
                 .collect()
             }
         };
+        // FT4 has no wide-band a-priori pass, only a targeted one. Aim it where
+        // we are listening — in a QSO that is the station whose reply the hint
+        // describes — and keep whatever it finds that the wide pass missed.
+        if mode == Mode::Ft4 {
+            if let Some(hint) = ap.ft4() {
+                let extra = mfsk_core::ft4::decode::decode_sniper_ap(
+                    audio_12k,
+                    listening_hz,
+                    MAX_CAND,
+                    mfsk_core::core::equalize::EqMode::Off,
+                    Some(&hint),
+                )
+                .into_iter()
+                .filter_map(|r| {
+                    let bits: [u8; 77] = r.message77().try_into().ok()?;
+                    build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht)
+                })
+                .filter(|d| !decodes.iter().any(|o| same_signal(o, d)))
+                .collect::<Vec<_>>();
+                decodes.extend(extra);
+            }
+        }
         // Remember who we heard, for the next slot's hashed messages.
         for d in &decodes {
             for call in [d.to.as_deref(), d.from.as_deref()].into_iter().flatten() {
@@ -148,9 +261,10 @@ impl Ft8Modem {
 /// Pack `text` into a 77-bit message, degrading to the nearest layout FT8 can
 /// carry, and report the message as the far end will read it.
 ///
-/// The ladder is: the standard exchange, then the non-standard-callsign layout
-/// (which can only carry `RRR` / `RR73` / `73`, so a grid or report is
-/// dropped), then 13 characters of free text.
+/// The ladder is: the DXpedition (Fox) layout when the text is written as one,
+/// then a directed CQ, then the standard exchange, then the
+/// non-standard-callsign layout (which can only carry `RRR` / `RR73` / `73`, so
+/// a grid or report is dropped), then 13 characters of free text.
 fn pack_message(text: &str) -> Option<([u8; 77], String)> {
     let text = text.trim().to_ascii_uppercase();
     let toks: Vec<&str> = text.split_whitespace().collect();
@@ -160,14 +274,33 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         toks.get(2).copied().unwrap_or(""),
     );
 
-    // 1. The everyday message, when both calls are standard.
+    // 0. DXpedition (Fox): "CALL1 RR73; CALL2 FOXCALL REPORT" closes one contact
+    //    and reports to the next in a single transmission. Only a Fox writes
+    //    this, and only ever with its own call third — the layout hashes it.
+    if c2 == "RR73;" && toks.len() == 5 {
+        if let Some((m, rpt)) = pack77_fox(c1, toks[2], toks[3], toks[4]) {
+            return Some((m, format!("{c1} RR73; {} <{}> {rpt}", toks[2], toks[3])));
+        }
+    }
+
+    // 1. A directed CQ: "CQ EU AB1CD FN42". The modifier is not a fourth field
+    //    — "CQ EU" packs as one token — so the message is still the everyday
+    //    three, with the first of them two words long.
+    if c1 == "CQ" && toks.len() == 4 && !c2.is_empty() {
+        let directed = format!("CQ {c2}");
+        if let Some(m) = wsjt77::pack77(&directed, toks[2], toks[3]) {
+            return Some((m, format!("{directed} {} {}", toks[2], toks[3])));
+        }
+    }
+
+    // 2. The everyday message, when both calls are standard.
     if toks.len() <= 3 {
         if let Some(m) = wsjt77::pack77(c1, c2, payload) {
             return Some((m, join3(c1, c2, payload)));
         }
     }
 
-    // 2. One compound / non-standard callsign, the other one hashed. Only a
+    // 3. One compound / non-standard callsign, the other one hashed. Only a
     //    bare RRR / RR73 / 73 fits alongside it — a grid or report is lost, so
     //    the returned text says so.
     let rpt = match payload {
@@ -198,10 +331,56 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         }
     }
 
-    // 3. Free text: 13 characters, from a restricted alphabet.
+    // 4. Free text: 13 characters, from a restricted alphabet.
     let free: String = text.chars().take(13).collect();
     let m = wsjt77::pack77_free_text(free.trim_end())?;
     Some((m, free.trim_end().to_string()))
+}
+
+/// Pack the DXpedition (Fox) layout — `i3=0, n3=1`:
+/// `[c28 rr73_call][c28 work_call][h10 fox_call][r5 report]`, then `n3` and
+/// `i3`. mfsk-core has no packer for it (only the unpacker), so the fields are
+/// written here; the bit positions are the ones `wsjt77::unpack77` reads back.
+///
+/// The report field is 5 bits in 2 dB steps (`report = 2·n5 − 30`), so an odd
+/// value lands on the nearest even one — that is the layout's resolution, not a
+/// rounding choice of ours. The quantised report is returned alongside the bits,
+/// because it is what the far end will read.
+fn pack77_fox(
+    rr73_call: &str,
+    work_call: &str,
+    fox_call: &str,
+    report: &str,
+) -> Option<([u8; 77], String)> {
+    let n28a = wsjt77::pack28(rr73_call)?;
+    let n28b = wsjt77::pack28(work_call)?;
+    if !wsjt77::is_standard_callsign(rr73_call) || !wsjt77::is_standard_callsign(work_call) {
+        return None;
+    }
+    let n10 = mfsk_core::msg::hash_table::ihashcall(fox_call, 10);
+    let db: i32 = report.trim_start_matches('+').parse().ok()?;
+    let n5 = ((db + 30) / 2).clamp(0, 31) as u32;
+
+    let mut msg = [0u8; 77];
+    let mut write = |start: usize, len: usize, val: u32| {
+        for i in 0..len {
+            msg[start + i] = ((val >> (len - 1 - i)) & 1) as u8;
+        }
+    };
+    write(0, 28, n28a);
+    write(28, 28, n28b);
+    write(56, 10, n10);
+    write(66, 5, n5);
+    write(71, 3, 1); // n3 = 1 (DXpedition)
+    write(74, 3, 0); // i3 = 0
+    Some((msg, sdroxide_types::fmt_report(2 * n5 as i16 - 30)))
+}
+
+/// True when two decodes are the same transmission seen by two passes: same
+/// text from the same place in the passband. The tolerance is a few Hz, so two
+/// stations sending identical text at different offsets stay distinct.
+fn same_signal(a: &Decode, b: &Decode) -> bool {
+    a.message == b.message && (a.audio_hz - b.audio_hz).abs() < 5.0
 }
 
 /// Join up to three message tokens, dropping the empty ones.
@@ -231,8 +410,9 @@ fn build_decode(
         from: p.from,
         grid: p.grid,
         is_cq: p.is_cq,
-        cq_dx: p.cq_dx,
+        cq_to: p.cq_to,
         free_text: p.free_text,
+        rr73_to: p.rr73_to,
     })
 }
 
@@ -243,8 +423,9 @@ struct Parsed {
     from: Option<String>,
     grid: Option<String>,
     is_cq: bool,
-    cq_dx: bool,
+    cq_to: Option<String>,
     free_text: bool,
+    rr73_to: Option<String>,
 }
 
 /// Pull the addressee, sender and grid out of a decoded message.
@@ -267,24 +448,28 @@ fn parse_message(text: &str, kind: MsgKind) -> Parsed {
         return Parsed::default();
     }
 
-    // A CQ names only its sender: "CQ [DX|POTA|EU…] <from> [grid]".
+    // A CQ names only its sender: "CQ [DX|EU|JA|POTA…] <from> [grid]". Anything
+    // sitting between "CQ" and the callsign is the modifier — who the call is
+    // aimed at, or what activity it belongs to.
     if toks[0] == "CQ" {
         return Parsed {
             from: toks.iter().skip(1).find(|t| is_callish(t)).and_then(|t| call_of(t)),
             grid: toks.last().filter(|t| is_grid(t)).map(|s| s.to_string()),
             is_cq: true,
-            cq_dx: toks.get(1) == Some(&"DX"),
+            cq_to: toks.get(1).filter(|t| !is_callish(t)).map(|t| t.to_ascii_uppercase()),
             ..Default::default()
         };
     }
 
     // DXpedition (Fox): "CALL1 RR73; CALL2 <fox> REPORT" — CALL1's contact is
     // finished and CALL2 is being worked, both by the (hashed) fox. Read it as
-    // the fox addressing CALL2; CALL1's RR73 is not ours to act on.
+    // the fox addressing CALL2, and carry CALL1's RR73 alongside: it is the only
+    // thing that tells a Hound its own contact just completed.
     if toks.get(1) == Some(&"RR73;") {
         return Parsed {
             to: toks.get(2).and_then(|t| call_of(t)),
             from: toks.get(3).and_then(|t| call_of(t)),
+            rr73_to: toks.first().and_then(|t| call_of(t)),
             ..Default::default()
         };
     }
@@ -328,7 +513,12 @@ fn is_grid(t: &str) -> bool {
 
 fn is_callish(t: &str) -> bool {
     let t = t.strip_prefix('<').and_then(|x| x.strip_suffix('>')).unwrap_or(t);
-    t.len() >= 3 && t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+    // Letters *and* a digit: a numeric CQ modifier ("CQ 001") is all digits and
+    // would otherwise be read as the calling station.
+    t.len() >= 3
+        && t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().any(|c| c.is_ascii_alphabetic())
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
 }
 
 #[cfg(test)]
@@ -345,7 +535,7 @@ mod tests {
         slot.extend_from_slice(&burst);
         slot.resize((slot_s * 12_000.0) as usize, 0.0);
         let i16buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
-        (sent, modem.decode_slot(&i16buf, 0))
+        (sent, modem.decode_slot(&i16buf, 0, &ApHints::default(), 1500.0))
     }
 
     #[test]
@@ -354,7 +544,7 @@ mod tests {
         assert_eq!(p.to, None);
         assert_eq!(p.from.as_deref(), Some("AB1CD"));
         assert_eq!(p.grid.as_deref(), Some("FN42"));
-        assert!(p.is_cq && !p.cq_dx);
+        assert!(p.is_cq && p.cq_to.is_none(), "a plain CQ is aimed at nobody in particular");
 
         let p = parse_message("W9XYZ AB1CD -13", MsgKind::Standard);
         assert_eq!(p.to.as_deref(), Some("W9XYZ"));
@@ -376,7 +566,8 @@ mod tests {
         assert_eq!(p.to, None);
         assert_eq!(p.from.as_deref(), Some("AB1CD"), "the DX modifier is not the sender");
         assert_eq!(p.grid.as_deref(), Some("FN42"));
-        assert!(p.is_cq && p.cq_dx);
+        assert!(p.is_cq);
+        assert_eq!(p.cq_to.as_deref(), Some("DX"));
 
         // "RR73" is a sign-off, not a locator — it must not be read as a grid.
         let p = parse_message("AB1CD W9XYZ RR73", MsgKind::Standard);
@@ -385,6 +576,36 @@ mod tests {
         // Invalid Maidenhead fields (S..Z) aren't grids either.
         assert!(!is_grid("ZZ99"));
         assert!(is_grid("FN42"));
+    }
+
+    #[test]
+    fn every_directed_cq_names_its_target() {
+        // Continent, country prefix and activity all read the same way: the
+        // token between "CQ" and the callsign.
+        for (msg, want) in [
+            ("CQ EU AB1CD FN42", "EU"),
+            ("CQ JA AB1CD FN42", "JA"),
+            ("CQ POTA AB1CD FN42", "POTA"),
+            ("CQ TEST AB1CD FN42", "TEST"),
+            ("CQ 001 AB1CD FN42", "001"),
+        ] {
+            let p = parse_message(msg, MsgKind::Standard);
+            assert_eq!(p.cq_to.as_deref(), Some(want), "{msg}");
+            assert_eq!(p.from.as_deref(), Some("AB1CD"), "{msg}: the modifier is not the sender");
+            assert_eq!(p.grid.as_deref(), Some("FN42"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_directed_cq_goes_out_as_one() {
+        // "CQ EU" is a single packed token, not a fourth field, so the message
+        // still fits the everyday layout.
+        let (sent, decodes) = round_trip(Mode::Ft8, "CQ EU AB1CD FN42");
+        assert_eq!(sent, "CQ EU AB1CD FN42");
+        let d = decodes.iter().find(|d| d.is_cq).expect("decoded");
+        assert_eq!(d.message, "CQ EU AB1CD FN42");
+        assert_eq!(d.cq_to.as_deref(), Some("EU"));
+        assert_eq!(d.from.as_deref(), Some("AB1CD"));
     }
 
     #[test]
@@ -436,6 +657,34 @@ mod tests {
         let p = parse_message("K1ABC RR73; W9XYZ <DX1FOX> +03", MsgKind::Fox);
         assert_eq!(p.to.as_deref(), Some("W9XYZ"));
         assert_eq!(p.from.as_deref(), Some("DX1FOX"), "the fox sent it");
+        assert_eq!(p.rr73_to.as_deref(), Some("K1ABC"), "K1ABC is the one being signed off");
+    }
+
+    #[test]
+    fn a_fox_message_round_trips() {
+        // One transmission closing K1ABC's contact and reporting to W9XYZ. The
+        // fox's own call travels as a 10-bit hash, so a receiver that has heard
+        // it resolves the name and one that hasn't sees `<...>`.
+        let mut modem = Ft8Modem::new(Mode::Ft8);
+        modem.seed_hashes(&["DX1FOX".to_string()]);
+        let (burst, sent) =
+            modem.encode_burst_12k("K1ABC RR73; W9XYZ DX1FOX +03", 1500.0, 0.5).expect("encode");
+        assert_eq!(sent, "K1ABC RR73; W9XYZ <DX1FOX> +02", "the layout carries 2 dB steps");
+
+        let mut slot = vec![0.0f32; 6_000];
+        slot.extend_from_slice(&burst);
+        slot.resize(15 * 12_000, 0.0);
+        let buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
+        let d = modem
+            .decode_slot(&buf, 0, &ApHints::default(), 1500.0)
+            .into_iter()
+            .find(|d| d.message.contains("RR73;"))
+            .expect("decoded");
+        assert_eq!(d.message, "K1ABC RR73; W9XYZ <DX1FOX> +02");
+        assert_eq!(d.rr73_to.as_deref(), Some("K1ABC"));
+        assert_eq!(d.to.as_deref(), Some("W9XYZ"));
+        assert_eq!(d.from.as_deref(), Some("DX1FOX"));
+        assert!(!d.free_text);
     }
 
     #[test]
@@ -457,6 +706,63 @@ mod tests {
             "got {:?}",
             decodes.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_priori_hints_name_the_message_we_are_waiting_for() {
+        // Our call is the addressee, the DX's the sender: "AB1CD W9XYZ R-13".
+        let ap = ApHints { my_call: "AB1CD".into(), dx_call: Some("W9XYZ".into()) };
+        let h = ap.ft8().expect("a hint");
+        assert_eq!(h.call1.as_deref(), Some("AB1CD"));
+        assert_eq!(h.call2.as_deref(), Some("W9XYZ"));
+        assert_eq!(ap.calls(), ["AB1CD", "W9XYZ"]);
+
+        // Calling CQ we still know the addressee — anyone answering names us.
+        let ap = ApHints { my_call: "AB1CD".into(), dx_call: None };
+        let h = ap.ft8().expect("a hint");
+        assert_eq!(h.call1.as_deref(), Some("AB1CD"));
+        assert_eq!(h.call2, None);
+
+        // An unconfigured station knows nothing to hint with.
+        assert!(ApHints::default().ft8().is_none());
+        assert!(ApHints::default().ft4().is_none());
+        assert!(ApHints { my_call: "  ".into(), dx_call: Some("W9XYZ".into()) }.ft8().is_none());
+    }
+
+    #[test]
+    fn an_a_priori_hint_only_ever_adds_decodes() {
+        // The hint is a fallback: mfsk-core attempts it only where an ordinary
+        // decode has already failed, and the result still has to pass CRC-14.
+        // So at any noise level the hinted pass finds everything the plain one
+        // does — which is what makes it safe to leave on all the time.
+        let ap = ApHints { my_call: "AB1CD".into(), dx_call: Some("W9XYZ".into()) };
+        let mut rng: u32 = 0x1234_5678;
+        let mut noise = || {
+            // xorshift32, so the comparison runs on identical audio each time.
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as i32 as f32) / (i32::MAX as f32)
+        };
+        for &level in &[0.05f32, 0.2, 0.5] {
+            let modem = Ft8Modem::new(Mode::Ft8);
+            let (burst, _) = modem.encode_burst_12k("AB1CD W9XYZ -13", 1500.0, 0.5).unwrap();
+            let mut slot = vec![0.0f32; 6_000];
+            slot.extend_from_slice(&burst);
+            slot.resize(15 * 12_000, 0.0);
+            let buf: Vec<i16> =
+                slot.iter().map(|&s| ((s + level * noise()) * 12_000.0) as i16).collect();
+
+            let plain = Ft8Modem::new(Mode::Ft8).decode_slot(&buf, 0, &ApHints::default(), 1500.0);
+            let hinted = Ft8Modem::new(Mode::Ft8).decode_slot(&buf, 0, &ap, 1500.0);
+            for d in &plain {
+                assert!(
+                    hinted.iter().any(|h| h.message == d.message),
+                    "noise {level}: the hinted pass lost {:?}",
+                    d.message
+                );
+            }
+        }
     }
 
     #[test]
@@ -497,7 +803,7 @@ mod tests {
         slot.resize(15 * 12_000, 0.0);
         let buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
         let d = modem
-            .decode_slot(&buf, 0)
+            .decode_slot(&buf, 0, &ApHints::default(), 1500.0)
             .into_iter()
             .find(|d| d.message.contains("DL/W1AW"))
             .expect("decoded");

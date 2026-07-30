@@ -82,6 +82,7 @@ pub enum Action {
     ZoomOut,
     PeakHold,
     SpectrumCollapse,
+    WaterfallFlip,
     ToggleHelp,
     ToggleSettings,
     ToggleLogbook,
@@ -123,7 +124,7 @@ impl Action {
             Ptt | TuneCarrier | TxDrive | TuneDrive | MicGain | DigiAudioFreq | AbortTx
             | VoicePlay(_) | VoiceStop => "Transmit",
             SpectrumZoom | SpectrumPan | SpectrumFloorDb | SpectrumCeilDb | FitSpan | ZoomIn
-            | ZoomOut | PeakHold | SpectrumCollapse => "Display",
+            | ZoomOut | PeakHold | SpectrumCollapse | WaterfallFlip => "Display",
             ToggleHelp | ToggleSettings | ToggleLogbook | ToggleSpots | ToggleMemories
             | ToggleVoice => "Windows",
         }
@@ -177,6 +178,7 @@ impl Action {
             ZoomOut => "Zoom out",
             PeakHold => "Peak hold",
             SpectrumCollapse => "Collapse spectrum",
+            WaterfallFlip => "Flip waterfall",
             ToggleHelp => "Manual window",
             ToggleSettings => "Settings window",
             ToggleLogbook => "Logbook window",
@@ -262,6 +264,7 @@ impl Action {
             ZoomOut,
             PeakHold,
             SpectrumCollapse,
+            WaterfallFlip,
             ToggleHelp,
             ToggleSettings,
             ToggleLogbook,
@@ -467,6 +470,7 @@ impl KeyBinding {
             KeyBinding::toggle(KeyChord::plain("M"), Action::Mute),
             KeyBinding::toggle(KeyChord::plain("N"), Action::NoiseBlanker),
             KeyBinding::toggle(KeyChord::plain("F"), Action::FitSpan),
+            KeyBinding::toggle(KeyChord::plain("V"), Action::WaterfallFlip),
         ];
         // Numpad 1–9 then 0 play slots 1–10; numpad "−" stops a message early.
         for slot in 0..crate::VOICE_SLOTS as u8 {
@@ -722,9 +726,8 @@ impl RelativeMode {
         if values.len() < 2 {
             return RelativeMode::Absolute;
         }
-        let count = |r: std::ops::RangeInclusive<u8>| {
-            values.iter().filter(|v| r.contains(v)).count()
-        };
+        let count =
+            |r: std::ops::RangeInclusive<u8>| values.iter().filter(|v| r.contains(v)).count();
         let small_pos = count(1..=8);
         let high_wrap = count(120..=127);
         let low_neg = count(65..=72);

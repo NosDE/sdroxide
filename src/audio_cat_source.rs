@@ -102,7 +102,8 @@ impl AudioCatSource {
             }
         };
         // `MonoResampler::new` returns None when the rates match.
-        let tx_resampler = out.as_ref().and_then(|(o, _)| MonoResampler::new(48_000.0, o.sample_rate));
+        let tx_resampler =
+            out.as_ref().and_then(|(o, _)| MonoResampler::new(48_000.0, o.sample_rate));
 
         let label = format!("CAT rig ({}) on {}", cfg.family.label(), cfg.serial.path);
         let audio_bw = cfg.audio_bw_hz;

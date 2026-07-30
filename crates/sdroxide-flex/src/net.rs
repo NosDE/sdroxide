@@ -408,17 +408,15 @@ impl FlexHandle {
             .map_err(|e| FlexError::msg(format!("bind UDP: {e}")))?;
         udp.set_nonblocking(true).map_err(|e| FlexError::msg(e.to_string()))?;
         enlarge_recv_buffer(&udp);
-        let udp_port =
-            udp.local_addr().map_err(|e| FlexError::msg(e.to_string()))?.port();
+        let udp_port = udp.local_addr().map_err(|e| FlexError::msg(e.to_string()))?.port();
 
         // Register as a GUI client: a stand-alone client owns its slices and
         // panadapter, and works with no SmartSDR running.
         // Reuse the identity of earlier sessions where we have one: the radio
         // keeps a GUI client's slices and panadapters per client id.
         let want_id = cfg.client_id.as_deref().filter(|s| !s.trim().is_empty());
-        let client_id = conn
-            .request(&p::client_gui(want_id), deadline, &mut spill)
-            .map(|body| {
+        let client_id =
+            conn.request(&p::client_gui(want_id), deadline, &mut spill).map(|body| {
                 let id = body.trim().to_string();
                 if id.is_empty() { want_id.unwrap_or_default().to_string() } else { id }
             })?;
@@ -629,7 +627,11 @@ impl FlexHandle {
                 let _ = conn.request(
                     &p::pan_set(
                         id,
-                        &format!("center={} bandwidth={} fps=1", p::mhz(center_hz), p::mhz(iq_rate)),
+                        &format!(
+                            "center={} bandwidth={} fps=1",
+                            p::mhz(center_hz),
+                            p::mhz(iq_rate)
+                        ),
                     ),
                     deadline,
                     spill,
@@ -651,8 +653,10 @@ impl FlexHandle {
                 // One the radio kept for us from an earlier session is ours to
                 // take back — that is what stops sessions from stacking up
                 // panadapters until the radio runs out of receivers.
-                let ours =
-                    inventory.iter().find(|pan| pan.client_handle == Some(conn.handle)).map(|p| p.id);
+                let ours = inventory
+                    .iter()
+                    .find(|pan| pan.client_handle == Some(conn.handle))
+                    .map(|p| p.id);
                 let Some(id) = ours.or_else(|| inventory.first().map(|p| p.id)) else {
                     return Err(FlexError::msg(format!(
                         "{e} — close a panadapter in SmartSDR, or wait for the previous \
@@ -661,7 +665,9 @@ impl FlexHandle {
                 };
                 if ours.is_some() {
                     owned.pan = Some(id);
-                    tracing::info!("Flex: reusing panadapter 0x{id:08X}, which the radio kept for us");
+                    tracing::info!(
+                        "Flex: reusing panadapter 0x{id:08X}, which the radio kept for us"
+                    );
                     let _ = conn.request(
                         &p::pan_set(
                             id,
@@ -778,7 +784,9 @@ impl FlexHandle {
                     .find(|s| s.in_use && s.client_handle == Some(conn.handle))
                     .map(|s| s.idx);
                 let idx = ours
-                    .or_else(|| inventory.iter().find(|s| s.in_use && s.pan == Some(pan)).map(|s| s.idx))
+                    .or_else(|| {
+                        inventory.iter().find(|s| s.in_use && s.pan == Some(pan)).map(|s| s.idx)
+                    })
                     .or_else(|| inventory.iter().find(|s| s.in_use).map(|s| s.idx))
                     .ok_or_else(|| {
                         FlexError::msg(format!("{e} — free a slice in SmartSDR and try again"))
@@ -810,10 +818,7 @@ impl FlexHandle {
                         .map(|mhz| mhz * 1e6)
                         && (hz - center_hz).abs() > 1.0
                     {
-                        tracing::info!(
-                            "Flex: following the shared slice to {:.6} MHz",
-                            hz / 1e6
-                        );
+                        tracing::info!("Flex: following the shared slice to {:.6} MHz", hz / 1e6);
                         centre = hz;
                         let _ = conn.request(&p::pan_center(pan, hz), deadline, spill);
                     }
@@ -867,7 +872,9 @@ impl FlexHandle {
             .map(|pan| pan.id)
             .collect();
         for id in strays {
-            tracing::info!("Flex: releasing panadapter 0x{id:08X}, left over from an earlier session");
+            tracing::info!(
+                "Flex: releasing panadapter 0x{id:08X}, left over from an earlier session"
+            );
             let _ = conn.request(&p::pan_remove(id), deadline, spill);
         }
     }
@@ -1084,11 +1091,7 @@ fn ring_ms(floats: usize, rate_hz: f64) -> u64 {
 /// is what an all-zero stream looks like — a real but weak signal reads as a
 /// large negative number instead.
 fn dbfs(v: f32) -> String {
-    if v <= 0.0 {
-        "-inf dBFS".to_string()
-    } else {
-        format!("{:.1} dBFS", 20.0 * v.log10())
-    }
+    if v <= 0.0 { "-inf dBFS".to_string() } else { format!("{:.1} dBFS", 20.0 * v.log10()) }
 }
 
 /// Keep reading status for `window`, for the moment after a command failed and
@@ -1193,7 +1196,6 @@ fn slice_inventory(lines: &[Line]) -> Vec<SliceInfo> {
     out.sort_by_key(|s| s.idx);
     out
 }
-
 
 // ── The streaming thread ──
 
@@ -1479,8 +1481,9 @@ impl NetThread {
         let pending_pan = self.pending_pan == Some(seq);
         let pending_slice = self.pending_slice == Some(seq);
         if code != 0 {
-            let why =
-                p::code_text(code).map(|t| t.to_string()).unwrap_or_else(|| format!("0x{code:08X}"));
+            let why = p::code_text(code)
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| format!("0x{code:08X}"));
             if pending_pan || pending_slice {
                 // Nothing to fall back on: the object we were sharing is gone
                 // and the radio won't give us one. Say so plainly — this is why
@@ -1563,9 +1566,7 @@ impl NetThread {
                 let hz = f * 1e6;
                 // Ignore the echo of our own tuning; a real dial move is
                 // anything that arrives outside the grace window.
-                let ours = self
-                    .if_cmd_at
-                    .is_some_and(|t| t.elapsed() < ECHO_GRACE)
+                let ours = self.if_cmd_at.is_some_and(|t| t.elapsed() < ECHO_GRACE)
                     && (hz - (self.center + self.if_hz)).abs() < 1.0;
                 if !ours {
                     let _ = self.updates.send(FlexUpdate::Freq(hz));
@@ -1915,9 +1916,9 @@ impl NetThread {
 
         // What the engine still owes the radio: queued 24 kHz audio plus the
         // packets already sent but not yet played out, both in 48 kHz samples.
-        let ahead = self.tx_sent.saturating_sub(
-            (started.elapsed().as_secs_f64() * DAX_RATE_HZ as f64) as u64,
-        );
+        let ahead = self
+            .tx_sent
+            .saturating_sub((started.elapsed().as_secs_f64() * DAX_RATE_HZ as f64) as u64);
         self.tx_backlog.store((self.tx_out.len() as u64 + ahead) as usize * 2, Ordering::Relaxed);
     }
 }
@@ -2035,7 +2036,10 @@ mod tests {
         assert_eq!(p::field(&body, "model"), Some("FLEX-8400"));
         assert_eq!(p::field(&body, "atu_present"), Some("1"));
         // Anything that is not the radio object is not it.
-        assert_eq!(radio_status(&Line::Status { handle: 0, body: "slice 0 mode=USB".into() }), None);
+        assert_eq!(
+            radio_status(&Line::Status { handle: 0, body: "slice 0 mode=USB".into() }),
+            None
+        );
         assert_eq!(radio_status(&Line::Version("1.0".into())), None);
     }
 }

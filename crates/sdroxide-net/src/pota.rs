@@ -19,10 +19,7 @@ fn parse(body: &str, now: i64) -> Result<Vec<Spot>, String> {
     let mut out = Vec::with_capacity(arr.len());
     for e in arr {
         // frequency is kHz as a string, e.g. "14074".
-        let freq_khz: f64 = e
-            .get("frequency")
-            .and_then(json_num)
-            .unwrap_or(0.0);
+        let freq_khz: f64 = e.get("frequency").and_then(json_num).unwrap_or(0.0);
         if freq_khz <= 0.0 {
             continue;
         }
@@ -38,7 +35,8 @@ fn parse(body: &str, now: i64) -> Result<Vec<Spot>, String> {
         let park = str_field(e, "name");
         let park = if park.is_empty() { str_field(e, "parkName") } else { park };
         let loc_desc = str_field(e, "locationDesc");
-        let comment = if loc_desc.is_empty() { park.clone() } else { format!("{park} ({loc_desc})") };
+        let comment =
+            if loc_desc.is_empty() { park.clone() } else { format!("{park} ({loc_desc})") };
         let grid = {
             let g = str_field(e, "grid6");
             let g = if g.is_empty() { str_field(e, "grid4") } else { g };
@@ -46,10 +44,11 @@ fn parse(body: &str, now: i64) -> Result<Vec<Spot>, String> {
         };
         let spotter = str_field(e, "spotter");
         // POTA gives the park's lat/lon directly — use it for the map.
-        let loc = match (e.get("latitude").and_then(json_num), e.get("longitude").and_then(json_num)) {
-            (Some(lat), Some(lon)) if lat != 0.0 || lon != 0.0 => Some((lat, lon)),
-            _ => None,
-        };
+        let loc =
+            match (e.get("latitude").and_then(json_num), e.get("longitude").and_then(json_num)) {
+                (Some(lat), Some(lon)) if lat != 0.0 || lon != 0.0 => Some((lat, lon)),
+                _ => None,
+            };
         out.push(Spot {
             id: Spot::make_id(SpotKind::Pota, &call, freq_hz),
             kind: SpotKind::Pota,

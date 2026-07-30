@@ -291,9 +291,8 @@ impl Rade {
         let base = out.len();
         out.resize(base + self.n_tx_eoo_out, Complex32::default());
         // Safety: `out` has `n_tx_eoo_out` writable slots from `base`.
-        let n = unsafe {
-            sys::rade_tx_eoo(self.r, out[base..].as_mut_ptr() as *mut sys::RADE_COMP)
-        };
+        let n =
+            unsafe { sys::rade_tx_eoo(self.r, out[base..].as_mut_ptr() as *mut sys::RADE_COMP) };
         out.truncate(base + n.max(0) as usize);
         Ok(())
     }
@@ -376,10 +375,7 @@ mod tests {
         assert!(matches!(r.rx(&short, &mut feats, &mut eoo), Err(RadeError::BadLength { .. })));
         let long = vec![Complex32::default(); r.nin() + 1];
         assert!(matches!(r.rx(&long, &mut feats, &mut eoo), Err(RadeError::BadLength { .. })));
-        assert!(matches!(
-            r.tx(&[0.0; 8], &mut Vec::new()),
-            Err(RadeError::BadLength { .. })
-        ));
+        assert!(matches!(r.tx(&[0.0; 8], &mut Vec::new()), Err(RadeError::BadLength { .. })));
     }
 
     #[test]

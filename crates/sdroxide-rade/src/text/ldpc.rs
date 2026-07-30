@@ -227,8 +227,8 @@ pub(crate) fn decode(syms: &[Sym; K], amps: &[f32; K], noise_var: f32) -> Decode
                 // Dividing this edge out of the product: its own sign multiplied
                 // back in cancels it, since every sign is ±1.
                 let inv_sign = if v >= 0.0 { 1.0 } else { -1.0 };
-                m_cv[e] = (inv_sign * sign * phi(sum - phi(v.abs())).max(0.0))
-                    .clamp(-LLR_MAX, LLR_MAX);
+                m_cv[e] =
+                    (inv_sign * sign * phi(sum - phi(v.abs())).max(0.0)).clamp(-LLR_MAX, LLR_MAX);
             }
         }
 

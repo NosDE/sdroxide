@@ -1,0 +1,18 @@
+[package]
+name = "sdroxide-rtlsdr"
+version.workspace = true
+edition.workspace = true
+
+# Native-only RTL2832U (RTL-SDR) support over USB. Pure Rust via `nusb` — no
+# libusb, no libSoapySDR, no C dependency at all. Must never be a dependency of
+# any wasm-targeted crate.
+[dependencies]
+sdroxide-types.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+nusb.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

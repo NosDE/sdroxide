@@ -49,6 +49,10 @@ const BROADCAST_CAP: usize = 64;
 pub(crate) struct SolarLatest {
     pub sun: Option<SolarServerMsg>,
     pub aurora: Option<SolarServerMsg>,
+    /// The two cloud channels, kept apart so a refreshed infrared frame does
+    /// not drop the visible one a viewer has not seen yet.
+    pub clouds_ir: Option<SolarServerMsg>,
+    pub clouds_vis: Option<SolarServerMsg>,
     pub tles_amateur: Option<SolarServerMsg>,
     pub tles_geo: Option<SolarServerMsg>,
     pub weather: Option<SolarServerMsg>,
@@ -72,6 +76,8 @@ impl SolarLatest {
             &self.tles_amateur,
             &self.tles_geo,
             &self.aurora,
+            &self.clouds_ir,
+            &self.clouds_vis,
             &self.sun,
         ]
         .into_iter()
@@ -92,6 +98,8 @@ impl SolarLatest {
     fn clear_feed_products(&mut self) {
         self.sun = None;
         self.aurora = None;
+        self.clouds_ir = None;
+        self.clouds_vis = None;
         self.tles_amateur = None;
         self.tles_geo = None;
         self.weather = None;
@@ -103,6 +111,8 @@ impl SolarLatest {
         let slot = match msg {
             SolarServerMsg::Sun { .. } => &mut self.sun,
             SolarServerMsg::Aurora(_) => &mut self.aurora,
+            SolarServerMsg::Clouds { infrared: true, .. } => &mut self.clouds_ir,
+            SolarServerMsg::Clouds { infrared: false, .. } => &mut self.clouds_vis,
             SolarServerMsg::Tles { geo: false, .. } => &mut self.tles_amateur,
             SolarServerMsg::Tles { geo: true, .. } => &mut self.tles_geo,
             SolarServerMsg::Weather { .. } => &mut self.weather,
@@ -205,11 +215,7 @@ async fn session(mut socket: WebSocket, shared: Arc<Shared>) {
         },
         _ => return,
     }
-    if socket
-        .send(msg(&SolarServerMsg::HelloAck { proto: SOLAR_PROTO_VERSION }))
-        .await
-        .is_err()
-    {
+    if socket.send(msg(&SolarServerMsg::HelloAck { proto: SOLAR_PROTO_VERSION })).await.is_err() {
         return;
     }
 
@@ -369,6 +375,14 @@ fn solar_pump(
                 }
                 RawUpdate::Tle { geo, text } => {
                     shared.solar.publish(SolarServerMsg::Tles { geo, text });
+                }
+                RawUpdate::Clouds { band, frame_unix, fetched_unix, png } => {
+                    shared.solar.publish(SolarServerMsg::Clouds {
+                        infrared: band == sdroxide_solar::Band::Longwave,
+                        frame_unix,
+                        fetched_unix,
+                        png,
+                    });
                 }
             }
         }

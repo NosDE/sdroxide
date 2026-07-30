@@ -165,16 +165,7 @@ impl RadeWorker {
             .expect("spawn sdroxide-rade thread");
 
         info!(rx_rate, audio_rate, "RADE worker started");
-        Ok(RadeWorker {
-            rx_in,
-            rx_out,
-            tx_in,
-            tx_out,
-            ctl,
-            text_rx,
-            shared,
-            thread: Some(thread),
-        })
+        Ok(RadeWorker { rx_in, rx_out, tx_in, tx_out, ctl, text_rx, shared, thread: Some(thread) })
     }
 
     /// Set the callsign transmitted in the End-of-Over frame. Empty clears it.
@@ -275,7 +266,8 @@ impl Drop for RadeWorker {
 
 fn push(ring: &mut rtrb::Producer<f32>, audio: &[f32], shared: &Shared) {
     if ring.slots() < audio.len() {
-        let n = shared.dropped.fetch_add(audio.len() as u64, Ordering::Relaxed) + audio.len() as u64;
+        let n =
+            shared.dropped.fetch_add(audio.len() as u64, Ordering::Relaxed) + audio.len() as u64;
         if n.is_power_of_two() {
             warn!(dropped = n, "RADE ring full, dropping audio");
         }
@@ -416,9 +408,8 @@ impl Inner {
         while self.buf8.len() >= self.rade.nin() {
             let nin = self.rade.nin();
             self.iq.clear();
-            self.iq.extend(
-                self.buf8[..nin].iter().map(|&s| Complex32::new(s * RX_REAL_SCALE, 0.0)),
-            );
+            self.iq
+                .extend(self.buf8[..nin].iter().map(|&s| Complex32::new(s * RX_REAL_SCALE, 0.0)));
             self.buf8.drain(..nin);
 
             let out = match self.rade.rx(&self.iq, &mut self.features, &mut self.eoo_rx) {
@@ -437,9 +428,7 @@ impl Inner {
                 // on this thread — never the audio callback.
                 if let Some(call) = crate::text::decode(&self.eoo_rx) {
                     info!(%call, snr_db = self.last_sync_snr, "RADE End-of-Over callsign");
-                    let _ = self
-                        .text_tx
-                        .send(RadeTextRx { call, snr_db: self.last_sync_snr });
+                    let _ = self.text_tx.send(RadeTextRx { call, snr_db: self.last_sync_snr });
                 }
             }
             if out.n_features == 0 {

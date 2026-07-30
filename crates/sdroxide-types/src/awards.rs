@@ -79,7 +79,9 @@ pub fn compute_awards(log: &[QsoRecord], band: Option<&str>, mode: Option<&str>)
         }
 
         // WAZ: record's CQ zone, else the resolver's.
-        if let Some(z) = q.cq_zone.or_else(|| ent.map(|e| e.cq_zone)).filter(|&z| (1..=40).contains(&z)) {
+        if let Some(z) =
+            q.cq_zone.or_else(|| ent.map(|e| e.cq_zone)).filter(|&z| (1..=40).contains(&z))
+        {
             let s = a.waz.entry(z).or_default();
             s.worked = true;
             s.confirmed |= conf;
@@ -111,6 +113,58 @@ pub fn compute_awards(log: &[QsoRecord], band: Option<&str>, mode: Option<&str>)
 /// The DXCC entity name for a callsign, if resolvable.
 pub fn entity_name(call: &str) -> Option<&'static str> {
     entity::resolve_callsign(call).map(|e| e.name)
+}
+
+// ── "What is still missing?" — the award tallies, placed on the map ──
+
+/// How far along one award slot is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Never worked. The thing a heat map exists to show.
+    Missing,
+    /// In the log, but no QSL of any kind has come back.
+    Worked,
+    Confirmed,
+}
+
+/// One DXCC entity, where it is, and how far along it is in the log.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntitySlot {
+    pub name: &'static str,
+    pub lat: f64,
+    pub lon: f64,
+    pub continent: &'static str,
+    pub coverage: Coverage,
+}
+
+/// Every DXCC entity the country file knows, placed and judged against
+/// `awards` — the whole target set, not only the part already in the log,
+/// because the gaps are the point.
+///
+/// Entities the log names but the country file does not (an imported log's own
+/// country column, a deleted entity) are left out: there is nowhere to draw
+/// them, and inventing a position would be worse than omitting one.
+pub fn entity_coverage(awards: &Awards) -> Vec<EntitySlot> {
+    entity::all_entities()
+        .iter()
+        .map(|e| EntitySlot {
+            name: e.name,
+            lat: e.lat,
+            lon: e.lon,
+            continent: e.continent,
+            coverage: match awards.dxcc.get(e.name) {
+                Some(s) if s.confirmed => Coverage::Confirmed,
+                Some(s) if s.worked => Coverage::Worked,
+                _ => Coverage::Missing,
+            },
+        })
+        .collect()
+}
+
+/// (missing, worked, confirmed) over a coverage list.
+pub fn coverage_counts(slots: &[EntitySlot]) -> (usize, usize, usize) {
+    let count = |c: Coverage| slots.iter().filter(|s| s.coverage == c).count();
+    (count(Coverage::Missing), count(Coverage::Worked), count(Coverage::Confirmed))
 }
 
 // ── "Is this one worth working?" — the live decode list's view of the log ──
@@ -295,6 +349,28 @@ mod tests {
         let n = ix.novelty("W1AW", Some("FN31"), "15m");
         assert!(!n.dupe);
         assert_eq!(n.highlight(), Some(Highlight::NewDxccBand));
+    }
+
+    /// The heat map's job is to show the gaps, so the list has to carry every
+    /// entity — including the hundreds nobody has worked yet — and rank a
+    /// confirmed one above a merely worked one.
+    #[test]
+    fn coverage_places_every_entity_and_grades_the_log() {
+        let mut worked = qso("DL1ABC", "20m", Some("JO62"));
+        let mut confirmed = qso("JA1XYZ", "20m", Some("PM95"));
+        confirmed.lotw_rcvd = true;
+        worked.lotw_rcvd = false;
+        let a = compute_awards(&[worked, confirmed], None, None);
+
+        let slots = entity_coverage(&a);
+        let find = |name: &str| *slots.iter().find(|s| s.name == name).expect(name);
+        assert_eq!(find("Fed. Rep. of Germany").coverage, Coverage::Worked);
+        assert_eq!(find("Japan").coverage, Coverage::Confirmed);
+        assert_eq!(find("Mongolia").coverage, Coverage::Missing);
+
+        let (missing, worked, confirmed) = coverage_counts(&slots);
+        assert_eq!((worked, confirmed), (1, 1));
+        assert_eq!(missing, slots.len() - 2, "the rest of the world should read as missing");
     }
 
     #[test]

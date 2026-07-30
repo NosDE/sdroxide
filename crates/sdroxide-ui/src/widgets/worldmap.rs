@@ -58,11 +58,7 @@ fn centroid(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
 
 /// The view to ease toward: centred on home (else the contacts' centroid),
 /// zoomed symmetrically to frame home plus every contact.
-fn target_view(
-    home: Option<(f64, f64)>,
-    contacts: &[(f64, f64)],
-    aspect: f64,
-) -> (f64, f64, f64) {
+fn target_view(home: Option<(f64, f64)>, contacts: &[(f64, f64)], aspect: f64) -> (f64, f64, f64) {
     let (clat, clon) = home.or_else(|| centroid(contacts)).unwrap_or((20.0, 0.0));
     if contacts.is_empty() {
         // Nothing to frame yet: whole world, centred on home.

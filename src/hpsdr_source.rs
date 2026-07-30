@@ -1,13 +1,19 @@
-//! An [`IqSource`] for an OpenHPSDR ethernet SDR (Protocol 2). The board's DDC
-//! delivers wideband complex I/Q, so this drives the engine's normal DDC/demod
-//! path exactly like a SoapySDR device (`audio_mode = false`); transmit I/Q goes
-//! to the board's DUC.
+//! An [`IqSource`] for an OpenHPSDR ethernet SDR, Protocol 1 (Metis /
+//! Hermes-Lite 2) or Protocol 2 — the protocol is detected at open time. The
+//! board's DDC delivers wideband complex I/Q, so this drives the engine's normal
+//! DDC/demod path exactly like a SoapySDR device (`audio_mode = false`);
+//! transmit I/Q goes to the board's DUC (P2) or the EP2 frame stream (P1).
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use sdroxide_hpsdr::HpsdrHandle;
+use sdroxide_hpsdr::{HpsdrHandle, LNA_GAIN_ELEMENT};
 use sdroxide_radio::{Complex32, IqSource, Result};
+
+/// How long the board may deliver no I/Q at all before the connection counts as
+/// dead and the engine starts reconnecting. Comfortably longer than the few
+/// milliseconds a healthy board takes to begin streaming after the run command.
+const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(5);
 
 pub struct HpsdrSource {
     handle: HpsdrHandle,
@@ -18,9 +24,22 @@ pub struct HpsdrSource {
 }
 
 impl HpsdrSource {
-    /// Open a Protocol 2 connection and start streaming at `center_hz`.
-    pub fn open(ip: Ipv4Addr, sample_rate_hz: f64, center_hz: f64) -> anyhow::Result<Self> {
-        let handle = HpsdrHandle::open(ip, sample_rate_hz)?;
+    /// Open a connection and start streaming at `center_hz`, taking the rate,
+    /// the initial front-end gain and the J16 accessory board from `cfg`. The
+    /// target IP is resolved by the caller, so `cfg`'s address fields are unused
+    /// here.
+    pub fn open(
+        ip: Ipv4Addr,
+        cfg: &sdroxide_types::HpsdrConfig,
+        center_hz: f64,
+    ) -> anyhow::Result<Self> {
+        let handle = HpsdrHandle::open(
+            ip,
+            cfg.sample_rate_hz,
+            cfg.lna_gain_db,
+            cfg.filter_board,
+            cfg.invert_spectrum,
+        )?;
         handle.set_rx_freq(center_hz);
         let label =
             format!("HPSDR {} @ {ip} ({:.3} Msps)", handle.board, handle.sample_rate_hz / 1e6);
@@ -47,6 +66,11 @@ impl HpsdrSource {
 
     pub fn protocol(&self) -> u8 {
         self.handle.protocol
+    }
+
+    /// Whether the board has a front-end gain the UI should offer.
+    pub fn has_lna_gain(&self) -> bool {
+        self.handle.has_lna_gain()
     }
 }
 
@@ -85,6 +109,32 @@ impl IqSource for HpsdrSource {
 
     fn describe(&self) -> String {
         self.label.clone()
+    }
+
+    /// The board's front-end LNA gain. On a Hermes-Lite 2 this is the only
+    /// analogue gain there is, and leaving it at whatever the gateware came up
+    /// with is the difference between a deaf receiver and a clipping one.
+    fn set_gain_element(&mut self, name: &str, db: f64) -> Result<()> {
+        if name == LNA_GAIN_ELEMENT {
+            self.handle.set_lna_gain_db(db);
+        }
+        Ok(())
+    }
+
+    fn current_gains(&self) -> Vec<(String, f64)> {
+        if self.handle.has_lna_gain() {
+            vec![(LNA_GAIN_ELEMENT.to_string(), self.handle.lna_gain_db())]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A board that has stopped delivering I/Q — unplugged, rebooted, taken over
+    /// by another program, or opened with the wrong protocol because a probe was
+    /// lost — is reported as needing a reopen so the engine reconnects on its
+    /// own. Without this the operator has to press Apply again by hand.
+    fn needs_reopen(&self) -> bool {
+        self.handle.silent_for() >= SILENCE_BEFORE_REOPEN
     }
 
     fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {

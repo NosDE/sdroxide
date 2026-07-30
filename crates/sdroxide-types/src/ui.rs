@@ -52,7 +52,7 @@ impl Default for UiSettings {
             spectrum_speed: Speed::Medium,
             waterfall_palette: 0,
             spectrum_gradient: true,
-            gradient_top: [64, 0, 0], // dark red
+            gradient_top: [64, 0, 0],   // dark red
             gradient_bottom: [0, 0, 0], // black
         }
     }
@@ -70,11 +70,15 @@ impl UiSettings {
     /// Waterfall scroll rate in rows per second. Absolute (independent of the
     /// frame rate) so the time axis — and the 60-second gridlines — stay stable
     /// when the frame rate changes.
+    ///
+    /// `Fast` is twice the old fast rate, which now sits on `Medium`: at 28
+    /// rows/s a CW or FT8 trace still smears vertically, and chasing a fading
+    /// signal wants the extra time resolution. It costs nothing but rows.
     pub fn waterfall_rows_per_sec(self) -> f32 {
         match self.waterfall_speed {
             Speed::Slow => 5.0,
-            Speed::Medium => 12.0,
-            Speed::Fast => 28.0,
+            Speed::Medium => 28.0,
+            Speed::Fast => 56.0,
         }
     }
 

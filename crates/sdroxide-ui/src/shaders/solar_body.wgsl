@@ -56,6 +56,22 @@ const PI = 3.14159265;
 /// 1/22.75° map has in it.
 const COAST_PX = 0.6;
 
+/// Self-illumination for the coastline and the borders, added on the night
+/// side.
+///
+/// The coast and the borders are a *line drawing* over the globe, not a
+/// physical feature of it, and a line drawing has no business going dark
+/// because the Sun set on it. Without this the whole night hemisphere is a
+/// featureless slab and there is nowhere to put a QSO arc's far end, an
+/// auroral oval or a satellite footprint — everything that happens at night is
+/// the interesting half.
+///
+/// Deliberately small. This is a hint of the map showing through, not a second
+/// daylit side: the terminator has to stay the most obvious thing on the globe,
+/// and the borders keep their place below the coast in the hierarchy.
+const COAST_GLOW  = 0.16;
+const BORDER_GLOW = 0.085;
+
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let lo = c / 12.92;
     let hi = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
@@ -184,6 +200,12 @@ fn shade_earth(in: VsOut, n: vec3<f32>) -> vec3<f32> {
     // by, and a border that competed with it would bury the map.
     let border = textureSample(border_tex, samp, in.uv).r;
     col = mix(col, srgb_to_linear(COAST) * (0.30 + 0.55 * day), border * 0.5 * (0.35 + 0.65 * day));
+
+    // Both line layers glow faintly once the Sun is off them. Emitted rather
+    // than mixed, and ramped in on the same soft terminator the shading uses,
+    // so it arrives the way city lights do instead of at a hard edge.
+    let night = 1.0 - day;
+    col += srgb_to_linear(COAST) * night * (coast * COAST_GLOW + border * BORDER_GLOW);
 
     // Atmospheric limb. Brightest on the daylit edge, which is what gives the
     // globe its depth against a black background.

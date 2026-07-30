@@ -97,10 +97,8 @@ pub fn parse(buf: &[u8]) -> Option<Packet<'_>> {
     let packet_type = buf[0] >> 4;
     let has_class = buf[0] & 0x08 != 0;
     let has_trailer = buf[0] & 0x04 != 0;
-    let has_stream = matches!(
-        packet_type,
-        packet_type::IF_DATA_WITH_STREAM | packet_type::EXT_DATA_WITH_STREAM
-    );
+    let has_stream =
+        matches!(packet_type, packet_type::IF_DATA_WITH_STREAM | packet_type::EXT_DATA_WITH_STREAM);
     if !has_class || !has_stream {
         return None;
     }
@@ -387,10 +385,7 @@ mod tests {
         let payload = [0x00, 0x01, 0x12, 0x34, 0x00, 0x05, 0xFF, 0xFF];
         assert_eq!(
             decode_meters(&payload),
-            vec![
-                MeterSample { id: 1, raw: 0x1234 },
-                MeterSample { id: 5, raw: -1 },
-            ]
+            vec![MeterSample { id: 1, raw: 0x1234 }, MeterSample { id: 5, raw: -1 },]
         );
     }
 }

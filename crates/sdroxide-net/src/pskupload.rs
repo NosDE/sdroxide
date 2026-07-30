@@ -226,7 +226,12 @@ impl PskUploadHandle {
 
 /// Start the uploader for `rx`. Reports are batched and sent every
 /// `interval_secs` (floored at the collector's five-minute minimum).
-pub fn spawn(cfg: &PskConfig, rx: Station, events: EventTx, now_utc: fn() -> i64) -> PskUploadHandle {
+pub fn spawn(
+    cfg: &PskConfig,
+    rx: Station,
+    events: EventTx,
+    now_utc: fn() -> i64,
+) -> PskUploadHandle {
     let (tx, report_rx) = crossbeam_channel::unbounded::<Report>();
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
     let host = if cfg.host.trim().is_empty() {
@@ -305,9 +310,8 @@ fn run(
 /// Fold a report into the pending batch: one entry per callsign per band, the
 /// strongest signal winning, since that is the report the network keeps anyway.
 fn merge(pending: &mut Vec<Report>, r: Report) {
-    if let Some(e) = pending
-        .iter_mut()
-        .find(|e| e.call == r.call && e.freq_hz.abs_diff(r.freq_hz) < 10_000)
+    if let Some(e) =
+        pending.iter_mut().find(|e| e.call == r.call && e.freq_hz.abs_diff(r.freq_hz) < 10_000)
     {
         if r.snr_db >= e.snr_db {
             *e = r;
@@ -409,8 +413,7 @@ mod tests {
     fn a_full_batch_splits_across_packets() {
         // Every report has to go somewhere: no packet may exceed the MTU
         // budget, and the batch loop must make progress on each pass.
-        let reports: Vec<Report> =
-            (0..200).map(|i| report(&format!("W9XY{i:03}"), -10)).collect();
+        let reports: Vec<Report> = (0..200).map(|i| report(&format!("W9XY{i:03}"), -10)).collect();
         let mut sent = 0;
         let mut packets = 0;
         while sent < reports.len() {

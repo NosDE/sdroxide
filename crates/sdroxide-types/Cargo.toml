@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+# Parses the bundled broadcast-station table (src/broadcast_stations.json) at
+# first use, and round-trip tests for the types `sdroxide-config` persists.
+# Pure Rust, so the crate still builds for wasm32.
+serde_json = "1"

@@ -607,8 +607,9 @@ impl NetThread {
                             // Ignore echoes right after our own dds/if commands —
                             // during a fast drag they arrive late and reflect stale
                             // positions, so following them fights the drag.
-                            let ours =
-                                self.if_cmd_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
+                            let ours = self
+                                .if_cmd_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(300));
                             let expected = self.center + self.if_hz;
                             if !ours && (hz - expected).abs() > 1.0 {
                                 // Operator turned the rig dial: adopt it as our

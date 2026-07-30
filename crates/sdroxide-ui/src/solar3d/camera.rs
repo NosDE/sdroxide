@@ -58,12 +58,7 @@ impl Camera {
         let proj = M4::perspective_reversed_z(FOV_Y, aspect, near, FAR);
         let view = M4::look_at(eye, focus, v3(0.0, 0.0, 1.0));
 
-        Camera {
-            view_proj: proj.mul(&view),
-            eye,
-            near,
-            height_px: size_px[1].max(1.0),
-        }
+        Camera { view_proj: proj.mul(&view), eye, near, height_px: size_px[1].max(1.0) }
     }
 
     /// Apparent radius of a sphere, in pixels — used to give every body a
@@ -739,10 +734,7 @@ mod tests {
     /// Run the tour, recording the pose, the station sequence, and — crucially —
     /// the resulting **eye position**, which is what the viewer actually sees
     /// move.
-    fn run_tour_eyes(
-        seconds: f32,
-        dt: f32,
-    ) -> (Vec<Pose>, Vec<&'static str>, Vec<V3>) {
+    fn run_tour_eyes(seconds: f32, dt: f32) -> (Vec<Pose>, Vec<&'static str>, Vec<V3>) {
         let mut st = SolarUi::new(Solar3dView::default());
         st.view.auto = true;
         let b = scene::bodies(&st, 1_784_937_600.0);
@@ -796,10 +788,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let (poses, _) = run_tour(140.0, dt);
         let vel: Vec<f32> = poses.windows(2).map(|w| short_angle(w[0].yaw, w[1].yaw)).collect();
-        let worst = vel
-            .windows(2)
-            .map(|w| (w[1] - w[0]).abs())
-            .fold(0.0f32, f32::max);
+        let worst = vel.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
         assert!(worst < 0.02, "yaw acceleration spike of {worst} rad/frame²");
     }
 
@@ -871,7 +860,11 @@ mod tests {
             prev = p;
         }
         // Arrived at the Earth...
-        assert!((prev - b.earth).len() < 0.01, "pivot ended {} Gm off the Earth", (prev - b.earth).len());
+        assert!(
+            (prev - b.earth).len() < 0.01,
+            "pivot ended {} Gm off the Earth",
+            (prev - b.earth).len()
+        );
         // ...having covered 1 AU in steps no larger than a smooth ease implies.
         assert!(worst < 3.0, "pivot moved {worst} Gm in a single 20 ms step");
     }

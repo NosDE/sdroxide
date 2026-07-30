@@ -438,11 +438,7 @@ fn receive_recovers_what_the_reference_recovers() {
         // report.
         let got = text::decode(&buf);
         let want = (!want.is_empty()).then_some(want);
-        assert_eq!(
-            got.as_deref(),
-            want,
-            "callsign {call:?} at sigma {sigma} seed {seed:#x}"
-        );
+        assert_eq!(got.as_deref(), want, "callsign {call:?} at sigma {sigma} seed {seed:#x}");
     }
 }
 

@@ -7,15 +7,18 @@
 //! thread, and the controller returns [`DigiAction`]s for the engine to
 //! apply (emit events, key/unkey PTT).
 
+use std::cmp::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::SystemTime;
 
 use sdroxide_dsp::MonoResampler;
 use sdroxide_types::{
-    Decode, DigiConfig, DigiStatus, Mode, QsoRecord, SstvMode, SstvStatus, adif_band,
+    Decode, DigiConfig, DigiStatus, Mode, QsoRecord, RifpMeta, RifpStatus, SstvMode, SstvStatus,
+    adif_band,
 };
 
-use crate::modem::Ft8Modem;
+use crate::clock::ClockMonitor;
+use crate::modem::{ApHints, Ft8Modem};
 use crate::params::{DECODE_RATE, DigiParams};
 use crate::qso::QsoMachine;
 use crate::scheduler::SlotScheduler;
@@ -39,8 +42,33 @@ pub enum DigiAction {
     SstvImage { image_id: u32, mode: SstvMode, w: u16, h: u16, rgb: Vec<u8> },
     /// SSTV: engine status change (tx/rx active, detected mode, progress).
     SstvStatus(SstvStatus),
+    /// Weather fax: a freshly decoded scan line, one byte per pixel.
+    WefaxLine { image_id: u32, y: u16, gray: Vec<u8> },
+    /// Weather fax: a finished chart (grayscale) — the engine encodes and
+    /// persists it. Unlike SSTV the height is not known in advance: it is
+    /// however many lines arrived before the stop tone.
+    WefaxImage { image_id: u32, w: u16, h: u16, gray: Vec<u8> },
+    /// Weather fax: receiver status (tuning, phasing, line count).
+    WefaxStatus(sdroxide_types::WefaxStatus),
+    /// RIFP: reassembled raster rows of an incoming picture — `rows` grayscale
+    /// bytes starting at row `y`, `w` per row. Only the unencoded raster can be
+    /// painted before the object is whole.
+    RifpRows { image_id: u32, y: u16, w: u16, h: u16, rows: Vec<u8> },
+    /// RIFP: a completed, digest-verified picture (raw RGB) — the engine
+    /// encodes and persists it.
+    RifpImage { image_id: u32, meta: RifpMeta, w: u16, h: u16, rgb: Vec<u8> },
+    /// RIFP: engine status change (transfer progress, sessions, counters).
+    RifpStatus(RifpStatus),
     /// FSQ image: a completed grayscale-as-RGB image — the engine encodes it.
     DigiImage { w: u16, h: u16, rgb: Vec<u8> },
+    /// Hellschreiber: a run of freshly received dot columns, column-major
+    /// (`cols[c * rows + r]`, row 0 at the top), 0 = black … 255 = white.
+    ///
+    /// Batched rather than one action per column: X9 makes 157 columns a second
+    /// and each is only fourteen bytes, so per-column messages would be mostly
+    /// framing. `seq` is the absolute column index, which is how the panel tells
+    /// a dropped batch (leave a gap) from a restarted receiver (clear).
+    HellColumns { seq: u64, rows: u8, cols: Vec<u8> },
     /// RADE: a remote station's callsign, recovered from its End-of-Over frame,
     /// with the SNR at the end of the over and the dial it was heard on.
     ///
@@ -53,9 +81,12 @@ pub enum DigiAction {
 struct DecodeJob {
     audio: Vec<i16>,
     slot_utc: i64,
-    /// Callsigns to fold into the worker's hash table before decoding — ours
-    /// and the DX's, so a hashed `<...>` naming either resolves on first sight.
-    seed_calls: Vec<String>,
+    /// Our callsign and the DX's. They seed the worker's hash table, so a hashed
+    /// `<...>` naming either resolves on first sight, and they bias the decoder
+    /// towards the message we are actually waiting for (see [`ApHints`]).
+    ap: ApHints,
+    /// Where we are listening, for FT4's targeted a-priori pass.
+    audio_hz: f32,
 }
 
 pub struct DigiController {
@@ -78,6 +109,11 @@ pub struct DigiController {
     /// lands in the slot *opposite* to when the DX actually transmitted — even if
     /// stations run out of the usual even/odd sequence. Pruned to recent slots.
     last_heard: std::collections::HashMap<String, i64>,
+    /// `(slot, tone offset)` of every recent decode, so we can see which part of
+    /// the band is busy *in the period we transmit in*. Pruned alongside
+    /// `last_heard`. Duplicated tones are kept: two stations on one frequency
+    /// is exactly the situation worth avoiding.
+    recent_activity: Vec<(i64, f32)>,
     // Decode worker.
     job_tx: Sender<DecodeJob>,
     res_rx: Receiver<(i64, Vec<Decode>)>,
@@ -85,12 +121,48 @@ pub struct DigiController {
     // TX burst playback.
     burst: Option<BurstPlayer>,
     status_dirty: bool,
+    /// What the decoders' `dt` values say about our own slot timing.
+    clock: ClockMonitor,
 }
 
 /// Metered playback of a synthesized TX burst (48 kHz mono).
 pub struct BurstPlayer {
     pub samples: Vec<f32>,
     pub pos: usize,
+}
+
+/// The stretch of the passband [`clearest_tx_hz`] will choose from, and the
+/// grid it searches on. Kept inside the usual SSB filter with room for the
+/// ~50 Hz signal at either edge.
+const TX_PICK_MIN_HZ: f32 = 400.0;
+const TX_PICK_MAX_HZ: f32 = 2600.0;
+const TX_PICK_STEP_HZ: f32 = 10.0;
+/// Separation past which a spot counts as simply clear. An FT8 signal is about
+/// 50 Hz wide, so a couple of signal-widths either side is all the room there
+/// is any point in having — beyond it, nearness to where we already are is the
+/// better tie-break.
+const CLEAR_ENOUGH_HZ: f32 = 120.0;
+
+/// Choose a transmit tone offset with the least company.
+///
+/// `busy` are the tone offsets of stations decoded in the period we are about
+/// to transmit in — the only ones we can actually collide with. The result is
+/// the spot furthest from all of them; among spots that are equally clear, the
+/// one nearest `current`, so the transmit marker doesn't wander across the band
+/// between contacts for no reason.
+fn clearest_tx_hz(busy: &[f32], current: f32) -> f32 {
+    let steps = ((TX_PICK_MAX_HZ - TX_PICK_MIN_HZ) / TX_PICK_STEP_HZ) as i32;
+    let candidates = || (0..=steps).map(|i| TX_PICK_MIN_HZ + i as f32 * TX_PICK_STEP_HZ);
+    let clearance = |hz: f32| {
+        busy.iter().map(|b| (b - hz).abs()).fold(f32::INFINITY, f32::min).min(CLEAR_ENOUGH_HZ)
+    };
+    let best = candidates().map(clearance).fold(f32::NEG_INFINITY, f32::max);
+    candidates()
+        .filter(|&hz| clearance(hz) >= best)
+        .min_by(|a, b| {
+            (a - current).abs().partial_cmp(&(b - current).abs()).unwrap_or(Ordering::Equal)
+        })
+        .unwrap_or(current)
 }
 
 impl DigiController {
@@ -107,8 +179,9 @@ impl DigiController {
             .spawn(move || {
                 let mut modem = Ft8Modem::new(worker_mode);
                 while let Ok(job) = job_rx.recv() {
-                    modem.seed_hashes(&job.seed_calls);
-                    let decodes = modem.decode_slot(&job.audio, job.slot_utc);
+                    modem.seed_hashes(&job.ap.calls());
+                    let decodes =
+                        modem.decode_slot(&job.audio, job.slot_utc, &job.ap, job.audio_hz);
                     if res_tx.send((job.slot_utc, decodes)).is_err() {
                         break;
                     }
@@ -133,11 +206,13 @@ impl DigiController {
             tx_even,
             tx_fired_slot: i64::MIN,
             last_heard: std::collections::HashMap::new(),
+            recent_activity: Vec::new(),
             job_tx,
             res_rx,
             _worker: worker,
             burst: None,
             status_dirty: true,
+            clock: ClockMonitor::new(),
         }
     }
 
@@ -146,11 +221,33 @@ impl DigiController {
     }
 
     pub fn set_config(&mut self, cfg: DigiConfig) {
+        // A Fox owns its period: it transmits in the configured one and the
+        // whole pile-up sequences off that, so nothing may flip it later.
+        if cfg.dxped_mode == sdroxide_types::DxpedMode::Fox {
+            self.tx_even = cfg.tx_even;
+        }
         self.qso.set_config(cfg);
         self.status_dirty = true;
     }
 
+    /// Set our transmit tone offset, as the operator asked.
+    ///
+    /// A Hound is held out of the Fox's half of the passband: the low end
+    /// belongs to the DXpedition's own signals, and a Hound calling down there
+    /// transmits on top of the station the whole pile-up is trying to work. The
+    /// one legitimate move into it — following the Fox once it has answered us —
+    /// goes through [`tune_audio_hz`](Self::tune_audio_hz) instead.
     pub fn set_audio_hz(&mut self, hz: f32) {
+        let hz = if self.is_hound() { hz.max(sdroxide_types::FOX_ZONE_MAX_HZ) } else { hz };
+        self.tune_audio_hz(hz);
+    }
+
+    fn is_hound(&self) -> bool {
+        self.qso.dxped() == sdroxide_types::DxpedMode::Hound
+    }
+
+    /// Move the transmit tone with no zone check — the sequencer's own moves.
+    fn tune_audio_hz(&mut self, hz: f32) {
         self.audio_hz = hz.clamp(200.0, 3500.0);
         self.qso.set_audio_hz(self.audio_hz);
         self.status_dirty = true;
@@ -163,6 +260,7 @@ impl DigiController {
     pub fn call_cq(&mut self) {
         // Call CQ in our configured period.
         self.tx_even = self.qso.status(false).tx_even;
+        self.pick_tx_freq();
         self.qso.call_cq();
         self.status_dirty = true;
     }
@@ -175,20 +273,58 @@ impl DigiController {
         audio_hz: f32,
         wait_for_cq: bool,
     ) {
-        self.set_audio_hz(audio_hz);
         let now = SlotScheduler::unix_now(SystemTime::now()) as i64;
         // Reply in the slot *opposite* to when the DX actually transmitted, using
         // the slot we last heard them in — so a late reply never lands in their
         // slot. Fall back to "the slot before now" only if we've no record of
         // them (which reproduces the old parity == parity(now) behaviour).
-        let dx_slot = self
-            .last_heard
-            .get(&from)
-            .copied()
-            .unwrap_or(now - self.params.slot_s as i64);
+        let dx_slot =
+            self.last_heard.get(&from).copied().unwrap_or(now - self.params.slot_s as i64);
         self.tx_even = !self.scheduler.is_even(self.scheduler.slot_index_unix(dx_slot as f64));
+        // Where to answer from. Moving onto the DX's own frequency is the
+        // obvious choice and the wrong one — see `pick_tx_freq`. A Hound is
+        // exempt twice over: its calling frequency is the operator's, and the
+        // Fox's own half of the band is out of bounds.
+        if !self.is_hound() {
+            if self.qso.status(false).config.auto_tx_freq {
+                self.pick_tx_freq();
+            } else {
+                self.set_audio_hz(audio_hz);
+            }
+        }
         self.qso.start_qso(from, grid, snr, wait_for_cq, now);
         self.status_dirty = true;
+    }
+
+    /// Move our transmit tone to the quietest part of the band *in the period
+    /// we are about to transmit in*.
+    ///
+    /// Answering on the station we are working is the natural-looking thing and
+    /// it is backwards: they transmit in the period opposite ours, so their
+    /// frequency says nothing about who is transmitting there when we do. The
+    /// stations that matter are the ones decoded in our own period — those are
+    /// the ones we would land on top of, and neither of us would be heard.
+    ///
+    /// Does nothing when the operator has turned it off, or in DXpedition mode
+    /// where both roles have their frequencies decided for them.
+    fn pick_tx_freq(&mut self) {
+        let cfg_ok = {
+            let s = self.qso.status(false);
+            s.config.auto_tx_freq && s.config.dxped_mode == sdroxide_types::DxpedMode::Normal
+        };
+        if !cfg_ok {
+            return;
+        }
+        let busy: Vec<f32> = self
+            .recent_activity
+            .iter()
+            .filter(|(slot, _)| {
+                self.scheduler.is_even(self.scheduler.slot_index_unix(*slot as f64)) == self.tx_even
+            })
+            .map(|(_, hz)| *hz)
+            .collect();
+        let hz = clearest_tx_hz(&busy, self.audio_hz);
+        self.tune_audio_hz(hz);
     }
 
     /// Pick which message goes out next (the operator's Tx1–Tx6).
@@ -201,6 +337,18 @@ impl DigiController {
     /// Queue a message to send verbatim in the next transmit slot.
     pub fn send_text(&mut self, text: String) {
         self.qso.queue_text(text);
+        self.status_dirty = true;
+    }
+
+    /// Mark a station to work when the sequencer is next free.
+    pub fn queue_add(&mut self, entry: sdroxide_types::QueuedCall) {
+        self.qso.queue_add(entry);
+        self.status_dirty = true;
+    }
+
+    /// Drop a station from the call queue; an empty callsign clears it.
+    pub fn queue_remove(&mut self, call: &str) {
+        self.qso.queue_remove(call);
         self.status_dirty = true;
     }
 
@@ -276,20 +424,44 @@ impl DigiController {
         self.status_dirty = true;
     }
 
-    /// Synthesize `msg` into a 48 kHz mono burst (12 kHz GFSK, resampled).
-    /// Returns the audio and the message as the far end will read it, which is
-    /// what the transcript logs — a compound-call or over-long message is
-    /// degraded to a form FT8 can carry (see [`Ft8Modem::encode_burst_12k`]).
-    fn synth_burst_48k(&mut self, msg: &str) -> Option<(Vec<f32>, String)> {
-        let (burst12, sent) = self.modem.encode_burst_12k(msg, self.audio_hz, 0.5)?;
+    /// Synthesize one slot's transmission into a 48 kHz mono burst (12 kHz
+    /// GFSK, resampled). Returns the audio and each message as the far end will
+    /// read it, which is what the transcript logs — a compound-call or over-long
+    /// message is degraded to a form FT8 can carry (see
+    /// [`Ft8Modem::encode_burst_12k`]).
+    ///
+    /// `msgs` is usually one message; a Fox transmits several at once, summed,
+    /// each on its own tone. The per-signal amplitude is divided between them so
+    /// the total stays inside the same headroom a single burst uses — five
+    /// signals at full drive would clip the transmitter, and an intermodulating
+    /// Fox is heard as splatter across the whole pile-up.
+    fn synth_burst_48k(&mut self, msgs: &[(String, f32)]) -> Option<(Vec<f32>, Vec<String>)> {
+        let amp = 0.5 / msgs.len().max(1) as f32;
+        let mut mix: Vec<f32> = Vec::new();
+        let mut sent = Vec::with_capacity(msgs.len());
+        for (msg, hz) in msgs {
+            let Some((burst12, as_sent)) = self.modem.encode_burst_12k(msg, *hz, amp) else {
+                continue;
+            };
+            if mix.len() < burst12.len() {
+                mix.resize(burst12.len(), 0.0);
+            }
+            for (m, s) in mix.iter_mut().zip(&burst12) {
+                *m += s;
+            }
+            sent.push(as_sent);
+        }
+        if mix.is_empty() {
+            return None;
+        }
         // Resample 12 k → 48 k.
         match MonoResampler::new(DECODE_RATE, 48_000.0) {
             Some(mut r) => {
-                let mut out = Vec::with_capacity(burst12.len() * 4 + 2048);
-                r.push(&burst12, &mut out);
+                let mut out = Vec::with_capacity(mix.len() * 4 + 2048);
+                r.push(&mix, &mut out);
                 Some((out, sent))
             }
-            None => Some((burst12, sent)),
+            None => Some((mix, sent)),
         }
     }
 
@@ -305,6 +477,13 @@ impl DigiController {
             self.status_dirty = true;
         }
 
+        // 0b. Free, with stations marked: take the next one. This is what makes
+        // the queue hands-off — every contact ending, however it ends, walks the
+        // sequencer on to the station the operator marked next.
+        if let Some(next) = self.qso.take_next_queued() {
+            self.start_qso(next.call, next.grid, next.snr_db, next.audio_hz, next.wait_for_cq);
+        }
+
         // 1. Drain finished decodes from the worker.
         loop {
             match self.res_rx.try_recv() {
@@ -316,12 +495,24 @@ impl DigiController {
                             if let Some(from) = d.from.as_deref().filter(|s| !s.is_empty()) {
                                 self.last_heard.insert(from.to_string(), slot_utc);
                             }
+                            self.recent_activity.push((slot_utc, d.audio_hz));
                         }
                         let cutoff = slot_utc - (8.0 * self.params.slot_s) as i64;
                         self.last_heard.retain(|_, &mut t| t >= cutoff);
+                        self.recent_activity.retain(|(t, _)| *t >= cutoff);
+                        // What everyone else's timing says about ours.
+                        if self.clock.observe(&decodes) {
+                            self.status_dirty = true;
+                        }
                         // Advance the QSO from anything addressed to us.
                         if self.qso.on_rx(&decodes, slot_utc) {
                             self.status_dirty = true;
+                        }
+                        // Hound: the Fox answered, so finish the contact on its
+                        // frequency instead of up in the calling zone. The one
+                        // move into the Fox's half that is not a mistake.
+                        if let Some(hz) = self.qso.take_qsy() {
+                            self.tune_audio_hz(hz);
                         }
                         // Keep our transmit slot opposite to the DX's most recent
                         // transmission, so replies stay out of their slot even if
@@ -348,12 +539,16 @@ impl DigiController {
                 if self.slot_buf.len() >= min_samples {
                     let audio = std::mem::take(&mut self.slot_buf);
                     let slot_utc = self.scheduler.slot_start_unix(self.last_slot_idx) as i64;
-                    let seed_calls = [self.qso.my_call(), self.qso.dx_call().unwrap_or("")]
-                        .iter()
-                        .filter(|c| !c.is_empty())
-                        .map(|c| c.to_string())
-                        .collect();
-                    let _ = self.job_tx.send(DecodeJob { audio, slot_utc, seed_calls });
+                    let ap = ApHints {
+                        my_call: self.qso.my_call().to_string(),
+                        dx_call: self.qso.dx_call().map(str::to_string),
+                    };
+                    let _ = self.job_tx.send(DecodeJob {
+                        audio,
+                        slot_utc,
+                        ap,
+                        audio_hz: self.audio_hz,
+                    });
                 }
             }
             self.slot_buf.clear();
@@ -378,20 +573,22 @@ impl DigiController {
             // easily rides out. (Being our opposite slot, this is never the DX's.)
             let latest = self.params.slot_s - self.params.burst_s + self.params.tx_offset_s;
             if into >= self.params.tx_offset_s && into <= latest {
-                if let Some(msg) = self.qso.plan_tx() {
-                    if let Some((samples, sent)) = self.synth_burst_48k(&msg) {
-                        self.burst = Some(BurstPlayer { samples, pos: 0 });
-                        self.tx_fired_slot = idx;
-                        self.qso.record_tx(&sent);
-                        self.status_dirty = true;
-                        actions.push(DigiAction::KeyTx);
+                let msgs = self.qso.plan_tx_all();
+                if let Some((samples, sent)) = self.synth_burst_48k(&msgs) {
+                    self.burst = Some(BurstPlayer { samples, pos: 0 });
+                    self.tx_fired_slot = idx;
+                    for m in &sent {
+                        self.qso.record_tx(m);
                     }
+                    self.status_dirty = true;
+                    actions.push(DigiAction::KeyTx);
                 }
             }
         }
 
-        // 4. Completed QSO → log it (fill freq/band from the dial).
-        if let Some(mut rec) = self.qso.take_completed() {
+        // 4. Completed QSOs → log them (fill freq/band from the dial). A Fox can
+        // finish several in one transmission, so drain rather than take one.
+        while let Some(mut rec) = self.qso.take_completed() {
             rec.freq_hz = self.dial_hz + self.audio_hz as f64;
             rec.band = adif_band(rec.freq_hz).to_string();
             actions.push(DigiAction::QsoLogged(rec));
@@ -410,6 +607,7 @@ impl DigiController {
     pub fn status(&self) -> DigiStatus {
         let mut s = self.qso.status(self.tx_burst_active());
         s.audio_hz = self.audio_hz;
+        s.clock_offset_s = self.clock.offset_s();
         s
     }
 }
@@ -472,6 +670,12 @@ impl crate::DigiEngine for DigiController {
     }
     fn send_text(&mut self, text: String) {
         DigiController::send_text(self, text)
+    }
+    fn queue_add(&mut self, entry: sdroxide_types::QueuedCall) {
+        DigiController::queue_add(self, entry)
+    }
+    fn queue_remove(&mut self, call: &str) {
+        DigiController::queue_remove(self, call)
     }
 }
 
@@ -548,6 +752,69 @@ mod tests {
             actions.iter().any(|a| matches!(a, DigiAction::KeyTx)),
             "should key late in our opposite slot, got {actions:?}"
         );
+    }
+
+    #[test]
+    fn the_transmit_frequency_goes_where_our_own_period_is_quiet() {
+        // A crowded stretch below 1200 Hz and a clear one above it.
+        let busy: Vec<f32> = (0..12).map(|i| 500.0 + i as f32 * 60.0).collect();
+        let hz = clearest_tx_hz(&busy, 1500.0);
+        assert!(hz > 1220.0, "picked {hz} Hz, inside the crowd");
+        assert!(busy.iter().all(|b| (b - hz).abs() >= 60.0), "picked {hz} Hz, on top of a station");
+
+        // With the band empty it stays where it already is rather than
+        // wandering off to an arbitrary edge.
+        assert_eq!(clearest_tx_hz(&[], 1500.0), 1500.0);
+        // One station in the middle: it moves clear, but no further than it has
+        // to — a spot 120 Hz away is as good as one 900 Hz away.
+        let hz = clearest_tx_hz(&[1500.0], 1500.0);
+        assert!((hz - 1500.0).abs() >= CLEAR_ENOUGH_HZ, "{hz} is still on top of them");
+        assert!(
+            (hz - 1500.0).abs() <= CLEAR_ENOUGH_HZ + TX_PICK_STEP_HZ,
+            "{hz} is a needless jump"
+        );
+    }
+
+    #[test]
+    fn answering_a_station_does_not_move_us_onto_them() {
+        let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
+        c.set_audio_hz(1500.0);
+        // Auto TX FRQ is on by default: their frequency is not ours to take.
+        c.start_qso("W9XYZ".into(), None, -10, 800.0, false);
+        assert_ne!(c.audio_hz(), 800.0);
+
+        // Turned off, the operator's own choice stands — including following
+        // the station they are answering.
+        c.set_config(DigiConfig { auto_tx_freq: false, ..cfg() });
+        c.start_qso("K1ABC".into(), None, -10, 800.0, false);
+        assert_eq!(c.audio_hz(), 800.0);
+    }
+
+    #[test]
+    fn a_hound_is_kept_out_of_the_fox_zone() {
+        use sdroxide_types::{DxpedMode, FOX_ZONE_MAX_HZ};
+        let mut c = DigiController::new(
+            Mode::Ft8,
+            DigiConfig { dxped_mode: DxpedMode::Hound, ..cfg() },
+            12_000.0,
+        );
+        // Tuning down among the Fox's own signals is refused.
+        c.set_audio_hz(600.0);
+        assert_eq!(c.audio_hz(), FOX_ZONE_MAX_HZ);
+        c.set_audio_hz(1800.0);
+        assert_eq!(c.audio_hz(), 1800.0, "the calling zone is free");
+
+        // Answering a Fox heard at 700 Hz keeps our calling frequency; only the
+        // Fox's own reply moves us down onto it.
+        c.start_qso("DX1FOX".into(), None, -10, 700.0, false);
+        assert_eq!(c.audio_hz(), 1800.0);
+        c.tune_audio_hz(700.0);
+        assert_eq!(c.audio_hz(), 700.0);
+
+        // Outside Hound mode the whole passband is the operator's.
+        let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
+        c.set_audio_hz(600.0);
+        assert_eq!(c.audio_hz(), 600.0);
     }
 
     #[test]

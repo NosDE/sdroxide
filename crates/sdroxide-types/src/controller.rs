@@ -1,6 +1,7 @@
 use crate::{
     CallsignInfo, Command, Decode, DeviceCaps, DigiStatus, MemoryChannel, Meters, QsoRecord,
-    RadioState, SkimmerSpot, Spot, SpectrumFrame, SstvMode, SstvStatus, UploadResult, VoiceStatus,
+    RadioState, RifpMeta, RifpStatus, SkimmerSpot, SpectrumFrame, Spot, SstvMode, SstvStatus,
+    UploadResult, VoiceStatus,
 };
 
 /// Events flowing engine → UI.
@@ -27,13 +28,76 @@ pub enum RadioEvent {
     SkimmerSpots(Vec<SkimmerSpot>),
     /// SSTV: one freshly decoded scanline `rgb` (3·width bytes) at row `y` of the
     /// image identified by `image_id`. Paints progressively.
-    SstvLine { image_id: u32, y: u16, rgb: Vec<u8> },
+    SstvLine {
+        image_id: u32,
+        y: u16,
+        rgb: Vec<u8>,
+    },
     /// SSTV: a completed image (PNG bytes) plus its identity and size.
-    SstvImage { image_id: u32, mode: SstvMode, w: u16, h: u16, png: Vec<u8> },
+    SstvImage {
+        image_id: u32,
+        mode: SstvMode,
+        w: u16,
+        h: u16,
+        png: Vec<u8>,
+    },
     /// SSTV: engine status change (tx/rx active, detected mode, progress).
     SstvStatus(SstvStatus),
+    /// Weather fax: one freshly decoded scan line, one byte per pixel.
+    WefaxLine {
+        image_id: u32,
+        y: u16,
+        gray: Vec<u8>,
+    },
+    /// Weather fax: a completed chart (PNG bytes). The height is however many
+    /// lines arrived before the stop tone, so it is carried rather than implied.
+    WefaxImage {
+        image_id: u32,
+        w: u16,
+        h: u16,
+        png: Vec<u8>,
+    },
+    /// Weather fax: receiver status (tuning, phasing, line count).
+    WefaxStatus(crate::WefaxStatus),
+    /// RIFP: freshly reassembled raster rows of an incoming picture — `rows`
+    /// grayscale bytes starting at row `y`, `w` bytes per row. Only the raster
+    /// content-encodings can be painted before the object completes; a PNG,
+    /// JPEG or facsimile object arrives as one [`RadioEvent::RifpImage`].
+    RifpRows {
+        image_id: u32,
+        y: u16,
+        /// Picture size, so a panel can size its canvas from the first row it
+        /// sees rather than waiting for the manifest to reach it too.
+        w: u16,
+        h: u16,
+        rows: Vec<u8>,
+    },
+    /// RIFP: a completed, digest-verified image (PNG bytes) plus what the
+    /// manifest said about it.
+    RifpImage {
+        image_id: u32,
+        meta: RifpMeta,
+        png: Vec<u8>,
+    },
+    /// RIFP: engine status change (transfer progress, sessions, counters).
+    RifpStatus(RifpStatus),
     /// FSQ image: a completed received picture (PNG bytes).
-    DigiImage { png: Vec<u8> },
+    DigiImage {
+        png: Vec<u8>,
+    },
+    /// Hellschreiber: a run of freshly received dot columns, batched since the
+    /// last poll. `cols` is column-major (`cols[c * rows + r]`, row 0 at the
+    /// top), 0 = black … 255 = white.
+    ///
+    /// `seq` is the absolute index of the first column since the receiver
+    /// started. Hell has no framing to resynchronise against, so the panel uses
+    /// it to tell a dropped batch (leave a gap of the right width) from a
+    /// restarted receiver (`seq` going backwards — clear the raster).
+    HellColumns {
+        seq: u64,
+        rows: u8,
+        cols: Vec<u8>,
+    },
     /// Voice keyer: slot contents plus what is being recorded or transmitted.
     /// Emitted on every change and, while one of the two runs, often enough for
     /// the UI to animate a position.
@@ -54,11 +118,21 @@ pub enum RadioEvent {
     /// Built-in TCI server status: whether the listener is up, where it is
     /// bound, how many third-party clients are connected, and any bind error.
     /// Emitted on every transition, so the settings dialog never polls.
-    TciServerStatus { running: bool, addr: String, clients: usize, error: Option<String> },
+    TciServerStatus {
+        running: bool,
+        addr: String,
+        clients: usize,
+        error: Option<String>,
+    },
     /// Built-in rigctld server status: whether the listener is up, where it is
     /// bound, how many clients are connected, and any bind error. Emitted on
     /// every transition, so the settings dialog never polls.
-    RigctldStatus { running: bool, addr: String, clients: usize, error: Option<String> },
+    RigctldStatus {
+        running: bool,
+        addr: String,
+        clients: usize,
+        error: Option<String>,
+    },
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).
@@ -119,6 +193,15 @@ pub trait RadioController {
     /// the settings UI calls this on demand (a "Discover" button), not per frame.
     /// Default empty: the browser/remote client can't scan the server's network.
     fn discover_hpsdr(&self) -> Vec<crate::HpsdrDevice> {
+        Vec::new()
+    }
+
+    /// List RTL-SDR dongles on the USB bus (native local client only). Fast
+    /// and non-invasive — no device is opened — so the settings UI may call it
+    /// on demand as often as the operator presses Rescan, including while a
+    /// dongle is streaming. Default empty: a browser client cannot see the
+    /// server's USB bus.
+    fn list_rtlsdr(&self) -> Vec<crate::RtlSdrDevice> {
         Vec::new()
     }
 

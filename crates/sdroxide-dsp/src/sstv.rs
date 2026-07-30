@@ -268,16 +268,7 @@ impl SstvTx {
         }
 
         let total: u64 = plan.iter().map(|&(_, n)| n as u64).sum();
-        SstvTx {
-            rate,
-            plan,
-            idx: 0,
-            left: 0,
-            cur_hz: 0.0,
-            phase: 0.0,
-            total,
-            done: 0,
-        }
+        SstvTx { rate, plan, idx: 0, left: 0, cur_hz: 0.0, phase: 0.0, total, done: 0 }
     }
 
     /// Fill `out` with audio; returns the number of real samples written before
@@ -322,11 +313,7 @@ impl SstvTx {
 
     /// Transmission progress, 0.0..=1.0.
     pub fn progress(&self) -> f32 {
-        if self.total == 0 {
-            1.0
-        } else {
-            (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
-        }
+        if self.total == 0 { 1.0 } else { (self.done as f32 / self.total as f32).clamp(0.0, 1.0) }
     }
 }
 
@@ -570,7 +557,8 @@ impl SstvRx {
                         parity ^= 1;
                     }
                 }
-                let pbit = if self.hz_at((start as f64 + 8.5 * bit) as u64) < 1200.0 { 1 } else { 0 };
+                let pbit =
+                    if self.hz_at((start as f64 + 8.5 * bit) as u64) < 1200.0 { 1 } else { 0 };
                 if parity == pbit {
                     if let Some(mode) = SstvMode::from_vis(code) {
                         // Image data begins after the stop bit (start + 10 bits);

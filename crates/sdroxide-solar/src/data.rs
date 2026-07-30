@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::aurora::{AuroraOval, HemisphericPower, KpPoint};
+use crate::clouds::{self, CloudField};
 use crate::donki::{CmeEvent, FlareEvent};
 use crate::imagery::SunImage;
 use crate::indices::SpaceWeather;
@@ -41,10 +42,13 @@ pub enum Source {
     Xray,
     /// Ionosonde soundings, for the MUF estimate.
     Muf,
-    /// CelesTrak's amateur-satellite element set.
-    Sats,
     /// QO-100, which is absent from the amateur set (see
     /// [`crate::satellites::QO100_URL`]).
+    ///
+    /// The only element set still fetched as a fixed source. The amateur group
+    /// used to be one too and is now a subscription like any other, so that the
+    /// operator can switch it off, filter it, or point it somewhere else —
+    /// see [`sdroxide_types::CELESTRAK_GROUPS`].
     SatGeo,
     /// The OVATION auroral-oval grid.
     Aurora,
@@ -52,10 +56,15 @@ pub enum Source {
     AuroraPower,
     /// Three days of predicted planetary K.
     KpForecast,
+    /// The longwave infrared half of the global cloud mosaic.
+    Clouds,
+    /// The visible half of it: the low cloud the infrared cannot see, on
+    /// whichever side of the planet the Sun is up.
+    CloudsVis,
 }
 
 impl Source {
-    pub const ALL: [Source; 13] = [
+    pub const ALL: [Source; 14] = [
         Source::Sun,
         Source::Cme,
         Source::Flare,
@@ -64,11 +73,12 @@ impl Source {
         Source::Kp,
         Source::Xray,
         Source::Muf,
-        Source::Sats,
         Source::SatGeo,
         Source::Aurora,
         Source::AuroraPower,
         Source::KpForecast,
+        Source::Clouds,
+        Source::CloudsVis,
     ];
 
     pub fn label(self) -> &'static str {
@@ -81,11 +91,12 @@ impl Source {
             Source::Kp => "Kp",
             Source::Xray => "XRAY",
             Source::Muf => "MUF",
-            Source::Sats => "TLE",
             Source::SatGeo => "QO-100",
             Source::Aurora => "OVATION",
             Source::AuroraPower => "HPI",
             Source::KpForecast => "Kp+3d",
+            Source::Clouds => "CLOUD",
+            Source::CloudsVis => "CLOUD/V",
         }
     }
 
@@ -97,12 +108,20 @@ impl Source {
 /// Fetch scheduling. Only the thing doing the fetching schedules, so this is
 /// the native feed's policy and none of it reaches the browser, which is handed
 /// finished data and just reads the freshness alongside it.
+/// How often an element-set listing is refetched, seconds.
+///
+/// Shared by the geostationary source and by every subscribed listing: TLEs are
+/// reissued a few times a day at most and SGP4 stays accurate for far longer, so
+/// polling harder buys nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub const TLE_PERIOD_S: i64 = 21_600;
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Source {
     /// Refresh cadence, seconds.
-    fn period(self) -> i64 {
+    pub(crate) fn period(self) -> i64 {
         match self {
-            Source::Sun => 600,      // browse images update every few minutes
+            Source::Sun => 600, // browse images update every few minutes
             Source::Cme => 1200,
             Source::Flare => 1200,
             Source::Regions => 3600, // a once-a-day product
@@ -112,8 +131,9 @@ impl Source {
             Source::Muf => 900,      // ionosondes sound every 5-15 minutes
             // Element sets are re-issued a few times a day; SGP4 stays accurate
             // for far longer than that, so there is no reason to poll hard.
-            Source::Sats => 21_600,
-            Source::SatGeo => 21_600,
+            // [`TLE_PERIOD_S`] is the same figure for the subscribed listings,
+            // which are not `Source`s.
+            Source::SatGeo => TLE_PERIOD_S,
             // OVATION is issued every five minutes, but the grid is 900 kB —
             // by far the largest JSON here — and the oval does not move far in
             // half an hour. The overlay shows what the picture is valid for, so
@@ -124,6 +144,12 @@ impl Source {
             Source::AuroraPower => 900,
             // Issued three times a day.
             Source::KpForecast => 3600,
+            // The mosaic is rebuilt hourly and there is no validator to ask
+            // with, so this is a compromise: often enough that a new hour is on
+            // the globe within a few minutes of being published, rarely enough
+            // that most of the fetches that find nothing new are cheap ones.
+            Source::Clouds => 600,
+            Source::CloudsVis => 600,
         }
     }
 
@@ -139,11 +165,12 @@ impl Source {
             Source::Kp => 41,
             Source::Xray => 53,
             Source::Muf => 61,
-            Source::Sats => 71,
             Source::SatGeo => 83,
             Source::Aurora => 97,
             Source::AuroraPower => 103,
             Source::KpForecast => 109,
+            Source::Clouds => 127,
+            Source::CloudsVis => 137,
         }
     }
 }
@@ -222,6 +249,14 @@ pub struct SolarData {
     /// own set. Iterate with [`SolarData::satellites`].
     pub sats_amateur: Vec<Satellite>,
     pub sats_geo: Vec<Satellite>,
+    /// Element sets the operator supplied themselves: pasted in, or fetched
+    /// from a subscribed listing. Never replaced by one of the built-in
+    /// sources — they are driven from the settings dialog.
+    pub sats_custom: Vec<Satellite>,
+    /// What each TLE subscription's last fetch did, in the order the settings
+    /// dialog holds them. Empty when nothing is subscribed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tle_subs: Vec<crate::tlesub::SubStatus>,
     /// The auroral oval. Shared by `Arc` for the same reason the solar image
     /// is: the renderer takes a handle, not a copy of the grid.
     pub aurora: Option<Arc<AuroraOval>>,
@@ -231,12 +266,37 @@ pub struct SolarData {
     pub aurora_power: Option<HemisphericPower>,
     /// Planetary K in three-hour bins, observed and then predicted.
     pub kp_forecast: Vec<KpPoint>,
+    /// The cloud field the globe draws, and the storms in it.
+    pub clouds: Option<Arc<CloudField>>,
+    /// Bumped on every rebuild, so the GPU uploads once per mosaic.
+    pub clouds_gen: u64,
+    /// The two channels it is built from, kept because they arrive separately
+    /// and each has to be able to refresh without the other.
+    pub cloud_ir: Option<Arc<clouds::Plane>>,
+    pub cloud_vis: Option<Arc<clouds::Plane>>,
     pub status: [SourceStatus; Source::ALL.len()],
 }
 
 impl SolarData {
     pub fn status(&self, src: Source) -> &SourceStatus {
         &self.status[src.index()]
+    }
+
+    /// Rebuild the cloud field from whichever channels have arrived.
+    ///
+    /// Called after either one lands. Infrared alone is a complete picture, so
+    /// it is the one that gates: the visible channel on its own says nothing
+    /// about how high anything is and covers half the planet, and drawing from
+    /// it would be drawing half a globe.
+    pub fn rebuild_clouds(&mut self) {
+        let Some(ir) = self.cloud_ir.clone() else { return };
+        // A visible frame from a different hour would put yesterday's daylight
+        // over today's cloud. An hour of slack covers the two fetches falling
+        // either side of a publication; more than that and it is dropped.
+        let vis =
+            self.cloud_vis.clone().filter(|v| (v.fetched_unix - ir.fetched_unix).abs() < 3600);
+        self.clouds = Some(Arc::new(clouds::combine(&ir, vis.as_deref())));
+        self.clouds_gen += 1;
     }
 
     /// True once anything at all has been loaded, from network or cache.
@@ -247,9 +307,19 @@ impl SolarData {
             || !self.regions.is_empty()
     }
 
-    /// Every tracked satellite, from both element sets.
+    /// Every tracked satellite, from all three element sets.
+    ///
+    /// The operator's own entries lead and shadow a fetched one for the same
+    /// catalogue number: pasting in a fresher TLE for a satellite that is
+    /// already in the amateur group has to replace it rather than put a second
+    /// marker a few kilometres away from the first.
     pub fn satellites(&self) -> impl Iterator<Item = &Satellite> {
-        self.sats_amateur.iter().chain(&self.sats_geo)
+        self.sats_custom.iter().chain(
+            self.sats_amateur
+                .iter()
+                .chain(&self.sats_geo)
+                .filter(|s| !self.sats_custom.iter().any(|c| c.norad_id == s.norad_id)),
+        )
     }
 
     /// The newest successful fetch across every source, for a single "data as
@@ -274,8 +344,7 @@ mod tests {
 
     #[test]
     fn every_source_has_a_distinct_label_and_its_own_status_slot() {
-        let labels: std::collections::HashSet<_> =
-            Source::ALL.iter().map(|s| s.label()).collect();
+        let labels: std::collections::HashSet<_> = Source::ALL.iter().map(|s| s.label()).collect();
         assert_eq!(labels.len(), Source::ALL.len(), "duplicate source labels");
         for src in Source::ALL {
             assert_eq!(Source::ALL[src.index()], src);

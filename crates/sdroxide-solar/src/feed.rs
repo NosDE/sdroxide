@@ -21,7 +21,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::aurora::{self, AuroraOval, HemisphericPower, KpPoint};
 use crate::cache::{Cache, Validators};
-use crate::data::{SolarData, Source, SourceStatus};
+use crate::clouds;
+use crate::data::{SolarData, Source, SourceStatus, TLE_PERIOD_S};
 use crate::donki::{self, CmeEvent, FlareEvent};
 use crate::imagery::{self, SdoChannel, SunImage};
 use crate::indices::{self};
@@ -33,6 +34,10 @@ const WINDOW_DAYS: i64 = 30;
 /// Body size caps. The 4096 solar images are ~2 MB; the rest are far smaller.
 const JSON_LIMIT: u64 = 16 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 24 * 1024 * 1024;
+/// The cloud mosaics are 280 kB each at the size asked for. This leaves room
+/// for the service to change its mind about the encoding without leaving room
+/// for a runaway body.
+const CLOUD_LIMIT: u64 = 8 * 1024 * 1024;
 /// How long a request may take in total.
 const TIMEOUT: Duration = Duration::from_secs(25);
 /// Worker wake interval; individual sources have their own, longer, cadences.
@@ -42,6 +47,15 @@ pub enum FeedCmd {
     RefreshAll,
     SetChannel(SdoChannel),
     SetResolution(u32),
+    /// Replace the operator's own element sets, as one three-line listing.
+    ///
+    /// Whole-set replacement rather than add/remove, because the settings
+    /// dialog owns the list: sending what it now holds cannot drift out of step
+    /// with it the way an incremental protocol can.
+    SetCustomTles(String),
+    /// Replace the subscribed element-set listings. Cached bodies are published
+    /// at once and refetched on the element-set cadence.
+    SetTleSubs(Vec<sdroxide_types::TleSubscription>),
 }
 
 /// A payload in the form it arrived in, for a relay that has to hand the same
@@ -53,9 +67,25 @@ pub enum FeedCmd {
 /// instead, so the worker offers them here rather than making anyone re-encode
 /// or re-fetch. Only sources whose wire form is the raw bytes appear.
 pub enum RawUpdate {
-    Sun { channel: SdoChannel, fetched_unix: i64, jpeg: Vec<u8> },
+    Sun {
+        channel: SdoChannel,
+        fetched_unix: i64,
+        jpeg: Vec<u8>,
+    },
     /// An element set: `geo` distinguishes QO-100 from the amateur list.
-    Tle { geo: bool, text: String },
+    Tle {
+        geo: bool,
+        text: String,
+    },
+    /// One channel of the cloud mosaic, as the PNG it arrived as. The decoded
+    /// field is a megabyte of planes; the picture it came from is a quarter of
+    /// that, and the receiver has the same decoder.
+    Clouds {
+        band: clouds::Band,
+        frame_unix: i64,
+        fetched_unix: i64,
+        png: Vec<u8>,
+    },
 }
 
 /// Handle to the worker. Dropping it stops the thread, which is what confines
@@ -114,7 +144,7 @@ impl SolarFeed {
     }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -142,6 +172,13 @@ fn worker(
         .build()
         .into();
     let mut cache = Cache::open();
+    // The operator's pasted sets and their subscriptions, kept apart so a
+    // refresh of one does not disturb the other. The pasted ones are held as
+    // the text they arrived as: a `Satellite` owns SGP4 constants and cannot be
+    // cloned, and re-parsing a handful of them is nothing next to a fetch.
+    let mut pasted_text = String::new();
+    let mut subs: Vec<sdroxide_types::TleSubscription> = Vec::new();
+    let mut subs_due_unix: i64 = 0;
 
     // Publish whatever is on disk before touching the network, so the window
     // has content the moment it opens — including with no connection at all.
@@ -151,6 +188,24 @@ fn worker(
     loop {
         let now = now_unix();
         let mut changed = false;
+        // Subscriptions ride the element-set cadence: TLEs are reissued a few
+        // times a day at most, and a fresher fetch would buy nothing.
+        if !subs.is_empty() && now >= subs_due_unix {
+            subs_due_unix = now + TLE_PERIOD_S;
+            let mut sats = satellites::parse_pasted_tles(&pasted_text);
+            let mut status = Vec::with_capacity(subs.len());
+            for sub in subs.iter() {
+                let (v, st) = crate::tlesub::refresh(&agent, &mut cache, sub, now);
+                sats.extend(v);
+                status.push(st);
+            }
+            let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+            d.sats_custom = dedup_by_norad(sats);
+            d.tle_subs = status;
+            drop(d);
+            raw(RawUpdate::Tle { geo: false, text: subscribed_tle_text(&cache, &subs) });
+            changed = true;
+        }
         for src in Source::ALL {
             let due = {
                 let d = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -190,12 +245,81 @@ fn worker(
                 let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
                 d.status[Source::Sun.index()] = SourceStatus::default();
             }
+            Ok(FeedCmd::SetCustomTles(text)) => {
+                // Parse outside the lock; SGP4 constants for a long list are
+                // not free, and the UI reads this mutex every frame.
+                pasted_text = text;
+                publish_custom(&shared, &cache, &pasted_text, &subs);
+                wake();
+            }
+            Ok(FeedCmd::SetTleSubs(v)) => {
+                subs = v.into_iter().filter(|s| s.enabled && s.is_valid()).collect();
+                // Serve the cached listings straight away — a subscription the
+                // operator has had for weeks should not blank the sky while a
+                // fetch it does not need runs.
+                publish_custom(&shared, &cache, &pasted_text, &subs);
+                raw(RawUpdate::Tle { geo: false, text: subscribed_tle_text(&cache, &subs) });
+                // ...then let the next loop pass decide whether to refetch,
+                // from when each listing was last actually fetched.
+                subs_due_unix =
+                    subs.iter().map(|s| cache.fetched_at(&s.url) + TLE_PERIOD_S).min().unwrap_or(0);
+                wake();
+            }
             Err(RecvTimeoutError::Timeout) => {}
             // The handle was dropped: the window closed, so stop fetching.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     tracing::debug!("solar feed thread stopped");
+}
+
+/// Publish the pasted sets plus whatever the subscriptions have on disk.
+///
+/// No network: this is the startup and settings-change path, and it must stay
+/// usable with no connection at all.
+fn publish_custom(
+    shared: &Mutex<SolarData>,
+    cache: &Cache,
+    pasted_text: &str,
+    subs: &[sdroxide_types::TleSubscription],
+) {
+    let mut sats = satellites::parse_pasted_tles(pasted_text);
+    for sub in subs {
+        sats.extend(crate::tlesub::cached(cache, sub));
+    }
+    let status = subs.iter().map(|s| crate::tlesub::cached_status(cache, s)).collect();
+    let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+    d.sats_custom = dedup_by_norad(sats);
+    d.tle_subs = status;
+}
+
+/// Every subscribed listing's cached text, concatenated, for the browser relay.
+///
+/// The browser has no subscription machinery — it is fed decoded products over
+/// the WebSocket — so it gets the union as one element-set listing and puts it
+/// where the amateur group used to go. Concatenating three-line listings is
+/// valid, and [`satellites::parse_tles`] drops the duplicates that overlapping
+/// groups produce.
+fn subscribed_tle_text(cache: &Cache, subs: &[sdroxide_types::TleSubscription]) -> String {
+    let mut out = String::new();
+    for sub in subs {
+        if let Some(text) = crate::tlesub::cached_text(cache, sub) {
+            out.push_str(text.trim_end());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Keep the first entry for each catalogue number.
+///
+/// Subscriptions overlap — the stations group and the cubesat group both carry
+/// plenty of the same satellites — and a duplicate would be a second marker
+/// drawn a few metres from the first. Pasted sets are put in first, so they win.
+fn dedup_by_norad(mut sats: Vec<Satellite>) -> Vec<Satellite> {
+    let mut seen = std::collections::HashSet::new();
+    sats.retain(|s| seen.insert(s.norad_id));
+    sats
 }
 
 fn load_cached(
@@ -212,16 +336,13 @@ fn load_cached(
     let kp = cache.read_string("kp.json").and_then(|s| indices::parse_kp(&s));
     let xray = cache.read_string("xray.json").and_then(|s| indices::parse_xray(&s));
     let sondes = cache.read_string("ionosondes.json").map(|s| indices::parse_ionosondes(&s));
-    // Keep the element sets in their original form as well as parsed: a relay
+    // Keep the element set in its original form as well as parsed: a relay
     // forwards the text, and re-serialising SGP4 constants is not possible.
-    let sats_txt = cache.read_string("amateur.txt");
     let sats_geo_txt = cache.read_string("qo100.txt");
-    let sats = sats_txt.as_deref().map(satellites::parse_tles);
     let sats_geo = sats_geo_txt.as_deref().map(satellites::parse_tles);
     let oval = cache.read_string("ovation.json").and_then(|s| aurora::parse_ovation(&s));
-    let power = cache
-        .read_string("hemipower.txt")
-        .and_then(|s| aurora::parse_hemispheric_power(&s));
+    let power =
+        cache.read_string("hemipower.txt").and_then(|s| aurora::parse_hemispheric_power(&s));
     let kp_forecast = cache.read_string("kpforecast.json").map(|s| aurora::parse_kp_forecast(&s));
     {
         let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -240,9 +361,6 @@ fn load_cached(
         if let Some(v) = sondes {
             d.weather.ionosondes = v;
         }
-        if let Some(v) = sats {
-            d.sats_amateur = v;
-        }
         if let Some(v) = sats_geo {
             d.sats_geo = v;
         }
@@ -255,13 +373,44 @@ fn load_cached(
             d.kp_forecast = v;
         }
     }
-    if let Some(text) = sats_txt {
-        raw(RawUpdate::Tle { geo: false, text });
-    }
     if let Some(text) = sats_geo_txt {
         raw(RawUpdate::Tle { geo: true, text });
     }
+    load_cached_clouds(shared, cache, raw);
     load_cached_sun(shared, cache, channel, resolution, raw);
+}
+
+/// Put yesterday's weather on the globe before today's is asked for.
+///
+/// Stale cloud is worth showing — the overlay says how old it is — because the
+/// alternative is a bare planet for the first few seconds of every launch, and
+/// for the whole session when there is no network.
+fn load_cached_clouds(shared: &Mutex<SolarData>, cache: &Cache, raw: &dyn Fn(RawUpdate)) {
+    let mut any = false;
+    for band in [clouds::Band::Longwave, clouds::Band::Visible] {
+        let Some(bytes) = cache.read(band.cache_name()) else { continue };
+        let fetched_unix = cache.fetched_at(&band.url());
+        // The header that carried the frame's own hour is long gone, so it is
+        // assumed — see `assumed_frame_unix`, which never guesses newer.
+        let frame_unix = clouds::assumed_frame_unix(fetched_unix);
+        // Decoding and the background estimate both happen out here, before the
+        // lock: this is the expensive step.
+        let Some(plane) = clouds::parse_plane(band, &bytes, frame_unix, fetched_unix) else {
+            continue;
+        };
+        {
+            let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match band {
+                clouds::Band::Longwave => d.cloud_ir = Some(Arc::new(plane)),
+                clouds::Band::Visible => d.cloud_vis = Some(Arc::new(plane)),
+            }
+        }
+        raw(RawUpdate::Clouds { band, frame_unix, fetched_unix, png: bytes });
+        any = true;
+    }
+    if any {
+        shared.lock().unwrap_or_else(|e| e.into_inner()).rebuild_clouds();
+    }
 }
 
 fn load_cached_sun(
@@ -313,18 +462,27 @@ fn refresh(
         Source::Flux => (indices::FLUX_URL.to_string(), "flux.json".to_string(), JSON_LIMIT),
         Source::Kp => (indices::KP_URL.to_string(), "kp.json".to_string(), JSON_LIMIT),
         Source::Xray => (indices::XRAY_URL.to_string(), "xray.json".to_string(), JSON_LIMIT),
-        Source::Muf => (indices::IONOSONDE_URL.to_string(), "ionosondes.json".to_string(), JSON_LIMIT),
-        Source::Sats => (satellites::AMATEUR_URL.to_string(), "amateur.txt".to_string(), JSON_LIMIT),
-        Source::SatGeo => (satellites::QO100_URL.to_string(), "qo100.txt".to_string(), JSON_LIMIT),
-        Source::Aurora => {
-            (aurora::OVATION_URL.to_string(), "ovation.json".to_string(), JSON_LIMIT)
+        Source::Muf => {
+            (indices::IONOSONDE_URL.to_string(), "ionosondes.json".to_string(), JSON_LIMIT)
         }
+        Source::SatGeo => (satellites::QO100_URL.to_string(), "qo100.txt".to_string(), JSON_LIMIT),
+        Source::Aurora => (aurora::OVATION_URL.to_string(), "ovation.json".to_string(), JSON_LIMIT),
         Source::AuroraPower => {
             (aurora::HEMI_POWER_URL.to_string(), "hemipower.txt".to_string(), JSON_LIMIT)
         }
         Source::KpForecast => {
             (aurora::KP_FORECAST_URL.to_string(), "kpforecast.json".to_string(), JSON_LIMIT)
         }
+        Source::Clouds => (
+            clouds::Band::Longwave.url(),
+            clouds::Band::Longwave.cache_name().to_string(),
+            CLOUD_LIMIT,
+        ),
+        Source::CloudsVis => (
+            clouds::Band::Visible.url(),
+            clouds::Band::Visible.cache_name().to_string(),
+            CLOUD_LIMIT,
+        ),
     };
 
     match http_get(agent, &url, &cache.validators(&url), limit) {
@@ -335,9 +493,13 @@ fn refresh(
             d.status[src.index()].record_ok(now);
             false
         }
-        Ok(Some((bytes, validators))) => {
+        Ok(Some((bytes, validators, warning))) => {
+            // What hour the picture is of, where the source says so. Only the
+            // cloud mosaic does; for everything else the fetch time is the
+            // observation time to within its own cadence.
+            let frame_unix = warning.as_deref().and_then(clouds::frame_unix).unwrap_or(now);
             // Parse and decode before taking the lock.
-            let parsed = parse(src, &bytes, channel, now);
+            let parsed = parse(src, &bytes, channel, now, frame_unix);
             let ok = match &parsed {
                 Parsed::None => false,
                 _ => true,
@@ -347,19 +509,26 @@ fn refresh(
                 // Forward the original bytes for the sources whose wire form is
                 // the payload itself, before `bytes` is dropped.
                 match src {
-                    Source::Sun => raw(RawUpdate::Sun {
-                        channel,
-                        fetched_unix: now,
-                        jpeg: bytes.clone(),
-                    }),
-                    Source::Sats | Source::SatGeo => {
+                    Source::Sun => {
+                        raw(RawUpdate::Sun { channel, fetched_unix: now, jpeg: bytes.clone() })
+                    }
+                    Source::SatGeo => {
                         if let Ok(text) = std::str::from_utf8(&bytes) {
-                            raw(RawUpdate::Tle {
-                                geo: src == Source::SatGeo,
-                                text: text.to_string(),
-                            });
+                            raw(RawUpdate::Tle { geo: true, text: text.to_string() });
                         }
                     }
+                    Source::Clouds => raw(RawUpdate::Clouds {
+                        band: clouds::Band::Longwave,
+                        frame_unix,
+                        fetched_unix: now,
+                        png: bytes.clone(),
+                    }),
+                    Source::CloudsVis => raw(RawUpdate::Clouds {
+                        band: clouds::Band::Visible,
+                        frame_unix,
+                        fetched_unix: now,
+                        png: bytes.clone(),
+                    }),
                     _ => {}
                 }
             }
@@ -376,7 +545,6 @@ fn refresh(
                 Parsed::Kp(v) => d.weather.geomagnetic = Some(v),
                 Parsed::Xray(v) => d.weather.xray = Some(v),
                 Parsed::Ionosondes(v) => d.weather.ionosondes = v,
-                Parsed::Sats(v) => d.sats_amateur = v,
                 Parsed::SatGeo(v) => d.sats_geo = v,
                 Parsed::Aurora(v) => {
                     d.aurora = Some(Arc::new(v));
@@ -384,6 +552,13 @@ fn refresh(
                 }
                 Parsed::AuroraPower(v) => d.aurora_power = Some(v),
                 Parsed::KpForecast(v) => d.kp_forecast = v,
+                Parsed::Cloud(plane) => {
+                    match plane.band {
+                        clouds::Band::Longwave => d.cloud_ir = Some(Arc::new(plane)),
+                        clouds::Band::Visible => d.cloud_vis = Some(Arc::new(plane)),
+                    }
+                    d.rebuild_clouds();
+                }
                 Parsed::None => {
                     d.status[src.index()]
                         .record_err(now, format!("{} returned unusable data", src.label()));
@@ -412,20 +587,25 @@ enum Parsed {
     Kp(indices::GeomagneticIndex),
     Xray(indices::XrayLevel),
     Ionosondes(Vec<indices::Ionosonde>),
-    Sats(Vec<Satellite>),
     SatGeo(Vec<Satellite>),
     Aurora(AuroraOval),
     AuroraPower(HemisphericPower),
     KpForecast(Vec<KpPoint>),
+    Cloud(clouds::Plane),
     None,
 }
 
-fn parse(src: Source, bytes: &[u8], channel: SdoChannel, now: i64) -> Parsed {
+fn parse(src: Source, bytes: &[u8], channel: SdoChannel, now: i64, frame_unix: i64) -> Parsed {
     match src {
         Source::Sun => match imagery::decode(bytes, channel, now) {
             Some(img) => Parsed::Sun(img),
             None => Parsed::None,
         },
+        Source::Clouds | Source::CloudsVis => {
+            let band =
+                if src == Source::Clouds { clouds::Band::Longwave } else { clouds::Band::Visible };
+            clouds::parse_plane(band, bytes, frame_unix, now).map_or(Parsed::None, Parsed::Cloud)
+        }
         _ => {
             let Ok(text) = std::str::from_utf8(bytes) else { return Parsed::None };
             let parsed = match src {
@@ -434,20 +614,20 @@ fn parse(src: Source, bytes: &[u8], channel: SdoChannel, now: i64) -> Parsed {
                 Source::Regions => swpc::parse_regions(text).map(Parsed::Regions),
                 // These four return an Option rather than a Result: a feed that
                 // is momentarily empty is normal, not an error.
-                Source::Flux => return indices::parse_flux(text).map_or(Parsed::None, Parsed::Flux),
+                Source::Flux => {
+                    return indices::parse_flux(text).map_or(Parsed::None, Parsed::Flux);
+                }
                 Source::Kp => return indices::parse_kp(text).map_or(Parsed::None, Parsed::Kp),
-                Source::Xray => return indices::parse_xray(text).map_or(Parsed::None, Parsed::Xray),
+                Source::Xray => {
+                    return indices::parse_xray(text).map_or(Parsed::None, Parsed::Xray);
+                }
                 Source::Muf => {
                     let v = indices::parse_ionosondes(text);
                     return if v.is_empty() { Parsed::None } else { Parsed::Ionosondes(v) };
                 }
-                Source::Sats | Source::SatGeo => {
+                Source::SatGeo => {
                     let v = satellites::parse_tles(text);
-                    return match (v.is_empty(), src) {
-                        (true, _) => Parsed::None,
-                        (false, Source::SatGeo) => Parsed::SatGeo(v),
-                        (false, _) => Parsed::Sats(v),
-                    };
+                    return if v.is_empty() { Parsed::None } else { Parsed::SatGeo(v) };
                 }
                 Source::Aurora => {
                     return aurora::parse_ovation(text).map_or(Parsed::None, Parsed::Aurora);
@@ -460,7 +640,7 @@ fn parse(src: Source, bytes: &[u8], channel: SdoChannel, now: i64) -> Parsed {
                     let v = aurora::parse_kp_forecast(text);
                     return if v.is_empty() { Parsed::None } else { Parsed::KpForecast(v) };
                 }
-                Source::Sun => unreachable!(),
+                Source::Sun | Source::Clouds | Source::CloudsVis => unreachable!(),
             };
             parsed.unwrap_or_else(|e| {
                 tracing::warn!("solar feed: {} parse failed: {e}", src.label());
@@ -471,12 +651,17 @@ fn parse(src: Source, bytes: &[u8], channel: SdoChannel, now: i64) -> Parsed {
 }
 
 /// Conditional GET. `Ok(None)` means 304 Not Modified.
-fn http_get(
+///
+/// The third member of the tuple is the response's `Warning` header, which is
+/// where GeoServer puts the timestamp of the frame it decided to serve — the
+/// only place the cloud mosaic says what hour it is a picture of. Everything
+/// else ignores it.
+pub(crate) fn http_get(
     agent: &ureq::Agent,
     url: &str,
     validators: &Validators,
     limit: u64,
-) -> Result<Option<(Vec<u8>, Validators)>, String> {
+) -> Result<Option<(Vec<u8>, Validators, Option<String>)>, String> {
     let mut req = agent.get(url);
     if let Some(etag) = &validators.etag {
         req = req.header("If-None-Match", etag);
@@ -492,19 +677,15 @@ fn http_get(
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    let header = |name: &str| {
-        resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
-    };
+    let header =
+        |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let next = Validators {
         etag: header("etag"),
         last_modified: header("last-modified"),
         fetched_unix: 0,
     };
-    let bytes = resp
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|e| e.to_string())?;
-    Ok(Some((bytes, next)))
+    let warning = header("warning");
+    let bytes =
+        resp.body_mut().with_config().limit(limit).read_to_vec().map_err(|e| e.to_string())?;
+    Ok(Some((bytes, next, warning)))
 }

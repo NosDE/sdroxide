@@ -30,9 +30,7 @@ pub fn parse_unix(s: &str) -> Option<i64> {
     let h: u32 = t.next().filter(|s| !s.is_empty()).map_or(Some(0), |s| s.parse().ok())?;
     let mi: u32 = t.next().map_or(Some(0), |s| s.parse().ok())?;
     // Seconds may carry a fraction; whole seconds are as fine as this gets.
-    let se: u32 = t
-        .next()
-        .map_or(Some(0), |s| s.split('.').next().unwrap_or("0").parse().ok())?;
+    let se: u32 = t.next().map_or(Some(0), |s| s.split('.').next().unwrap_or("0").parse().ok())?;
     if h > 23 || mi > 59 || se > 60 {
         return None;
     }

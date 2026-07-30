@@ -141,15 +141,12 @@ impl FsqController {
         self.note_heard(&from);
         let after = after.trim_start();
         // Split the (optional) target token and its trigger from the payload.
-        let target_len = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '/'))
-            .unwrap_or(after.len());
+        let target_len =
+            after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '/')).unwrap_or(after.len());
         let target = after[..target_len].to_uppercase();
         let trigger = after[target_len..].chars().next().unwrap_or(' ');
-        let payload = after[target_len..]
-            .strip_prefix(trigger)
-            .unwrap_or(&after[target_len..])
-            .trim();
+        let payload =
+            after[target_len..].strip_prefix(trigger).unwrap_or(&after[target_len..]).trim();
         let my = self.my_call();
         let is_query = trigger == '?';
         let (to, to_me) = if target.is_empty() {
@@ -207,6 +204,10 @@ impl FsqController {
             fsq_heard: self.heard.clone(),
             fsq_messages: self.messages.clone(),
             rade: None,
+            js8: None,
+            fox_queue: Vec::new(),
+            call_queue: Vec::new(),
+            clock_offset_s: None,
         }
     }
 

@@ -1,9 +1,9 @@
 //! Digital down-converter: NCO mix to baseband, then multistage decimation
 //! from the device rate to a ~48 kHz channel rate.
 
+use crate::Complex32;
 use crate::decim::{FirDecim, HalfbandDecim};
 use crate::nco::Nco;
-use crate::Complex32;
 
 pub struct Ddc {
     nco: Nco,

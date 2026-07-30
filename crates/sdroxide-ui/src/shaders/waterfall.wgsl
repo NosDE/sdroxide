@@ -9,6 +9,8 @@ struct Uniforms {
     // viewport in texture-u coordinates
     u_lo: f32,
     u_hi: f32,
+    // 1 = flipped: newest row at the bottom, scrolling upwards
+    flip: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -37,8 +39,10 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let u_tex = mix(u.u_lo, u.u_hi, in.uv.x);
-    // Newest row at the top; older rows below.
-    let v_tex = fract(u.scroll - in.uv.y * u.vscale);
+    // Age of this pixel's row, 0 at the newest edge. Newest at the top and
+    // older rows below, or the reverse when flipped.
+    let age = select(in.uv.y, 1.0 - in.uv.y, u.flip > 0.5);
+    let v_tex = fract(u.scroll - age * u.vscale);
     let intensity = textureSampleLevel(hist_tex, hist_samp, vec2<f32>(u_tex, v_tex), 0.0).r;
     return textureSampleLevel(lut_tex, lut_samp, vec2<f32>(intensity, 0.5), 0.0);
 }

@@ -102,10 +102,7 @@ fn run(cmds: &[Command], settle: Duration) -> (bool, Option<sdroxide_types::Voic
 /// pressed by accident in FT8 must not key up — whatever is in the slot.
 #[test]
 fn a_voice_message_never_keys_up_in_a_digital_mode() {
-    let cmds = [
-        Command::SetMode { rx: RxId::Main, mode: Mode::Ft8 },
-        Command::VoicePlay(Some(0)),
-    ];
+    let cmds = [Command::SetMode { rx: RxId::Main, mode: Mode::Ft8 }, Command::VoicePlay(Some(0))];
     let (keyed, _) = run(&cmds, Duration::from_millis(700));
     assert!(!keyed, "the voice keyer must be refused in FT8");
 }

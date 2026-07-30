@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -90,6 +90,51 @@ pub fn sstv_rx_dir() -> Result<PathBuf, ConfigError> {
     Ok(dir)
 }
 
+/// Directory for a mode's received pictures (`~/.config/sdroxide/<kind>_rx`),
+/// created on demand.
+///
+/// One store per mode rather than one for everything: an SSTV picture and a
+/// weather chart are browsed for entirely different reasons, and a
+/// fifteen-minute chart arriving every half hour would bury a session's SSTV.
+pub fn image_rx_dir(kind: &str) -> Result<PathBuf, ConfigError> {
+    // The caller's `kind` is a literal today, but it ends up in a path.
+    let safe: String = kind.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let dir = config_dir()?.join(format!("{}_rx", if safe.is_empty() { "image" } else { &safe }));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Directory for received weather-fax charts, created on demand: the user's
+/// pictures directory (`<Pictures>/sdroxide/wefax`), or the config directory
+/// (`~/.config/sdroxide/wefax_rx`) when the platform exposes no pictures folder.
+///
+/// Charts go where pictures go, unlike every other store here, because that is
+/// what they are for. A weather chart is printed, mailed, dropped into a
+/// passage plan or opened next to a routing program — all of which happen
+/// outside this program, in a file manager, and none of which anyone will do
+/// from a hidden directory under `~/.config`.
+pub fn wefax_rx_dir() -> Result<PathBuf, ConfigError> {
+    let dir = match directories::UserDirs::new()
+        .and_then(|u| u.picture_dir().map(std::path::Path::to_path_buf))
+    {
+        Some(pictures) => pictures.join("sdroxide").join("wefax"),
+        None => config_dir()?.join("wefax_rx"),
+    };
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Where charts were kept before they moved to the pictures directory.
+///
+/// Read-only and never created: the gallery lists it alongside the current
+/// store so an existing collection does not appear to have been lost. `None`
+/// when it is the current store anyway, or when there is no config directory.
+pub fn wefax_legacy_rx_dir() -> Option<PathBuf> {
+    let old = config_dir().ok()?.join("wefax_rx");
+    let current = wefax_rx_dir().ok()?;
+    (old != current && old.is_dir()).then_some(old)
+}
+
 /// Directory for the operator's transmit-image slots
 /// (`~/.config/sdroxide/sstv_tx`), created on demand.
 pub fn sstv_tx_dir() -> Result<PathBuf, ConfigError> {
@@ -165,7 +210,8 @@ impl Settings {
 }
 
 /// Band-stack registers: up to 3 remembered (freq, mode, filter) per band.
-pub type BandStacks = std::collections::HashMap<sdroxide_types::Band, Vec<sdroxide_types::BandStackEntry>>;
+pub type BandStacks =
+    std::collections::HashMap<sdroxide_types::Band, Vec<sdroxide_types::BandStackEntry>>;
 
 fn load_json<T: serde::de::DeserializeOwned + Default>(file: &str) -> T {
     let Ok(dir) = config_dir() else { return T::default() };
@@ -312,6 +358,122 @@ pub fn save_sstv_messages(messages: &[String]) -> Result<(), ConfigError> {
     save_json("sstv_messages.json", &messages)
 }
 
+/// The operator's satellite additions: element sets pasted in by hand, and
+/// frequency entries that override or extend the built-in table.
+///
+/// A client-side file like `input.json`: it describes what this operator wants
+/// to track and where they have found the transponders, so it stays with the UI
+/// rather than with the engine.
+pub fn load_sat_config() -> sdroxide_types::SatConfig {
+    let mut cfg: sdroxide_types::SatConfig = load_json("satellites.json");
+    // The amateur satellites and the ISS used to be fetched unconditionally.
+    // They are subscriptions now, so a config that predates them — or a fresh
+    // install with no file at all — has to be given them once, or the sky comes
+    // up empty. Written back immediately so the seeding happens exactly once
+    // and unsubscribing sticks.
+    if cfg.seed_defaults() {
+        if let Err(e) = save_sat_config(&cfg) {
+            warn!("could not write the seeded satellite subscriptions: {e}");
+        }
+    }
+    cfg
+}
+
+pub fn save_sat_config(cfg: &sdroxide_types::SatConfig) -> Result<(), ConfigError> {
+    save_json("satellites.json", cfg)
+}
+
+/// The broadcast station list (`broadcast_stations.json`).
+pub const BROADCAST_STATIONS_FILE: &str = "broadcast_stations.json";
+
+/// Where the broadcast station list lives, for showing in the settings panel.
+pub fn broadcast_stations_path() -> Result<PathBuf, ConfigError> {
+    Ok(config_dir()?.join(BROADCAST_STATIONS_FILE))
+}
+
+/// The longwave/shortwave broadcast stations the waterfall labels.
+///
+/// Unlike every other store here this file is *reference data*, not the
+/// operator's preferences: it is seeded once from the table compiled into the
+/// binary and then left alone, because someone who has corrected a schedule or
+/// added a local station must not lose it to an upgrade. Deleting the file
+/// restores the bundled list; [`restore_bundled_broadcast_stations`] does the
+/// same deliberately.
+///
+/// A malformed file falls back to the bundled table rather than to an empty
+/// list — the generic [`load_json`] behaviour of quietly starting fresh is
+/// wrong for data the operator never expected to have to maintain.
+pub fn load_broadcast_stations() -> Vec<sdroxide_types::BroadcastStation> {
+    let Ok(path) = broadcast_stations_path() else {
+        return sdroxide_types::broadcast::builtin().to_vec();
+    };
+    load_broadcast_stations_at(&path)
+}
+
+/// [`load_broadcast_stations`] against an explicit path, so the seed-once and
+/// fall-back-on-garbage behaviour can be tested without a config directory.
+fn load_broadcast_stations_at(path: &std::path::Path) -> Vec<sdroxide_types::BroadcastStation> {
+    if !path.exists() {
+        match write_bundled_broadcast_stations(path) {
+            Ok(()) => info!("seeded {BROADCAST_STATIONS_FILE} from the bundled station list"),
+            Err(e) => warn!("could not seed {BROADCAST_STATIONS_FILE}: {e}"),
+        }
+    }
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<sdroxide_types::BroadcastStations>(&text) {
+            Ok(f) => f.stations,
+            Err(e) => {
+                warn!("failed to parse {BROADCAST_STATIONS_FILE}: {e}; using the bundled list");
+                sdroxide_types::broadcast::builtin().to_vec()
+            }
+        },
+        Err(e) => {
+            warn!("failed to read {BROADCAST_STATIONS_FILE}: {e}; using the bundled list");
+            sdroxide_types::broadcast::builtin().to_vec()
+        }
+    }
+}
+
+pub fn save_broadcast_stations(
+    stations: &[sdroxide_types::BroadcastStation],
+) -> Result<(), ConfigError> {
+    let file = sdroxide_types::BroadcastStations {
+        version: 1,
+        updated: String::new(),
+        note: String::new(),
+        stations: stations.to_vec(),
+    };
+    save_json(BROADCAST_STATIONS_FILE, &file)
+}
+
+/// Replace the operator's station list with the bundled one, keeping the old
+/// file alongside as `.bak`. The only path that overwrites their edits, so it
+/// stays behind an explicit action in the UI.
+pub fn restore_bundled_broadcast_stations() -> Result<(), ConfigError> {
+    restore_bundled_broadcast_stations_at(&broadcast_stations_path()?)
+}
+
+fn restore_bundled_broadcast_stations_at(path: &std::path::Path) -> Result<(), ConfigError> {
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        if let Err(e) = fs::rename(path, &backup) {
+            warn!("could not back up {BROADCAST_STATIONS_FILE}: {e}");
+        }
+    }
+    write_bundled_broadcast_stations(path)
+}
+
+/// Write the compiled-in table out verbatim, so the shipped and on-disk copies
+/// are byte-identical — re-serialising would drop the file's own provenance
+/// notes and reformat every entry.
+fn write_bundled_broadcast_stations(path: &std::path::Path) -> Result<(), ConfigError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, sdroxide_types::broadcast::EMBEDDED_JSON)?;
+    Ok(())
+}
+
 /// Voice-keyer slot labels (one entry per slot). The recordings themselves are
 /// WAV files under [`voice_dir`]; this stores only what each slot is called.
 pub fn load_voice_names() -> Vec<String> {
@@ -346,7 +508,8 @@ mod tests {
         let mut cfg = SkimmerSettings::default();
         cfg.set_enabled(SkimmerKind::Psk, false);
         cfg.set_squelch_db(SkimmerKind::Cw, 12);
-        let back: SkimmerSettings = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let back: SkimmerSettings =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
         assert!(!back.enabled(SkimmerKind::Psk));
         assert_eq!(back.squelch_db(SkimmerKind::Cw), 12);
@@ -367,7 +530,12 @@ mod tests {
         let mut stacks = BandStacks::default();
         stacks.insert(
             Band::M40,
-            vec![BandStackEntry { freq_hz: 7_100_000.0, mode: Mode::Lsb, filter_lo: -2850.0, filter_hi: -150.0 }],
+            vec![BandStackEntry {
+                freq_hz: 7_100_000.0,
+                mode: Mode::Lsb,
+                filter_lo: -2850.0,
+                filter_hi: -150.0,
+            }],
         );
         let text = serde_json::to_string(&stacks).unwrap();
         let back: BandStacks = serde_json::from_str(&text).unwrap();
@@ -413,5 +581,78 @@ mod tests {
         assert_eq!(c.spot_max_age_secs, 600, "the rest of the file still applies");
         assert!(c.cluster.enabled);
         assert!(c.freedv_reporter.enabled);
+    }
+
+    /// A scratch directory of our own, so the station-list tests never touch the
+    /// operator's real config. No `tempfile` dependency for four tests.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sdroxide-bc-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join(BROADCAST_STATIONS_FILE)
+    }
+
+    #[test]
+    fn a_missing_station_list_is_seeded_from_the_bundled_one() {
+        let path = scratch("seed");
+        assert!(!path.exists());
+        let loaded = load_broadcast_stations_at(&path);
+        assert!(path.exists(), "the file should have been written");
+        // Byte-for-byte, so the shipped and seeded copies cannot drift and the
+        // file's own provenance notes survive.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            sdroxide_types::broadcast::EMBEDDED_JSON
+        );
+        assert_eq!(loaded.len(), sdroxide_types::broadcast::builtin().len());
+    }
+
+    #[test]
+    fn an_edited_station_list_survives_being_loaded_again() {
+        let path = scratch("edit");
+        load_broadcast_stations_at(&path);
+        fs::write(
+            &path,
+            r#"{"version":1,"stations":[{"name":"My Local Pirate","freq_khz":6295}]}"#,
+        )
+        .unwrap();
+        let loaded = load_broadcast_stations_at(&path);
+        assert_eq!(loaded.len(), 1, "the operator's file wins, and is not re-seeded");
+        assert_eq!(loaded[0].name, "My Local Pirate");
+        assert_eq!(loaded[0].freq_khz, 6295.0);
+        // A two-field entry is legal, and everything else defaults.
+        assert!(loaded[0].site.is_empty());
+        assert_eq!(loaded[0].mode_str(), "AM");
+    }
+
+    #[test]
+    fn a_corrupt_station_list_falls_back_without_overwriting_it() {
+        let path = scratch("corrupt");
+        fs::write(&path, "{ this is not json").unwrap();
+        let loaded = load_broadcast_stations_at(&path);
+        assert_eq!(
+            loaded.len(),
+            sdroxide_types::broadcast::builtin().len(),
+            "a broken file must not leave the waterfall with no stations"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{ this is not json",
+            "and must not be silently destroyed — it is the operator's to fix"
+        );
+    }
+
+    #[test]
+    fn restoring_the_bundled_list_keeps_the_old_one_alongside() {
+        let path = scratch("restore");
+        fs::write(&path, r#"{"version":1,"stations":[{"name":"Mine","freq_khz":6070}]}"#).unwrap();
+        restore_bundled_broadcast_stations_at(&path).expect("restore");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            sdroxide_types::broadcast::EMBEDDED_JSON
+        );
+        let backup = path.with_extension("json.bak");
+        assert!(backup.exists(), "the edited list should be kept as .json.bak");
+        assert!(fs::read_to_string(&backup).unwrap().contains("Mine"));
     }
 }

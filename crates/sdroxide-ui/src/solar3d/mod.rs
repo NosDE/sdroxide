@@ -99,6 +99,13 @@ pub struct Solar3d {
     /// Channel/resolution the running feed was started with, so a change in the
     /// UI can be forwarded rather than restarting the thread.
     feed_channel: (u8, u16),
+    /// The custom element sets the running feed was last told about. SGP4
+    /// constants are not free to rebuild, so the listing is only re-sent when
+    /// the operator actually changes it.
+    feed_tles: String,
+    /// Likewise for the subscribed listings: re-sending these would refetch
+    /// nothing (the cache decides that) but would still reparse every one.
+    feed_subs: Vec<sdroxide_types::TleSubscription>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -111,6 +118,8 @@ impl Solar3d {
             gpu_ready: false,
             feed: None,
             feed_channel: (view.channel, view.resolution),
+            feed_tles: String::new(),
+            feed_subs: Vec::new(),
         }
     }
 
@@ -127,15 +136,39 @@ impl Solar3d {
         v
     }
 
+    /// Whether the clouds are marched rather than sliced. Lives here rather than
+    /// in `UiSettings` because it rides `Solar3dView`, which is the state the
+    /// browser tab persists too — the same switch has to reach both.
+    pub fn cloud_march(&self) -> bool {
+        self.lock().view.cloud_march
+    }
+
+    pub fn set_cloud_march(&self, on: bool) {
+        self.lock().view.cloud_march = on;
+    }
+
     /// Emit the window for this frame (or not, when closed). Call once per root
-    /// pass, after the main UI. `grid` is the operator's Maidenhead locator.
-    pub fn viewport(&mut self, ctx: &egui::Context, grid: &str, traffic: DigiTraffic) {
+    /// pass, after the main UI. `grid` is the operator's Maidenhead locator and
+    /// `awards` the log's DXCC coverage for the "what is still missing" layer.
+    pub fn viewport(
+        &mut self,
+        ctx: &egui::Context,
+        grid: &str,
+        traffic: DigiTraffic,
+        awards: Arc<Vec<sdroxide_types::EntitySlot>>,
+        sat_cfg: Arc<sdroxide_types::SatConfig>,
+    ) {
         if !self.open {
             // Dropping the feed disconnects the worker's channel, which is how
             // it learns to stop. Closing the window therefore ends all network
             // activity, which is the behaviour the manual promises.
             if self.feed.take().is_some() {
                 self.lock().data = None;
+                // The next feed is a new thread that knows nothing, so forget
+                // what the old one was told or the custom sets would never be
+                // re-sent after a close and reopen.
+                self.feed_tles.clear();
+                self.feed_subs.clear();
             }
             return;
         }
@@ -147,6 +180,7 @@ impl Solar3d {
             self.gpu_ready = true;
         }
         self.ensure_feed(ctx);
+        self.ensure_custom_tles(&sat_cfg);
 
         // Publish this frame's inputs, then drop the guard: the deferred
         // callback takes the same lock, and on the embedded-viewport path it
@@ -155,6 +189,8 @@ impl Solar3d {
             let mut st = self.lock();
             st.set_qth(grid);
             st.digi = traffic;
+            st.awards = awards;
+            st.sat_cfg = sat_cfg;
         }
 
         let state = Arc::clone(&self.state);
@@ -225,6 +261,48 @@ impl Solar3d {
                 }
             }
             self.feed_channel = (channel, resolution);
+        }
+    }
+
+    /// Push the operator's own element sets into the feed when they change.
+    ///
+    /// The listing is compared rather than the config, so editing a frequency
+    /// entry — which the tracker does not care about — costs nothing.
+    fn ensure_custom_tles(&mut self, cfg: &sdroxide_types::SatConfig) {
+        let Some(feed) = &self.feed else { return };
+        let text = cfg.tle_text();
+        if text != self.feed_tles {
+            feed.send(sdroxide_solar::FeedCmd::SetCustomTles(text.clone()));
+            self.feed_tles = text;
+        }
+        let subs: Vec<_> = cfg.live_subs().cloned().collect();
+        if subs != self.feed_subs {
+            feed.send(sdroxide_solar::FeedCmd::SetTleSubs(subs.clone()));
+            self.feed_subs = subs;
+        }
+    }
+
+    /// What each TLE subscription's last fetch did, for the settings dialog.
+    ///
+    /// Empty while the window has never been open this session: the feed — and
+    /// with it every fetch — only exists while the window does. The settings
+    /// dialog falls back to reading the disk cache in that case, so a
+    /// subscription still reports its age with the window shut.
+    pub fn tle_sub_status(&self) -> Vec<sdroxide_solar::SubStatus> {
+        let st = self.lock();
+        let Some(data) = &st.data else { return Vec::new() };
+        data.lock().unwrap_or_else(|e| e.into_inner()).tle_subs.clone()
+    }
+
+    /// Re-read the subscribed listings from the disk cache.
+    ///
+    /// Used after the settings dialog fetches them itself: the feed shares the
+    /// cache but has no way to know somebody else just wrote to it, so without
+    /// this the window would keep showing the previous listing until its own
+    /// six-hourly refresh came round.
+    pub fn reload_tle_subs(&mut self) {
+        if let Some(feed) = &self.feed {
+            feed.send(sdroxide_solar::FeedCmd::SetTleSubs(self.feed_subs.clone()));
         }
     }
 

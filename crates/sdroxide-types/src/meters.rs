@@ -29,6 +29,9 @@ pub struct Meters {
     pub adc_peak_dbfs: f32,
     /// Present while transmitting.
     pub tx: Option<TxMeters>,
+    /// A WFM stereo pilot is locked on the main receiver. Drives the `ST`
+    /// indicator; always `false` in every other mode.
+    pub stereo: bool,
 }
 
 impl Meters {

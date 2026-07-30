@@ -224,42 +224,222 @@ impl Moon {
 /// one mid-table would re-point everybody's saved target at a different body.
 /// Grouping is by lookup rather than by position, so appending costs nothing.
 pub static MOONS: &[Moon] = &[
-    moon("Phobos", Planet::Mars, Surface::Cratered, 0.000_011_1,
-         0.009_378, 0.318_910_1, 26.9468, 81.3020, 175.2965, 3.1),
-    moon("Deimos", Planet::Mars, Surface::Cratered, 0.000_006_2,
-         0.023_457, 1.262_441_0, 26.0340, 83.1084, 217.9145, 2.1),
-    moon("Io", Planet::Jupiter, Surface::Volcanic, 0.001_821_6,
-         0.421_734, 1.769_137_8, 2.1863, 338.5922, 39.6030, 0.5),
-    moon("Europa", Planet::Jupiter, Surface::Icy, 0.001_560_8,
-         0.670_784, 3.551_181_3, 2.3008, 349.6050, 223.3522, 1.4),
-    moon("Ganymede", Planet::Jupiter, Surface::Cratered, 0.002_634_1,
-         1.070_477, 7.154_553_8, 2.2921, 338.4866, 241.5283, 0.4),
-    moon("Callisto", Planet::Jupiter, Surface::Cratered, 0.002_410_3,
-         1.882_801, 16.689_044_3, 1.9602, 337.0372, 102.4867, 0.9),
-    moon("Enceladus", Planet::Saturn, Surface::Icy, 0.000_252_1,
-         0.238_093, 1.370_218_3, 28.0483, 169.5092, 142.6489, 0.8),
-    moon("Tethys", Planet::Saturn, Surface::Icy, 0.000_531_1,
-         0.294_675, 1.887_802_4, 27.1398, 168.2413, 149.9646, 2.5),
-    moon("Dione", Planet::Saturn, Surface::Icy, 0.000_561_4,
-         0.377_426, 2.736_915_5, 28.0537, 169.5225, 136.8684, 0.4),
-    moon("Rhea", Planet::Saturn, Surface::Icy, 0.000_763_8,
-         0.527_075, 4.517_502_9, 27.8771, 168.9550, 12.7417, 0.6),
-    moon("Titan", Planet::Saturn, Surface::Haze, 0.002_574_7,
-         1.222_836, 15.945_438_8, 27.7089, 169.0684, 327.2068, 4.0),
-    moon("Iapetus", Planet::Saturn, Surface::Cratered, 0.000_734_5,
-         3.563_010, 79.330_326_1, 17.0000, 138.8233, 77.7233, 3.7),
-    moon("Miranda", Planet::Uranus, Surface::Icy, 0.000_235_8,
-         0.129_841, 1.413_478_5, 99.4000, 165.7880, 321.6880, 6.5),
-    moon("Ariel", Planet::Uranus, Surface::Icy, 0.000_578_9,
-         0.190_932, 2.520_379_4, 97.7212, 167.6678, 198.1876, 0.2),
-    moon("Umbriel", Planet::Uranus, Surface::Icy, 0.000_584_7,
-         0.265_977, 4.144_177_4, 97.7181, 167.7028, 246.2747, 0.6),
-    moon("Titania", Planet::Uranus, Surface::Icy, 0.000_788_4,
-         0.436_301, 8.705_867_1, 97.7794, 167.6473, 276.4197, 0.3),
-    moon("Oberon", Planet::Uranus, Surface::Icy, 0.000_761_4,
-         0.583_447, 13.463_238_7, 97.9102, 167.7100, 347.5247, 0.3),
-    moon("Triton", Planet::Neptune, Surface::Icy, 0.001_353_4,
-         0.354_759, 5.876_843_3, 129.3400, 222.4621, 78.8495, 1.2),
+    moon(
+        "Phobos",
+        Planet::Mars,
+        Surface::Cratered,
+        0.000_011_1,
+        0.009_378,
+        0.318_910_1,
+        26.9468,
+        81.3020,
+        175.2965,
+        3.1,
+    ),
+    moon(
+        "Deimos",
+        Planet::Mars,
+        Surface::Cratered,
+        0.000_006_2,
+        0.023_457,
+        1.262_441_0,
+        26.0340,
+        83.1084,
+        217.9145,
+        2.1,
+    ),
+    moon(
+        "Io",
+        Planet::Jupiter,
+        Surface::Volcanic,
+        0.001_821_6,
+        0.421_734,
+        1.769_137_8,
+        2.1863,
+        338.5922,
+        39.6030,
+        0.5,
+    ),
+    moon(
+        "Europa",
+        Planet::Jupiter,
+        Surface::Icy,
+        0.001_560_8,
+        0.670_784,
+        3.551_181_3,
+        2.3008,
+        349.6050,
+        223.3522,
+        1.4,
+    ),
+    moon(
+        "Ganymede",
+        Planet::Jupiter,
+        Surface::Cratered,
+        0.002_634_1,
+        1.070_477,
+        7.154_553_8,
+        2.2921,
+        338.4866,
+        241.5283,
+        0.4,
+    ),
+    moon(
+        "Callisto",
+        Planet::Jupiter,
+        Surface::Cratered,
+        0.002_410_3,
+        1.882_801,
+        16.689_044_3,
+        1.9602,
+        337.0372,
+        102.4867,
+        0.9,
+    ),
+    moon(
+        "Enceladus",
+        Planet::Saturn,
+        Surface::Icy,
+        0.000_252_1,
+        0.238_093,
+        1.370_218_3,
+        28.0483,
+        169.5092,
+        142.6489,
+        0.8,
+    ),
+    moon(
+        "Tethys",
+        Planet::Saturn,
+        Surface::Icy,
+        0.000_531_1,
+        0.294_675,
+        1.887_802_4,
+        27.1398,
+        168.2413,
+        149.9646,
+        2.5,
+    ),
+    moon(
+        "Dione",
+        Planet::Saturn,
+        Surface::Icy,
+        0.000_561_4,
+        0.377_426,
+        2.736_915_5,
+        28.0537,
+        169.5225,
+        136.8684,
+        0.4,
+    ),
+    moon(
+        "Rhea",
+        Planet::Saturn,
+        Surface::Icy,
+        0.000_763_8,
+        0.527_075,
+        4.517_502_9,
+        27.8771,
+        168.9550,
+        12.7417,
+        0.6,
+    ),
+    moon(
+        "Titan",
+        Planet::Saturn,
+        Surface::Haze,
+        0.002_574_7,
+        1.222_836,
+        15.945_438_8,
+        27.7089,
+        169.0684,
+        327.2068,
+        4.0,
+    ),
+    moon(
+        "Iapetus",
+        Planet::Saturn,
+        Surface::Cratered,
+        0.000_734_5,
+        3.563_010,
+        79.330_326_1,
+        17.0000,
+        138.8233,
+        77.7233,
+        3.7,
+    ),
+    moon(
+        "Miranda",
+        Planet::Uranus,
+        Surface::Icy,
+        0.000_235_8,
+        0.129_841,
+        1.413_478_5,
+        99.4000,
+        165.7880,
+        321.6880,
+        6.5,
+    ),
+    moon(
+        "Ariel",
+        Planet::Uranus,
+        Surface::Icy,
+        0.000_578_9,
+        0.190_932,
+        2.520_379_4,
+        97.7212,
+        167.6678,
+        198.1876,
+        0.2,
+    ),
+    moon(
+        "Umbriel",
+        Planet::Uranus,
+        Surface::Icy,
+        0.000_584_7,
+        0.265_977,
+        4.144_177_4,
+        97.7181,
+        167.7028,
+        246.2747,
+        0.6,
+    ),
+    moon(
+        "Titania",
+        Planet::Uranus,
+        Surface::Icy,
+        0.000_788_4,
+        0.436_301,
+        8.705_867_1,
+        97.7794,
+        167.6473,
+        276.4197,
+        0.3,
+    ),
+    moon(
+        "Oberon",
+        Planet::Uranus,
+        Surface::Icy,
+        0.000_761_4,
+        0.583_447,
+        13.463_238_7,
+        97.9102,
+        167.7100,
+        347.5247,
+        0.3,
+    ),
+    moon(
+        "Triton",
+        Planet::Neptune,
+        Surface::Icy,
+        0.001_353_4,
+        0.354_759,
+        5.876_843_3,
+        129.3400,
+        222.4621,
+        78.8495,
+        1.2,
+    ),
 ];
 
 /// Terse constructor so the table above stays one line per moon.
@@ -543,7 +723,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no {group}/{name} in the fixture"))
             .iter()
             .map(|row| {
-                let v: Vec<f64> = row.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+                let v: Vec<f64> =
+                    row.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
                 (v[0], vec3(v[1], v[2], v[3]))
             })
             .collect()
@@ -767,7 +948,12 @@ mod tests {
                 p.name()
             );
             let want = if retro { 180.0 - obliquity } else { obliquity };
-            assert!((tilt(p) - want).abs() < 0.6, "{} tilt {:.2}°, want {want:.2}°", p.name(), tilt(p));
+            assert!(
+                (tilt(p) - want).abs() < 0.6,
+                "{} tilt {:.2}°, want {want:.2}°",
+                p.name(),
+                tilt(p)
+            );
         }
     }
 
@@ -782,9 +968,8 @@ mod tests {
     #[test]
     fn moon_orbits_sit_in_their_planets_equator() {
         let jd = 2_451_545.0;
-        let orbit_normal = |m: &Moon| {
-            m.offset(jd).cross(m.offset(jd + m.period_d * 0.25)).normalize()
-        };
+        let orbit_normal =
+            |m: &Moon| m.offset(jd).cross(m.offset(jd + m.period_d * 0.25)).normalize();
         for m in MOONS {
             let pole = m.parent.basis(jd).z;
             let off = orbit_normal(m).dot(pole).clamp(-1.0, 1.0).acos().to_degrees();
@@ -820,11 +1005,8 @@ mod tests {
             );
         }
         let t = MOONS.iter().find(|m| m.name == "Triton").unwrap();
-        let off = orbit_normal(t)
-            .dot(Planet::Neptune.basis(jd).z)
-            .clamp(-1.0, 1.0)
-            .acos()
-            .to_degrees();
+        let off =
+            orbit_normal(t).dot(Planet::Neptune.basis(jd).z).clamp(-1.0, 1.0).acos().to_degrees();
         assert!((off - 157.0).abs() < 3.0, "Triton is {off:.1}° to Neptune's equator");
     }
 

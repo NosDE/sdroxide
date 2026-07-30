@@ -1,9 +1,37 @@
+use sdroxide_dsp::ComplexDcBlock;
 use soapysdr::Direction;
 use tracing::info;
 
 use sdroxide_types::{DeviceCaps, GainElement};
 
 use crate::{Complex32, IqSource, RadioError, Result};
+
+/// Corner frequency of the front-end DC blocker. Low enough to be invisible at
+/// any device rate (10 ppm of a 2 Msps span), high enough to settle in ~8 ms.
+const DC_BLOCK_HZ: f64 = 20.0;
+
+/// Fraction of the span the LO is parked above the VFO on a zero-IF front end.
+/// A quarter keeps every channel filter clear of DC while leaving three
+/// quarters of the span *above* the VFO, which is where band activity sits.
+const LO_OFFSET_FRAC: f64 = 0.25;
+
+/// Below this rate offset tuning costs more span than it is worth, and the span
+/// is too narrow to escape DC by a useful margin anyway.
+const LO_OFFSET_MIN_RATE: f64 = 1_000_000.0;
+
+/// LO offset for an open RX stream — see [`IqSource::lo_offset_hz`].
+///
+/// `analog_bw` is the front end's filter bandwidth (0 if it reports none):
+/// parking the LO further out than the analog filter reaches would just
+/// attenuate the signal we moved out there, so such a device gets no offset
+/// and relies on the DC blocker alone.
+fn lo_offset_for(rate: f64, analog_bw: f64) -> f64 {
+    if rate < LO_OFFSET_MIN_RATE {
+        return 0.0;
+    }
+    let offset = rate * LO_OFFSET_FRAC;
+    if analog_bw > 0.0 && offset > analog_bw * 0.45 { 0.0 } else { offset }
+}
 
 /// One enumerated device: its label plus the args string that opens it.
 #[derive(Debug, Clone)]
@@ -64,9 +92,7 @@ impl SoapyDevice {
         candidates
             .into_iter()
             .filter(|&r| ok(r))
-            .min_by(|a, b| {
-                (a - requested).abs().total_cmp(&(b - requested).abs())
-            })
+            .min_by(|a, b| (a - requested).abs().total_cmp(&(b - requested).abs()))
             .unwrap_or(requested)
     }
 
@@ -103,12 +129,18 @@ impl SoapyDevice {
             let _ = self.dev.set_gain(Direction::Tx, channel, 0.0);
             for name in self.dev.list_gains(Direction::Tx, channel).unwrap_or_default() {
                 if let Ok(r) = self.dev.gain_element_range(Direction::Tx, channel, name.as_str()) {
-                    let _ = self
-                        .dev
-                        .set_gain_element(Direction::Tx, channel, name.as_str(), r.minimum);
+                    let _ =
+                        self.dev.set_gain_element(Direction::Tx, channel, name.as_str(), r.minimum);
                 }
             }
         }
+
+        let analog_bw = self.dev.bandwidth(Direction::Rx, channel).unwrap_or(0.0);
+        let lo_offset = lo_offset_for(actual_rate, analog_bw);
+        info!(
+            rate = actual_rate,
+            analog_bw, lo_offset, "RX front end configured (LO offset 0 = LO on the VFO)"
+        );
 
         let mut source = SoapyRxSource {
             dev: self.dev,
@@ -118,6 +150,8 @@ impl SoapyDevice {
             channel,
             sample_rate: actual_rate,
             center_hz,
+            lo_offset,
+            dc: ComplexDcBlock::new(DC_BLOCK_HZ, actual_rate),
             overflows: 0,
             tx_underflows: 0,
         };
@@ -136,6 +170,11 @@ pub struct SoapyRxSource {
     channel: usize,
     sample_rate: f64,
     center_hz: f64,
+    lo_offset: f64,
+    /// Front-end DC/LO-leakage removal, applied to every block as it arrives so
+    /// the spectrum display, both DDCs, the skimmer and the TCI IQ feed all see
+    /// a clean stream. See [`ComplexDcBlock`].
+    dc: ComplexDcBlock,
     overflows: u64,
     tx_underflows: u64,
 }
@@ -179,9 +218,9 @@ impl IqSource for SoapyRxSource {
         let Some(stream) = self.rx_stream.as_mut() else {
             return Ok(0);
         };
-        match stream.read(&mut [buf], 200_000) {
-            Ok(n) => Ok(n),
-            Err(e) if e.code == soapysdr::ErrorCode::Timeout => Ok(0),
+        let n = match stream.read(&mut [buf], 200_000) {
+            Ok(n) => n,
+            Err(e) if e.code == soapysdr::ErrorCode::Timeout => 0,
             // Overflow = samples dropped because we read too slowly.
             // Recoverable: log and keep streaming.
             Err(e) if e.code == soapysdr::ErrorCode::Overflow => {
@@ -189,10 +228,19 @@ impl IqSource for SoapyRxSource {
                 if self.overflows.is_power_of_two() {
                     tracing::warn!(count = self.overflows, "RX overflow (samples dropped)");
                 }
-                Ok(0)
+                0
             }
-            Err(e) => Err(RadioError::Soapy(e)),
-        }
+            Err(e) => return Err(RadioError::Soapy(e)),
+        };
+        // Deliberately not reset across a dropped block or a TX cycle: the
+        // offset is a property of the hardware, not of the stream, so carrying
+        // the estimate avoids a re-convergence transient on every resume.
+        self.dc.process(&mut buf[..n]);
+        Ok(n)
+    }
+
+    fn lo_offset_hz(&self) -> f64 {
+        self.lo_offset
     }
 
     fn describe(&self) -> String {
@@ -369,9 +417,8 @@ fn probe_caps(dev: &soapysdr::Device) -> Result<DeviceCaps> {
     }
     let lower: Vec<String> = sensors.iter().map(|s| s.to_lowercase()).collect();
     let has_swr_sensor = lower.iter().any(|s| s.contains("swr") || s.contains("vswr"));
-    let has_fwd_power_sensor = lower
-        .iter()
-        .any(|s| s.contains("forward") || s.contains("fwd") || s.contains("tx_power"));
+    let has_fwd_power_sensor =
+        lower.iter().any(|s| s.contains("forward") || s.contains("fwd") || s.contains("tx_power"));
 
     Ok(DeviceCaps {
         driver,
@@ -392,4 +439,23 @@ fn probe_caps(dev: &soapysdr::Device) -> Result<DeviceCaps> {
         has_swr_sensor,
         has_fwd_power_sensor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lo_offset_wants_span_and_an_analog_filter_wide_enough_to_reach_it() {
+        // A HackRF at the rate it settles on: the 1.75 MHz baseband filter
+        // passes a 500 kHz offset with room to spare.
+        assert_eq!(lo_offset_for(2_000_000.0, 1_750_000.0), 500_000.0);
+        // A front end whose filter is narrower than the offset would only
+        // attenuate what we moved out there — DC blocker alone.
+        assert_eq!(lo_offset_for(2_000_000.0, 200_000.0), 0.0);
+        // Too narrow a stream to spend a quarter of on an offset.
+        assert_eq!(lo_offset_for(768_000.0, 768_000.0), 0.0);
+        // A driver that reports no filter bandwidth: go by the rate.
+        assert_eq!(lo_offset_for(8_000_000.0, 0.0), 2_000_000.0);
+    }
 }

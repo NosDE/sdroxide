@@ -138,14 +138,7 @@ pub fn ring() -> (Vec<Vertex>, Vec<u32>) {
 /// is not optional for lines: wgpu's line topology is always exactly 1 px wide,
 /// so screen-space quads are the only way to get the app's glowing strokes.
 pub fn quad() -> Vec<[f32; 2]> {
-    vec![
-        [-1.0, -1.0],
-        [1.0, -1.0],
-        [-1.0, 1.0],
-        [-1.0, 1.0],
-        [1.0, -1.0],
-        [1.0, 1.0],
-    ]
+    vec![[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
 }
 
 #[cfg(test)]

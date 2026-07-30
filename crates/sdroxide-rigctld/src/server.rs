@@ -15,9 +15,9 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use sdroxide_types::RigctldConfig;
 use tracing::{debug, info, warn};
 
+use crate::ServerRequest;
 use crate::proto::{self, Reply, Session};
 use crate::state::RigState;
-use crate::ServerRequest;
 
 /// How often the acceptor wakes to take a new connection or notice a stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -263,8 +263,7 @@ mod tests {
 
     #[test]
     fn answers_a_real_client() {
-        let state =
-            RigState { vfo_a_hz: 14_074_000.0, can_tx: true, ..RigState::default() };
+        let state = RigState { vfo_a_hz: 14_074_000.0, can_tx: true, ..RigState::default() };
         let ctrl = RigctldController::start(&loopback_cfg(), state).unwrap();
         let mut sock = TcpStream::connect(ctrl.addr()).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -279,10 +278,10 @@ mod tests {
         let n = sock.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"RPRT 0\n");
         let reqs = wait_for_cmd(&ctrl);
-        assert!(reqs.iter().any(|r| matches!(
-            r,
-            ServerRequest::Cmd(sdroxide_types::Command::SetVfo { .. })
-        )));
+        assert!(
+            reqs.iter()
+                .any(|r| matches!(r, ServerRequest::Cmd(sdroxide_types::Command::SetVfo { .. })))
+        );
     }
 
     /// The exchange every Hamlib client opens with. If `\dump_state` is wrong
