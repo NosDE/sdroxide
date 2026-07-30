@@ -18,7 +18,7 @@ pub use engine::{
     start as start_engine,
 };
 pub use error::RadioError;
-pub use source::{ControlUpdate, FileSource, IqSource, SigGenSource};
+pub use source::{DeviceSweep, ControlUpdate, FileSource, IqSource, SigGenSource};
 
 // Re-exported so frontends can name handle types without direct deps.
 pub use crossbeam_channel;

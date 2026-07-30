@@ -543,7 +543,9 @@ pub fn adif_band(freq_hz: f64) -> &'static str {
         m if m < 25.0 => "12m",
         m if m < 29.8 => "10m",
         m if m < 54.0 => "6m",
-        _ => "2m",
+        m if m < 148.0 => "2m",
+        m if m < 450.0 => "70cm",
+        _ => "23cm",
     }
 }
 

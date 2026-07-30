@@ -4104,7 +4104,9 @@ dependencies = [
  "sdroxide-cat",
  "sdroxide-config",
  "sdroxide-dsp",
+ "sdroxide-flex",
  "sdroxide-hpsdr",
+ "sdroxide-icom",
  "sdroxide-net",
  "sdroxide-proto",
  "sdroxide-radio",
@@ -4174,12 +4176,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdroxide-flex"
+version = "0.6.0"
+dependencies = [
+ "crossbeam-channel",
+ "rtrb",
+ "sdroxide-dsp",
+ "sdroxide-types",
+ "socket2",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "sdroxide-hpsdr"
 version = "0.6.0"
 dependencies = [
  "crossbeam-channel",
  "network-interface",
  "rtrb",
+ "sdroxide-types",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "sdroxide-icom"
+version = "0.6.0"
+dependencies = [
+ "crossbeam-channel",
+ "rtrb",
+ "sdroxide-cat",
  "sdroxide-types",
  "thiserror 2.0.19",
  "tracing",

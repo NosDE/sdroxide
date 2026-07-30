@@ -54,6 +54,8 @@ struct SettingsIo<'a> {
     audio_pick: &'a mut Option<(bool, Option<String>)>,
     hpsdr_discover: &'a mut bool,
     tci_test: &'a mut bool,
+    flex_discover: &'a mut bool,
+    flex_test: &'a mut bool,
     apply_iface: &'a mut bool,
     ui_edit: &'a mut sdroxide_types::UiSettings,
     digi_edit: &'a mut sdroxide_types::DigiConfig,
@@ -228,8 +230,12 @@ pub struct SdroxideApp {
     serial_ports: Vec<String>,
     /// HPSDR devices found by the last "Discover" scan in the settings dialog.
     hpsdr_devices: Vec<sdroxide_types::HpsdrDevice>,
+    /// FlexRadios found by the last discovery listen on the Radio tab.
+    flex_devices: Vec<sdroxide_types::FlexDevice>,
     /// Result of the last TCI "Test connection" (Ok summary / Err message).
     tci_test_result: Option<Result<String, String>>,
+    /// Result of the last FlexRadio "Test connection".
+    flex_test_result: Option<Result<String, String>>,
     seen_first_state: bool,
     show_memories: bool,
     show_settings: bool,
@@ -539,7 +545,9 @@ impl SdroxideApp {
             radio_cfg: None,
             serial_ports: Vec::new(),
             hpsdr_devices: Vec::new(),
+            flex_devices: Vec::new(),
             tci_test_result: None,
+            flex_test_result: None,
             seen_first_state: false,
             show_memories: false,
             show_settings: false,
@@ -1196,7 +1204,10 @@ impl SdroxideApp {
             return;
         }
         self.ensure_awards();
-        let bands = ["", "160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m"];
+        let bands = [
+            "", "160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m", "70cm",
+            "23cm",
+        ];
         let mut open = self.show_awards;
         let mut new_band: Option<String> = None;
         let awards = self.awards_cache.as_ref().map(|(_, _, a)| a.clone()).unwrap_or_default();
@@ -1491,6 +1502,29 @@ impl SdroxideApp {
                                 }
                             }
                         });
+                    // AGC-T, next to the speed it belongs with. Only on the
+                    // FlexRadio: its operators expect this control (SmartSDR has
+                    // it), whereas a CAT rig's own AGC threshold sits in the
+                    // radio and is not ours to move — showing the slider there
+                    // would promise something it doesn't do.
+                    if self.caps.as_ref().is_some_and(|c| c.driver == "flex")
+                        && agc != AgcMode::Off
+                    {
+                        let mut db = self.state.rx[0].agc_max_gain_db;
+                        ui.label("AGC-T").on_hover_text(
+                            "How far the AGC may lift weak signals. Turn it down until the \
+                             band noise stops being pumped up between signals.",
+                        );
+                        if crate::chrome::slider(
+                            ui,
+                            Slider::new(&mut db, 20.0..=120.0).step_by(1.0).suffix(" dB"),
+                        )
+                        .changed()
+                        {
+                            self.state.rx[0].agc_max_gain_db = db; // optimistic echo
+                            cmds.push(Command::SetAgcMaxGain { rx: RxId::Main, db });
+                        }
+                    }
                     let muted = self.state.rx[0].muted;
                     if crate::chrome::chip_accent(ui, muted, "MUTE", crate::theme::PINK, Color32::WHITE)
                         .clicked()
@@ -1575,7 +1609,11 @@ impl SdroxideApp {
         // The voice keyer's button only appears where the keyer can transmit —
         // every voice mode plus RADE, which takes a message as its microphone.
         let keyer_ok = self.state.rx[0].mode.allows_voice_keyer();
-        let width = if keyer_ok { 520.0 } else { 470.0 };
+        // The ATU button and its readout only exist on a radio that has a
+        // tuner to drive (the FlexRadio models fitted with one); the module
+        // grows to make room rather than squeezing the rest.
+        let atu_ok = self.caps.as_ref().is_some_and(|c| c.has_atu);
+        let width = if keyer_ok { 520.0 } else { 470.0 } + if atu_ok { 130.0 } else { 0.0 };
         crate::chrome::module(ui, "Transmit", width, |ui| {
             let tx = self.state.tx;
             if crate::chrome::chip_accent(
@@ -1599,6 +1637,45 @@ impl SdroxideApp {
             .clicked()
             {
                 cmds.push(Command::SetTune(!tx.tune));
+            }
+            if atu_ok {
+                use sdroxide_types::AtuState;
+                let atu = self.state.atu;
+                // Lit while a match is in circuit and while the cycle runs, so
+                // the button is also the "tuner is doing something" indicator.
+                let lit = atu.is_engaged() || atu == AtuState::Tuning;
+                let hover = match atu {
+                    AtuState::Success => "Tuner in circuit — click to bypass it",
+                    AtuState::Tuning => "Tuning — the radio is transmitting",
+                    AtuState::Failed => "The last tune failed — click to run it again",
+                    _ => "Tune the radio's antenna tuner (this transmits briefly)",
+                };
+                let clicked = crate::chrome::chip_accent(
+                    ui,
+                    lit,
+                    RichText::new(" ATU ").size(15.0),
+                    crate::theme::YELLOW,
+                    crate::theme::INK_ON_CYAN,
+                )
+                .on_hover_text(hover)
+                .clicked();
+                // A cycle takes a second or two and cannot be usefully
+                // interrupted, so clicks during it are ignored rather than
+                // starting a second tune.
+                if clicked && atu != AtuState::Tuning {
+                    cmds.push(if atu.is_engaged() {
+                        Command::BypassAtu
+                    } else {
+                        Command::StartAtu
+                    });
+                }
+                let colour = match atu {
+                    AtuState::Success => Color32::from_rgb(90, 200, 110),
+                    AtuState::Failed => Color32::from_rgb(230, 90, 80),
+                    AtuState::Tuning => crate::theme::YELLOW,
+                    _ => Color32::GRAY,
+                };
+                ui.label(RichText::new(atu.label()).color(colour).size(12.0));
             }
             if keyer_ok {
                 // Lit while a message is on the air, so the button doubles as
@@ -4461,6 +4538,8 @@ impl SdroxideApp {
         let mut audio_pick: Option<(bool, Option<String>)> = None;
         let mut hpsdr_discover = false;
         let mut tci_test = false;
+        let mut flex_discover = false;
+        let mut flex_test = false;
         let mut apply_iface = false;
         let mut radio_edit = self.radio_cfg.clone();
         let mut ui_edit = self.ui_settings;
@@ -4491,6 +4570,8 @@ impl SdroxideApp {
         iface_opts.push(sdroxide_types::Backend::Hpsdr);
         iface_opts.push(sdroxide_types::Backend::Cat);
         iface_opts.push(sdroxide_types::Backend::Tci);
+        iface_opts.push(sdroxide_types::Backend::Flex);
+        iface_opts.push(sdroxide_types::Backend::Icom);
 
         let mut tab = self.settings_tab;
         let mut open = self.show_settings;
@@ -4514,6 +4595,8 @@ impl SdroxideApp {
                         audio_pick: &mut audio_pick,
                         hpsdr_discover: &mut hpsdr_discover,
                         tci_test: &mut tci_test,
+                        flex_discover: &mut flex_discover,
+                        flex_test: &mut flex_test,
                         apply_iface: &mut apply_iface,
                         ui_edit: &mut ui_edit,
                         digi_edit: &mut digi_edit,
@@ -4593,6 +4676,21 @@ impl SdroxideApp {
             // Blocking LAN scan (~1.5 s); done after the window closure so it can
             // take `&self.ctrl`. Results feed the device dropdown next frame.
             self.hpsdr_devices = self.ctrl.discover_hpsdr();
+        }
+        if flex_discover {
+            // Passive listen for radio announcements (~2.5 s); after the
+            // closure so it can take `&self.ctrl`.
+            self.flex_devices = self.ctrl.discover_flex();
+        }
+        if flex_test {
+            if let Some(cfg) = &radio_edit {
+                let ip = cfg.flex.target_ip().unwrap_or_default().to_string();
+                self.flex_test_result = Some(if ip.trim().is_empty() {
+                    Err("no radio selected — press Discover or enter an IP".into())
+                } else {
+                    self.ctrl.test_flex(&ip)
+                });
+            }
         }
         if tci_test {
             // Blocking connect (~up to 3 s); after the closure so it can take
@@ -4779,6 +4877,15 @@ impl SdroxideApp {
                     Backend::Tci => {
                         settings_tci_tab(ui, io.radio_edit, io.tci_test, &self.tci_test_result)
                     }
+                    Backend::Icom => settings_icom_tab(ui, io.radio_edit),
+                    Backend::Flex => settings_flex_tab(
+                        ui,
+                        &self.flex_devices,
+                        io.radio_edit,
+                        io.flex_discover,
+                        io.flex_test,
+                        &self.flex_test_result,
+                    ),
                     // Legacy configs may still carry the removed auto-detect
                     // backend; prompt the user to pick a concrete interface.
                     Backend::Auto => {
@@ -5443,6 +5550,230 @@ fn settings_tci_tab(
     ui.label(
         RichText::new(
             "Wideband IQ receive, audio transmit. Press \"Apply / reconnect\" to switch without a restart.",
+        )
+        .weak(),
+    );
+}
+
+/// FlexRadio interface: radio discovery / manual IP, DAX IQ channel and rate,
+/// antenna, and a Test-connection button (the interface itself is chosen by the
+/// selector in `settings_body`).
+fn settings_flex_tab(
+    ui: &mut egui::Ui,
+    devices: &[sdroxide_types::FlexDevice],
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    discover: &mut bool,
+    test: &mut bool,
+    test_result: &Option<Result<String, String>>,
+) {
+    use sdroxide_types::FlexConfig;
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Radio configuration is only available in the native app.");
+        return;
+    };
+    egui::Grid::new("flex-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Radios");
+        ui.horizontal(|ui| {
+            if ui
+                .button("Discover")
+                .on_hover_text("Listen for radios announcing themselves (about 2 s)")
+                .clicked()
+            {
+                *discover = true;
+            }
+            let shown = cfg.flex.selected_ip.clone().unwrap_or_else(|| "— none —".into());
+            ComboBox::from_id_salt("flex_dev").width(320.0).selected_text(shown).show_ui(ui, |ui| {
+                if devices.is_empty() {
+                    ui.label(RichText::new("no radios — press Discover").weak());
+                }
+                for d in devices {
+                    let sel = cfg.flex.selected_ip.as_deref() == Some(d.ip.as_str());
+                    if ui.selectable_label(sel, d.label()).clicked() {
+                        cfg.flex.selected_ip = Some(d.ip.clone());
+                    }
+                }
+            });
+        });
+        ui.end_row();
+
+        ui.label("Manual IP");
+        let mut ip = cfg.flex.manual_ip.clone().unwrap_or_default();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut ip)
+                .desired_width(160.0)
+                .hint_text("optional, e.g. 192.168.1.60"),
+        );
+        if resp.changed() {
+            let t = ip.trim();
+            cfg.flex.manual_ip = if t.is_empty() { None } else { Some(t.to_string()) };
+        }
+        ui.end_row();
+
+        ui.label("DAX IQ rate");
+        let shown = format!("{} kHz", (cfg.flex.iq_sample_rate_hz / 1000.0) as u32);
+        ComboBox::from_id_salt("flex_rate").selected_text(shown).show_ui(ui, |ui| {
+            for &r in &FlexConfig::IQ_RATES {
+                let sel = (cfg.flex.iq_sample_rate_hz - r).abs() < 1.0;
+                if ui.selectable_label(sel, format!("{} kHz", (r / 1000.0) as u32)).clicked() {
+                    cfg.flex.iq_sample_rate_hz = r;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("DAX IQ channel");
+        ComboBox::from_id_salt("flex_ch")
+            .selected_text(cfg.flex.daxiq_channel.to_string())
+            .show_ui(ui, |ui| {
+                for ch in FlexConfig::CHANNELS {
+                    if ui.selectable_label(cfg.flex.daxiq_channel == ch, ch.to_string()).clicked() {
+                        cfg.flex.daxiq_channel = ch;
+                    }
+                }
+            });
+        ui.end_row();
+
+        ui.label("Antenna");
+        ui.add(
+            egui::TextEdit::singleline(&mut cfg.flex.antenna)
+                .desired_width(120.0)
+                .hint_text("optional, e.g. ANT1"),
+        );
+        ui.end_row();
+
+        ui.label("Station name");
+        ui.add(
+            egui::TextEdit::singleline(&mut cfg.flex.station)
+                .desired_width(160.0)
+                .hint_text("shown in the radio's client list"),
+        );
+        ui.end_row();
+
+        ui.label("");
+        if ui.button("Test connection").clicked() {
+            *test = true;
+        }
+        ui.end_row();
+    });
+    match test_result {
+        Some(Ok(s)) => {
+            ui.label(RichText::new(format!("Connected: {s}")).color(Color32::from_rgb(90, 200, 110)));
+        }
+        Some(Err(e)) => {
+            ui.label(RichText::new(format!("Failed: {e}")).color(Color32::from_rgb(230, 90, 80)));
+        }
+        None => {}
+    }
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Wideband DAX IQ receive, DAX audio transmit. sdroxide connects as a GUI client and \
+             creates its own panadapter and slice. A manual IP overrides discovery; press \
+             \"Apply / reconnect\" to switch without a restart.",
+        )
+        .weak(),
+    );
+}
+
+/// Icom network interface: the radio's address and the network-control login,
+/// plus which model it is (that decides the CI-V address).
+fn settings_icom_tab(ui: &mut egui::Ui, radio_edit: &mut Option<sdroxide_types::RadioConfig>) {
+    use sdroxide_types::IcomConfig;
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Radio configuration is only available in the native app.");
+        return;
+    };
+    egui::Grid::new("icom-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Radio IP");
+        ui.add(
+            egui::TextEdit::singleline(&mut cfg.icom.ip)
+                .desired_width(160.0)
+                .hint_text("e.g. 192.168.1.40"),
+        );
+        ui.end_row();
+
+        ui.label("Model");
+        let shown = cfg.icom.model.clone();
+        ComboBox::from_id_salt("icom_model").selected_text(shown).show_ui(ui, |ui| {
+            for (name, addr) in IcomConfig::MODELS {
+                if ui.selectable_label(cfg.icom.model == name, name).clicked() {
+                    cfg.icom.model = name.to_string();
+                    // The CI-V address goes with the model; an operator who has
+                    // changed it on the radio can still override it below.
+                    cfg.icom.civ_address = addr;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("CI-V address");
+        let mut hex = format!("{:02X}", cfg.icom.civ_address);
+        if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(48.0)).changed()
+            && let Ok(v) = u8::from_str_radix(hex.trim().trim_start_matches("0x"), 16)
+        {
+            cfg.icom.civ_address = v;
+        }
+        ui.end_row();
+
+        ui.label("Username");
+        ui.add(
+            egui::TextEdit::singleline(&mut cfg.icom.username)
+                .desired_width(160.0)
+                .hint_text("as set on the radio"),
+        );
+        ui.end_row();
+
+        ui.label("Password");
+        ui.add(
+            egui::TextEdit::singleline(&mut cfg.icom.password).desired_width(160.0).password(true),
+        );
+        ui.end_row();
+
+        ui.label("Scope span");
+        let shown = format!("\u{b1}{} kHz", (cfg.icom.scope_span_hz / 1000.0) as u32);
+        ComboBox::from_id_salt("icom_span").selected_text(shown).show_ui(ui, |ui| {
+            for hz in [2_500.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0, 500_000.0] {
+                let sel = (cfg.icom.scope_span_hz - hz).abs() < 1.0;
+                let label = if hz < 1000.0 {
+                    format!("\u{b1}{hz} Hz")
+                } else {
+                    format!("\u{b1}{} kHz", (hz / 1000.0) as u32)
+                };
+                if ui.selectable_label(sel, label).clicked() {
+                    cfg.icom.scope_span_hz = hz;
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label("Audio-band width");
+        let mut khz = cfg.icom.audio_bw_hz / 1000.0;
+        if crate::chrome::slider(ui, Slider::new(&mut khz, 3.0..=12.0).suffix(" kHz")).changed() {
+            cfg.icom.audio_bw_hz = khz * 1000.0;
+        }
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Control, audio and the radio's own spectrum scope all travel over the network — \
+             no cable, no sound card and no wfview in between. Enable network control on the \
+             radio (Set → Network) and set the same username and password there; only one \
+             network client can be connected at a time. The waterfall is the radio's own scope, \
+             so the SPAN button on the radio moves it too; the audio-band width below is what \
+             the panadapter falls back to while no sweep is arriving. Press \"Apply / \
+             reconnect\" to switch without a restart.",
+        )
+        .weak(),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "To transmit with the computer's microphone instead of the one plugged into the \
+             radio, the radio has to be told to take its modulation from the network: \
+             MENU → SET → Connectors → MOD Input → DATA OFF MOD = WLAN (or LAN) for voice, \
+             and DATA MOD = WLAN for the digital modes. Without it the radio keys but \
+             modulates from its own microphone jack, and nothing this end can change that.",
         )
         .weak(),
     );
@@ -6443,9 +6774,23 @@ impl eframe::App for SdroxideApp {
                 RadioEvent::State(s) => {
                     let prev_vfo = self.state.active_freq_hz();
                     let prev_mode = self.state.rx[0].mode;
+                    let prev_span = self.state.sample_rate;
                     self.state = s;
                     if self.state.rx[0].mode != prev_mode {
                         self.clear_digi_rx();
+                    }
+                    // Follow the device when it changes how much it can show —
+                    // an Icom's scope span switched on the radio, a new
+                    // interface, a different sample rate. Keeping the old zoom
+                    // would leave a ±250 kHz scope drawn a few kHz wide, and
+                    // nothing else refits the view: that is the F key's job,
+                    // and the operator should not have to press it because the
+                    // radio changed underneath them.
+                    if (self.state.sample_rate - prev_span).abs() > 1.0
+                        && self.state.sample_rate > 0.0
+                        && !self.view.is_unset()
+                    {
+                        self.view.fit(self.state.center_hz, self.state.sample_rate);
                     }
                     self.recenter_if_tuned_away(prev_vfo);
                 }

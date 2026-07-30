@@ -5,7 +5,10 @@
 //! opaque [`CatHandle`] (a background serial thread), so no serial types leak
 //! into the engine or UI.
 
-mod civ;
+// The CI-V frames are identical over a serial cable and over Icom's network
+// protocol, so the framing is shared with `sdroxide-icom` rather than written
+// twice.
+pub mod civ;
 mod yaesu;
 
 use std::io::Write;
@@ -25,6 +28,10 @@ pub enum CatUpdate {
     Mode(Mode),
     /// TX SWR reading (routed to the telemetry channel, not the control channel).
     Swr(f32),
+    /// The rig's own S-meter reading, in dBm. Only such a reading can drive an
+    /// S-meter here: the rig sends audio its AGC has already levelled, so
+    /// measuring what arrives would show the AGC's work, not the signal.
+    Signal(f32),
 }
 
 /// Enumerate serial ports for the settings UI. USB-style ports (ttyACM/ttyUSB,
@@ -56,6 +63,12 @@ trait Protocol: Send {
     fn ptt(&self, on: bool) -> Vec<u8>;
     /// Frames that request the rig's current freq + mode.
     fn poll_requests(&self) -> Vec<Vec<u8>>;
+    /// Frame setting the rig's own squelch, `level` on a 0..255 scale. `None`
+    /// where the dialect has no such command — a rig that cannot be told is
+    /// left alone rather than sent something it might misread.
+    fn squelch(&self, _level: u8) -> Option<Vec<u8>> {
+        None
+    }
     /// Frames requesting TX telemetry (SWR / power), polled only while keyed.
     /// Empty for families with no such read.
     fn tx_telemetry_requests(&self) -> Vec<Vec<u8>> {
@@ -79,8 +92,15 @@ impl Protocol for Civ {
     fn ptt(&self, on: bool) -> Vec<u8> {
         civ::ptt_frame(self.radio, on)
     }
+    fn squelch(&self, level: u8) -> Option<Vec<u8>> {
+        Some(civ::set_squelch_frame(self.radio, level))
+    }
     fn poll_requests(&self) -> Vec<Vec<u8>> {
-        vec![civ::read_freq_frame(self.radio), civ::read_mode_frame(self.radio)]
+        vec![
+            civ::read_freq_frame(self.radio),
+            civ::read_mode_frame(self.radio),
+            civ::read_smeter_frame(self.radio),
+        ]
     }
     fn tx_telemetry_requests(&self) -> Vec<Vec<u8>> {
         vec![civ::read_swr_frame(self.radio)]
@@ -105,10 +125,13 @@ impl Protocol for Civ {
                         }
                     }
                 }
-                // Meter read (0x15): we only request the SWR sub-meter (0x12).
+                // Meter read (0x15): which meter answered is in the sub-command
+                // byte, so both parsers are offered it and the wrong one declines.
                 0x15 => {
                     if let Some(swr) = civ::parse_swr_reply(&reply.data) {
                         out.push(CatUpdate::Swr(swr));
+                    } else if let Some(dbm) = civ::parse_smeter_reply(&reply.data) {
+                        out.push(CatUpdate::Signal(dbm));
                     }
                 }
                 _ => {}
@@ -129,6 +152,8 @@ enum CatCmd {
     Freq(f64),
     Mode(Mode),
     Ptt(bool),
+    /// The rig's own squelch, on its 0..255 scale.
+    Squelch(u8),
     Stop,
 }
 
@@ -148,6 +173,11 @@ impl CatHandle {
     }
     pub fn set_ptt(&self, on: bool) {
         let _ = self.cmd_tx.send(CatCmd::Ptt(on));
+    }
+    /// Set the rig's own squelch. Silently ignored by a dialect that has no
+    /// such command.
+    pub fn set_squelch(&self, level: u8) {
+        let _ = self.cmd_tx.send(CatCmd::Squelch(level));
     }
     /// Non-blocking drain of rig-reported freq/mode changes.
     pub fn poll(&self) -> Vec<CatUpdate> {
@@ -190,7 +220,10 @@ pub fn query_once(cfg: &CatConfig) -> Option<(Option<f64>, Option<Mode>)> {
                     match u {
                         CatUpdate::Freq(hz) => freq = Some(hz),
                         CatUpdate::Mode(m) => mode = Some(m),
-                        CatUpdate::Swr(_) => {} // not requested during startup query
+                        // Neither is asked for by the startup query, but the
+                        // rig may answer a meter poll left over from a previous
+                        // session on the same port.
+                        CatUpdate::Swr(_) | CatUpdate::Signal(_) => {}
                     }
                 }
             }
@@ -340,6 +373,13 @@ fn serial_thread(
                             }
                         }
                     }
+                    Ok(CatCmd::Squelch(level)) => {
+                        if let Some(f) = protocol.squelch(level)
+                            && port.write_all(&f).is_err()
+                        {
+                            break 'io true;
+                        }
+                    }
                     Ok(CatCmd::Ptt(on)) => {
                         let failed = match cfg.ptt {
                             PttMethod::Vox => false,
@@ -427,6 +467,10 @@ fn serial_thread(
                                 c
                             }
                             CatUpdate::Swr(_) => false, // handled above
+                        // A meter reading is never "unchanged news": it is the
+                        // live level, and holding one back would freeze the
+                        // needle at the last different value.
+                        CatUpdate::Signal(_) => true,
                         };
                         if changed {
                             let _ = event_tx.send(u);

@@ -1,7 +1,9 @@
 mod audio_cat_source;
 mod console;
+mod flex_source;
 mod gui_main;
 mod hpsdr_source;
+mod icom_source;
 mod local_controller;
 mod null_source;
 mod server_main;
@@ -584,6 +586,8 @@ fn open_configured_source(
         Backend::Cat => open_cat_source(radio),
         Backend::Hpsdr => open_hpsdr_source(radio, cli.freq),
         Backend::Tci => open_tci_source(radio, cli.freq),
+        Backend::Flex => open_flex_source(radio, cli.freq),
+        Backend::Icom => open_icom_source(radio, cli.freq),
         Backend::Soapy => open_soapy_source(cli, settings),
         Backend::Auto => {
             #[cfg(feature = "soapy")]
@@ -713,6 +717,117 @@ fn tci_caps(address: &str, iq_rate: f64) -> DeviceCaps {
         // (verified against ExpertSDR3 — no command spelling drives it, and
         // toggling it in the GUI emits nothing on the wire). TCI gain control
         // is deferred until a controllable path is found.
+        ..DeviceCaps::default()
+    }
+}
+
+/// Build the FlexRadio (SmartSDR) source from radio.json: wideband DAX IQ
+/// receive + DAX audio transmit. The target IP is the manual override, else the
+/// persisted selection, else the first radio a discovery listen turns up.
+fn open_flex_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    let ip: std::net::Ipv4Addr = if let Some(s) = radio.flex.target_ip() {
+        s.trim().parse().with_context(|| format!("invalid FlexRadio IP address {s:?}"))?
+    } else {
+        let found = sdroxide_flex::discover_default();
+        let dev = found.first().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no FlexRadio found on the network — enter a radio IP in Settings → Radio"
+            )
+        })?;
+        dev.ip.parse().with_context(|| format!("discovered FlexRadio IP {:?}", dev.ip))?
+    };
+
+    let src = flex_source::FlexSource::open(ip, &radio.flex, center_hz)
+        .context("connecting to the FlexRadio")?;
+    // Remember the identity the radio gave us. It keeps a GUI client's slices
+    // and panadapters per client id, so coming back under the same one is what
+    // hands our objects back instead of stranding them — a fresh id every start
+    // eats one of the radio's few slices each time.
+    let id = src.client_id();
+    if !id.is_empty() && radio.flex.client_id.as_deref() != Some(id) {
+        let mut cfg = radio.clone();
+        cfg.flex.client_id = Some(id.to_string());
+        if let Err(e) = sdroxide_config::save_radio_config(&cfg) {
+            tracing::warn!("saving the FlexRadio client id: {e}");
+        }
+    }
+    let caps = flex_caps(
+        src.model(),
+        &ip.to_string(),
+        src.sample_rate_hz(),
+        src.rf_gain_range(),
+        src.has_atu(),
+    );
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for a FlexRadio: wideband IQ RX (not `audio_mode`), TX via DAX
+/// audio (`tx_audio`) which the radio modulates. RX coverage is the 6000/8000
+/// series' 30 kHz–165 MHz; the radio enforces its own transmit limits.
+fn flex_caps(
+    model: &str,
+    ip: &str,
+    iq_rate: f64,
+    rf_gain: Option<(f64, f64, f64)>,
+    has_atu: bool,
+) -> DeviceCaps {
+    // RX gain is the panadapter's `rfgain` — the preamp/attenuator ahead of the
+    // converter, and the only gain of the radio's that changes the DAX IQ we
+    // receive (its AGC sits in the slice, downstream of our tap). The steps are
+    // whatever the radio named; a radio that named none simply has no slider.
+    let gains = rf_gain
+        .map(|(min_db, max_db, step_db)| {
+            vec![sdroxide_types::GainElement {
+                name: flex_source::RF_GAIN.into(),
+                direction: sdroxide_types::Direction::Rx,
+                min_db,
+                max_db,
+                step_db,
+            }]
+        })
+        .unwrap_or_default();
+    DeviceCaps {
+        driver: "flex".into(),
+        label: format!("{model} @ {ip} ({:.0} kHz DAX IQ)", iq_rate / 1000.0),
+        rx_channels: 1,
+        tx_channels: 1,
+        audio_mode: false,
+        tx_audio: true,
+        freq_ranges_rx: vec![(30_000.0, 165_000_000.0)],
+        freq_ranges_tx: vec![(1_800_000.0, 54_000_000.0)],
+        sample_rates: sdroxide_types::FlexConfig::IQ_RATES.to_vec(),
+        gains,
+        has_atu,
+        ..DeviceCaps::default()
+    }
+}
+
+/// Build the Icom network source: CI-V and audio over UDP, no cable in between.
+fn open_icom_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    let src = icom_source::IcomSource::open(&radio.icom, center_hz)
+        .context("connecting to the Icom")?;
+    let caps = icom_caps(src.model(), &radio.icom.ip);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for an Icom on the network: demodulated audio (`audio_mode`),
+/// so the panadapter shows the audio band rather than a wideband spectrum, and
+/// transmit by streaming audio the radio modulates.
+fn icom_caps(model: &str, ip: &str) -> DeviceCaps {
+    DeviceCaps {
+        driver: "icom".into(),
+        label: format!("{model} @ {ip} (network)"),
+        rx_channels: 1,
+        tx_channels: 1,
+        audio_mode: true,
+        freq_ranges_rx: vec![(30_000.0, 470_000_000.0)],
+        freq_ranges_tx: vec![(1_800_000.0, 450_000_000.0)],
         ..DeviceCaps::default()
     }
 }

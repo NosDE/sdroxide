@@ -818,6 +818,10 @@ radio. Everything below the selector changes to match the choice:
   [5.2.2](#522-cat-radios-serial-control--usb-audio).
 - **TCI (network)** — a TCI server such as ExpertSDR3 or Thetis. See
   [5.2.4](#524-tci-network-expertsdr3-and-thetis).
+- **FlexRadio (network)** — a FLEX-6000 or FLEX-8000 over the SmartSDR API. See
+  [5.2.5](#525-flexradio-network-flex-6000-and-flex-8000).
+- **Icom (network)** — an IC-705, IC-7610 or IC-9700 over LAN or WLAN. See
+  [5.2.6](#526-icom-network-ic-705-ic-7610-ic-9700).
 
 There is no auto-detect: you pick the interface, and an interface that cannot be
 opened falls back to a silent source rather than guessing at another one.
@@ -953,6 +957,134 @@ the TCI server, which modulates it.
 > This is sdroxide acting as a TCI *client*. For the other direction — sdroxide
 > acting as the rig so WSJT-X and friends can drive it — see
 > [§ 5.8.2 Built-in TCI server](#582-built-in-tci-server).
+
+#### 5.2.5 FlexRadio (network): FLEX-6000 and FLEX-8000
+
+With the **FlexRadio (network)** interface, sdroxide drives a FLEX-6000- or
+FLEX-8000-series radio directly over the SmartSDR API: a wideband **DAX IQ**
+stream comes in, **DAX audio** goes out for transmit, and frequency, mode, PTT
+and power ride the radio's command connection. No SmartSDR, DAX or SmartCAT
+installation is involved — sdroxide speaks the protocol itself, which is also
+why it works the same on Linux and macOS as on Windows.
+
+- **Radios** — press **Discover** and sdroxide listens for radios announcing
+  themselves on the LAN (about two seconds; they broadcast once a second). Pick
+  one from the list. A radio marked *[in use]* already has a GUI client — you can
+  still connect, but the two of you share the transmitter.
+- **Manual IP** — the radio's address, which overrides the discovered pick. Use
+  this when the radio is on another subnet, or when broadcasts don't reach you.
+- **DAX IQ rate** — the receive stream rate: 24, 48, 96 or 192 kHz. 192 kHz gives
+  the widest panadapter and the most for the skimmers to find.
+- **DAX IQ channel** — which of the radio's four DAX IQ channels to claim.
+  Change it if another program on your network already uses channel 1.
+- **Antenna** — the antenna port for the slice sdroxide creates (`ANT1`, `ANT2`,
+  `RX_A`, …). Leave it empty to accept the radio's own default.
+- **Station name** — how sdroxide identifies itself in the radio's client list.
+- **Test connection** — connect to the radio's API port and report the model and
+  SmartSDR version, without leaving the dialog.
+
+sdroxide connects as a **GUI client**, so it works with no SmartSDR running: on
+connect it creates its own panadapter, a slice (the radio's VFO — the DAX IQ
+stream follows the panadapter, and the slice follows your dial), a DAX IQ stream
+and a DAX TX audio stream, and it removes all of them again when you switch
+interfaces or quit.
+
+A radio only has so many panadapters and slices, and SmartSDR holds some while
+it runs. When none is free, sdroxide **shares** what is already there instead of
+refusing to connect — it re-centres the panadapter it borrows (the IQ stream
+follows the centre) and claims the slice for transmit, but leaves that
+panadapter's bandwidth and frame rate alone, and never removes an object it did
+not create. Sharing is visible in two ways: tuning sdroxide moves the shared
+slice, so SmartSDR's dial moves with it, and the log says which object is being
+shared. If a shared object disappears — most often your own previous connection
+being released a moment after **Apply / reconnect** — sdroxide takes the freed
+slot and creates its own. Transmit sets DAX as the radio's audio source and keys with
+the API's `xmit` command; forward power and SWR come back on the radio's meter
+stream and drive the TX meters.
+
+> Receive is wideband IQ, so the full panadapter, the waterfall and the CW/PSK/
+> RTTY skimmers all work. Transmit sends audio the radio modulates, so the
+> **power level is the radio's** — sdroxide's drive control sets `rfpower` rather
+> than scaling the audio.
+
+Three controls appear only with this interface, because only here do they mean
+anything:
+
+- **AGC-T**, the slider next to the AGC speed menu. SmartSDR has the same
+  control, and Flex operators reach for it constantly: it limits how far the
+  automatic gain control may lift weak signals. Turn it down until the band noise
+  stops being pumped up between signals. It acts on *sdroxide's* AGC — the
+  radio's own tuner-side AGC sits in the slice, downstream of where the DAX IQ is
+  tapped, so it never touches what sdroxide receives. A CAT radio hides the
+  slider, since there the radio's AGC is the one in circuit and not ours to move.
+- **RF gain**, on the **Device** tab. This is the panadapter's `rfgain` — the
+  preamp/attenuator ahead of the converter, and the only gain of the radio's that
+  does change our samples. The steps offered are the ones the radio reports for
+  itself. Reach for this against overload from strong neighbouring signals, and
+  for AGC-T against noise being pumped.
+- **ATU**, next to PTT and TUNE, on radios fitted with a tuner (e.g. the
+  FLEX-8400 ATU). Pressing it runs a tune cycle — the radio transmits briefly by
+  itself — and the readout beside it shows the outcome: **Success** with the
+  button lit when a match is in circuit, **Bypass** when the tuner concluded the
+  antenna is better off without it, **Failed** when it gave up (press again to
+  retry). Pressing a lit button switches to bypass. A tune passes the same safety
+  rails as keying up: transmit-capable radio, inside its TX range, and inside the
+  amateur bands while `tx_ham_only` is set.
+
+#### 5.2.6 Icom (network): IC-705, IC-7610, IC-9700
+
+With the **Icom (network)** interface, sdroxide speaks the protocol Icom's own
+RS-BA1 software uses, directly: CI-V control and audio in both directions over
+UDP. Nothing sits in between — no serial cable, no USB sound card, no wfview and
+no virtual COM port.
+
+- **Radio IP** — the address the radio shows under its network settings.
+- **Model** — picking one sets the matching CI-V address; the field below stays
+  editable for a radio whose address has been changed.
+- **Username / Password** — the network-control login configured *on the radio*.
+  Icom's protocol only obfuscates the password on the wire, so treat it as
+  readable by anyone on the network.
+- **Display bandwidth** — how wide the audio-band panadapter is drawn.
+
+Set the radio up first: **Set → Network**, turn network control on, give it a
+username and password, and note the address. Only **one** network client can be
+connected at a time — sdroxide and wfview cannot both have it.
+
+- **Scope span** — how wide the waterfall is, from ±2.5 kHz to ±500 kHz.
+
+The waterfall is the **radio's own spectrum scope**, not something sdroxide
+computes: an Icom sends no IQ, so this is the only wideband view there is. Every
+sweep carries its own centre and span, which means the **SPAN** button on the
+radio moves the display too — the setting above is just what sdroxide asks for
+when it connects. The frequency scale, the bandplan strip and click-to-tune all
+follow the scope.
+
+> The *audio* is still the demodulated receiver output, so the audio-band width
+> below the span is what the panadapter falls back to while no sweep arrives,
+> and the wideband CW/PSK/RTTY skimmers stay dark — they need IQ, which the
+> protocol does not carry. What you gain over the CAT/Audio interface is that
+> everything travels over the network, so the radio can be anywhere in the
+> house.
+
+**Transmitting with the computer's microphone.** sdroxide streams the
+microphone you picked under **Audio** to the radio over the same connection, but
+the radio decides what to modulate — and out of the box that is the microphone
+plugged into its own jack. Tell it to take the network instead:
+
+**MENU → SET → Connectors → MOD Input → DATA OFF MOD = WLAN** (or **LAN** on a
+wired radio) for voice, and **DATA MOD = WLAN** for the digital modes. Both, if
+you want SSB and FT8 from the same setup. Without it the radio keys and
+transmits — just with whatever its own microphone hears, which from another room
+is silence.
+
+**S-meter and squelch.** Both are the radio's own. sdroxide cannot measure the
+receive level itself here: what arrives is demodulated audio that the radio's
+AGC has already levelled, so the meter reads the value the radio's own S-meter
+is built on, asked for four times a second. The squelch works the same way round
+— moving the **SQL** control sets the *radio's* squelch, where the decision is
+instant and what it holds back never goes on the air-side of the link at all.
+That also means it overwrites the squelch set on the radio itself, but only once
+you touch the control: connecting leaves whatever you set there alone.
 
 ### 5.3 UI: display preferences
 

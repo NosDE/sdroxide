@@ -233,7 +233,7 @@ other ham software). See the [User Manual](docs/USER_MANUAL.md) for setup steps.
 
 ## Radio backends
 
-sdroxide can drive four kinds of radio, selected on the **Radio** tab of the
+sdroxide can drive six kinds of radio, selected on the **Radio** tab of the
 Settings window. Backend, serial, and radio-audio changes apply live when you
 press **Apply / reconnect**. A radio that isn't there yet at startup — or that
 drops mid-session — is retried in the background and attaches by itself, so
@@ -251,10 +251,25 @@ starting sdroxide before the rig is fine:
 - **TCI** — a TCI (Transceiver Control Interface) server such as ExpertSDR3 
   over WebSocket (default `127.0.0.1:50001`): wideband IQ receive plus 
   audio transmit.
+- **FlexRadio** — a FLEX-6000 or FLEX-8000 over the SmartSDR API, with no
+  SmartSDR, DAX or SmartCAT installed: press **Discover** to find radios on the
+  LAN, pick a DAX IQ rate (24–192 kHz) and channel. sdroxide connects as a GUI
+  client and creates its own panadapter, slice and streams — wideband DAX IQ
+  receive, DAX audio transmit, forward power and SWR from the radio's meters,
+  the panadapter's RF gain, an **AGC-T** slider next to the AGC menu, and an
+  **ATU** button with its Success/Bypass readout on radios fitted with a tuner.
 
-The wideband-IQ backends (SoapySDR, HPSDR, TCI) drive the full panadapter, the
-CW/PSK/RTTY skimmers, and internal demodulation; a CAT rig feeding demodulated
-audio shows only a narrow audio-band slice.
+- **Icom (network)** — an IC-705, IC-7610 or IC-9700 over LAN or WLAN, speaking
+  the protocol Icom's own RS-BA1 uses: CI-V control and receive/transmit audio
+  over UDP. No cable, no sound card and no wfview or virtual COM port in
+  between. Enable network control on the radio and give sdroxide the same
+  username and password. The waterfall is the radio's own spectrum scope
+  (±2.5 kHz to ±500 kHz, and the radio's SPAN button moves it); audio is the
+  demodulated receiver output, since the protocol carries no IQ.
+
+The wideband-IQ backends (SoapySDR, HPSDR, TCI, FlexRadio) drive the full
+panadapter, the CW/PSK/RTTY skimmers, and internal demodulation; a CAT rig
+feeding demodulated audio shows only a narrow audio-band slice.
 
 ## Built-in TCI server
 

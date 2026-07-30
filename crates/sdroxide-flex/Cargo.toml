@@ -1,0 +1,20 @@
+[package]
+name = "sdroxide-flex"
+version.workspace = true
+edition.workspace = true
+
+# Native-only FlexRadio SmartSDR client (FLEX-6000 / FLEX-8000): the
+# line-oriented TCP command API on port 4992 plus VITA-49 streaming on UDP.
+# Pure Rust, no system library, no vendor SDK. Must never be a dependency of any
+# wasm-targeted crate.
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Discovery shares UDP 4992 with any SmartSDR/DAX running on the same machine,
+# which needs SO_REUSEADDR/SO_REUSEPORT — not reachable through std's UdpSocket.
+# ("all" carries `set_reuse_port`, which is not in the default API surface.)
+socket2 = { version = "0.6", features = ["all"] }

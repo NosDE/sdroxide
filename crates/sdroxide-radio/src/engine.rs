@@ -635,6 +635,12 @@ struct Engine {
     /// audio, so the DDC/demod/skimmer path is bypassed for a narrow
     /// audio-band panadapter mapped to RF.
     audio_mode: bool,
+    /// Newest spectrum a radio drew for itself (an Icom's scope). While this
+    /// is set it drives the panadapter instead of our own FFT — such a radio
+    /// sends no IQ, so there is nothing wideband to transform.
+    device_sweep: Option<crate::source::DeviceSweep>,
+    /// Counts every display frame this engine emits, whichever path built it.
+    spectrum_seq: u32,
     /// Sound-card sample rate feeding `analyzer` in audio mode.
     radio_fs: f64,
     /// Displayed RF window width in audio mode (Hz).
@@ -747,6 +753,8 @@ fn engine_thread(
         state,
         cfg,
         analyzer,
+        device_sweep: None,
+        spectrum_seq: 0,
         event_tx,
         main,
         sub: None,
@@ -890,6 +898,12 @@ fn engine_thread(
             }
         }
 
+        // A radio that draws its own spectrum (an Icom) hands over finished
+        // sweeps; they replace the panadapter's FFT while they keep coming.
+        if let Some(sweep) = engine.source.device_spectrum() {
+            engine.adopt_device_sweep(sweep);
+        }
+
         // Out-of-band control changes from a CAT rig (dial/mode moved on the
         // radio itself). No-op for SoapySDR/siggen/file.
         let updates = engine.source.poll_control();
@@ -963,7 +977,13 @@ fn engine_thread(
                     tx: Some(TxMeters { fwd_w: tele.fwd_w, swr: tele.swr, alc }),
                 })
             } else {
-                engine.main.as_ref().and_then(|c| c.power_dbfs()).map(|p| Meters {
+                // A rig with its own S-meter is the authority on the receive
+                // level: it measures ahead of its AGC, where we only ever see
+                // what came out the other side. Everything else we measure
+                // ourselves, off the IQ in the RX passband.
+                let rig = engine.source.rx_signal_dbm();
+                let own = engine.main.as_ref().and_then(|c| c.power_dbfs());
+                rig.or(own).map(|p| Meters {
                     s_dbm: p + engine.cal_offset_db,
                     adc_peak_dbfs: 0.0,
                     tx: None,
@@ -1285,6 +1305,15 @@ impl Engine {
                 self.update_display_center();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
             }
+            // The tuner's own progress and verdict. The radio is the authority
+            // here, including when the operator ran the tune at the radio or
+            // from another client.
+            ControlUpdate::Atu(atu) => {
+                if self.state.atu != atu {
+                    self.state.atu = atu;
+                    let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+                }
+            }
             // Power levels the rig reports (the operator moved them on the rig,
             // or these are the levels it came up with). Adopted, not overridden:
             // the rig's own setting is what the operator asked for.
@@ -1343,7 +1372,30 @@ impl Engine {
     /// In audio mode, keep `state.center_hz`/`sample_rate` describing the
     /// displayed RF window (dial ± bw/2, width = bw) so the panadapter axis and
     /// zoom clamp match the audio-band spectrum.
+    /// Take a spectrum the radio drew, and move the display onto it.
+    ///
+    /// The sweep says where it is and how wide, so the whole UI — frequency
+    /// scale, bandplan, click-to-tune, zoom — follows the radio's scope rather
+    /// than the audio passband.
+    fn adopt_device_sweep(&mut self, sweep: crate::source::DeviceSweep) {
+        let moved = self
+            .device_sweep
+            .as_ref()
+            .is_none_or(|p| p.center_hz != sweep.center_hz || p.span_hz != sweep.span_hz);
+        if moved {
+            self.state.center_hz = sweep.center_hz;
+            self.state.sample_rate = sweep.span_hz;
+            let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+        }
+        self.device_sweep = Some(sweep);
+    }
+
     fn update_display_center(&mut self) {
+        // A radio-drawn spectrum places the display itself; deriving it from
+        // the dial would fight the scope.
+        if self.device_sweep.is_some() {
+            return;
+        }
         if !self.audio_mode {
             return;
         }
@@ -1607,9 +1659,38 @@ impl Engine {
     /// Build the display spectrum frame. In digital modes it comes from the
     /// high-resolution channel analyzer (VFO-centered), zoomed to the FT8
     /// audio passband; otherwise from the full-rate device analyzer.
+    ///
+    /// Whichever path builds it, the frame leaves here with a fresh sequence
+    /// number. Clients read the display through a triple buffer, so they see the
+    /// same frame many times over and tell a *new* one apart by its `seq`: a
+    /// trace that smooths over time, or a peak hold that decays, folds in one
+    /// step per new sequence number. A frame built by a path that keeps no
+    /// counter of its own — a sweep handed over by the radio — would otherwise
+    /// arrive as seq 0 forever, and the display would freeze on the first one
+    /// while the waterfall, which reads every frame it is given, kept scrolling.
     fn make_spectrum_frame(&mut self) -> SpectrumFrame {
+        let mut frame = self.build_spectrum_frame();
+        self.spectrum_seq = self.spectrum_seq.wrapping_add(1);
+        frame.seq = self.spectrum_seq;
+        frame
+    }
+
+    fn build_spectrum_frame(&mut self) -> SpectrumFrame {
         if self.tx_active {
             return self.make_tx_frame();
+        }
+        // A sweep from the radio wins: it is the only wideband view such a
+        // radio can give, and it already carries its own centre and span.
+        if let Some(sweep) = &self.device_sweep {
+            return SpectrumAnalyzer::frame_from_db(
+                &sweep.bins_db,
+                sweep.center_hz,
+                sweep.span_hz,
+                self.cfg.db_floor,
+                self.cfg.db_ceil,
+                DISPLAY_BINS,
+                self.cfg.viewport,
+            );
         }
         if self.audio_mode {
             // The real audio's FFT is symmetric; the dial is audio-DC. USB maps
@@ -1751,7 +1832,15 @@ impl Engine {
             }
             SetVolume { rx, v } => self.state.rx[rx.index()].volume = v.clamp(0.0, 1.0),
             SetMute { rx, muted } => self.state.rx[rx.index()].muted = muted,
-            SetSquelch { rx, db } => self.state.rx[rx.index()].squelch_db = db,
+            SetSquelch { rx, db } => {
+                self.state.rx[rx.index()].squelch_db = db;
+                // A rig that gates its own audio has to be told: in audio mode
+                // there is no passband here to gate. Best effort — a source
+                // without a squelch of its own ignores it.
+                if rx == RxId::Main {
+                    let _ = self.source.set_squelch_db(db);
+                }
+            }
             SetNoiseBlanker(on) => self.state.noise_blanker = on,
             SetNoiseReduction { rx, level } => self.state.rx[rx.index()].noise_reduction = level,
             SetAutoNotch { rx, on } => self.state.rx[rx.index()].auto_notch = on,
@@ -1911,6 +2000,44 @@ impl Engine {
                     self.state.tx_gains = self.source.current_tx_gains();
                 }
             },
+            StartAtu => {
+                // A tune cycle puts RF on the antenna, so it passes the same
+                // rails as keying up: a transmit-capable radio, inside its TX
+                // range, and inside the amateur bands when that is enforced.
+                let txf = self.state.tx_freq_hz();
+                let refuse = |reason: &str| warn!("ATU tune refused: {reason}");
+                if !self.caps.has_atu {
+                    return refuse("this radio has no built-in antenna tuner");
+                }
+                if self.state.tx.ptt || self.state.tx.tune {
+                    return refuse("already transmitting");
+                }
+                if !self.caps.is_transmit_capable() {
+                    return refuse("device is not transmit capable");
+                }
+                if !self.caps.can_tx_hz(txf) {
+                    return refuse("frequency outside the device TX range");
+                }
+                if self.tx_ham_only && Band::containing(txf) == Band::Gen {
+                    return refuse("outside amateur bands (tx_ham_only is set in config.toml)");
+                }
+                if let Err(e) = self.source.atu_tune() {
+                    warn!("ATU tune: {e}");
+                    return;
+                }
+                // The radio reports progress; showing it immediately keeps the
+                // button from looking dead for the first few hundred ms.
+                self.state.atu = sdroxide_types::AtuState::Tuning;
+                let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+            }
+            BypassAtu => {
+                if let Err(e) = self.source.atu_bypass() {
+                    warn!("ATU bypass: {e}");
+                    return;
+                }
+                self.state.atu = sdroxide_types::AtuState::ManualBypass;
+                let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+            }
             SetAntenna { dir, name } => {
                 if dir == sdroxide_types::Direction::Rx {
                     if let Err(e) = self.source.set_antenna(&name) {

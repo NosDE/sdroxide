@@ -46,6 +46,8 @@ sdroxide-midi = { path = "crates/sdroxide-midi" }
 sdroxide-rigctld = { path = "crates/sdroxide-rigctld" }
 sdroxide-hpsdr = { path = "crates/sdroxide-hpsdr" }
 sdroxide-tci = { path = "crates/sdroxide-tci" }
+sdroxide-flex = { path = "crates/sdroxide-flex" }
+sdroxide-icom = { path = "crates/sdroxide-icom" }
 sdroxide-net = { path = "crates/sdroxide-net" }
 
 serde = { version = "1", features = ["derive"] }
@@ -79,6 +81,8 @@ sdroxide-server.workspace = true
 sdroxide-cat.workspace = true
 sdroxide-hpsdr.workspace = true
 sdroxide-tci.workspace = true
+sdroxide-flex.workspace = true
+sdroxide-icom.workspace = true
 sdroxide-ui = { workspace = true, features = ["remote"] }
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 anyhow.workspace = true

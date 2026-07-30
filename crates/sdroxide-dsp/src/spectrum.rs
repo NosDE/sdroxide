@@ -140,6 +140,48 @@ impl SpectrumAnalyzer {
     /// over `[db_floor, db_ceil]`. With `viewport = Some((lo_hz, hi_hz))`
     /// only that sub-span is extracted (zoomed display); the frame's
     /// center/span then describe the viewport.
+    /// Build a frame from decibels somebody else measured — a radio that draws
+    /// its own scope hands over a finished sweep, and it has to end up in the
+    /// same shape (and the same quantisation) as one we computed.
+    pub fn frame_from_db(
+        bins_db: &[f32],
+        center_hz: f64,
+        span_hz: f64,
+        db_floor: f32,
+        db_ceil: f32,
+        out_bins: usize,
+        viewport: Option<(f64, f64)>,
+    ) -> SpectrumFrame {
+        let scale = 255.0 / (db_ceil - db_floor).max(1e-3);
+        let out_bins = out_bins.clamp(1, 8192);
+        let (frac_lo, frac_hi, out_center, out_span) = match viewport {
+            Some((lo, hi)) if hi > lo && span_hz > 0.0 => {
+                let full_lo = center_hz - span_hz / 2.0;
+                let flo = ((lo - full_lo) / span_hz).clamp(0.0, 0.998);
+                let fhi = ((hi - full_lo) / span_hz).clamp(flo + 0.002, 1.0);
+                (flo, fhi, full_lo + (flo + fhi) / 2.0 * span_hz, (fhi - flo) * span_hz)
+            }
+            _ => (0.0, 1.0, center_hz, span_hz),
+        };
+        let n = bins_db.len().max(1);
+        let mut bins = Vec::with_capacity(out_bins);
+        for i in 0..out_bins {
+            // Each output bin covers a slice of the sweep; the strongest point
+            // in it wins, so a narrow signal survives being scaled down.
+            let f0 = frac_lo + (frac_hi - frac_lo) * i as f64 / out_bins as f64;
+            let f1 = frac_lo + (frac_hi - frac_lo) * (i + 1) as f64 / out_bins as f64;
+            let a = ((f0 * n as f64) as usize).min(n - 1);
+            let b = ((f1 * n as f64).ceil() as usize).clamp(a + 1, n);
+            let db = bins_db[a..b].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let v = ((db - db_floor) * scale).clamp(0.0, 255.0);
+            bins.push(v as u8);
+        }
+        // `seq` is left at 0: this function keeps no state, so it has no counter
+        // to draw one from. The engine stamps every frame it emits before it
+        // goes out, which is what makes consecutive sweeps distinguishable.
+        SpectrumFrame { seq: 0, center_hz: out_center, span_hz: out_span, db_floor, db_ceil, bins }
+    }
+
     pub fn make_frame(
         &mut self,
         center_hz: f64,
@@ -220,8 +262,42 @@ impl SpectrumAnalyzer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::f32::consts::TAU;
+
+    use super::*;
+
+    #[test]
+    fn a_foreign_spectrum_keeps_its_place_and_its_peaks() {
+        // A sweep as a radio hands it over: flat noise with one signal.
+        let mut db = vec![-120.0f32; 475];
+        db[237] = -40.0;
+        let f = SpectrumAnalyzer::frame_from_db(&db, 14_100_000.0, 50_000.0, -140.0, 0.0, 256, None);
+        assert_eq!(f.bins.len(), 256);
+        assert_eq!(f.center_hz, 14_100_000.0);
+        assert_eq!(f.span_hz, 50_000.0);
+        // The signal survives being scaled down to fewer bins, in the middle.
+        let peak = f.bins.iter().enumerate().max_by_key(|(_, v)| **v).map(|(i, _)| i).unwrap();
+        assert!((124..=132).contains(&peak), "the signal landed at bin {peak}");
+        assert!(f.bins[peak] > f.bins[0], "the signal did not stand out of the noise");
+    }
+
+    #[test]
+    fn zooming_into_a_foreign_spectrum_narrows_it() {
+        let db = vec![-100.0f32; 475];
+        let full = SpectrumAnalyzer::frame_from_db(&db, 14_100_000.0, 50_000.0, -140.0, 0.0, 128, None);
+        let zoom = SpectrumAnalyzer::frame_from_db(
+            &db,
+            14_100_000.0,
+            50_000.0,
+            -140.0,
+            0.0,
+            128,
+            Some((14_095_000.0, 14_105_000.0)),
+        );
+        assert_eq!(full.span_hz, 50_000.0);
+        assert!((zoom.span_hz - 10_000.0).abs() < 1.0, "zoomed span is {}", zoom.span_hz);
+        assert!((zoom.center_hz - 14_100_000.0).abs() < 1.0);
+    }
 
     #[test]
     fn tone_lands_in_the_right_bin_at_the_right_level() {

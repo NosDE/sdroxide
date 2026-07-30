@@ -54,6 +54,9 @@ pub struct DeviceCaps {
     pub sensors: Vec<String>,
     pub has_swr_sensor: bool,
     pub has_fwd_power_sensor: bool,
+    /// The radio has a built-in antenna tuner we can start and bypass. Drives
+    /// the ATU button: a radio without one shows none.
+    pub has_atu: bool,
 }
 
 impl DeviceCaps {

@@ -129,6 +129,19 @@ pub trait RadioController {
         Err("not supported on this client".into())
     }
 
+    /// Listen for FlexRadios announcing themselves on the LAN (native local
+    /// client only). Blocking for a couple of seconds — driven by the settings
+    /// UI's "Discover" button, not per frame.
+    fn discover_flex(&self) -> Vec<crate::FlexDevice> {
+        Vec::new()
+    }
+
+    /// Test a FlexRadio's SmartSDR API at `ip`. Blocking; returns the model and
+    /// version or an error message. Default: unsupported (remote client).
+    fn test_flex(&self, _ip: &str) -> Result<String, String> {
+        Err("not supported on this client".into())
+    }
+
     /// The persisted radio-backend config (SoapySDR vs CAT), or `None` when the
     /// client can't own it (the browser remote client).
     fn radio_config(&self) -> Option<crate::RadioConfig> {

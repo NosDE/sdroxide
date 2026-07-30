@@ -1,7 +1,7 @@
 //! Icom CI-V framing — also used by the Xiegu X6100, which speaks a CI-V
 //! dialect. A frame is `FE FE <to> <from> <cmd> [data…] FD`.
 
-use sdroxide_types::Mode;
+use sdroxide_types::{Mode, SQUELCH_OPEN_DB};
 
 pub const PREAMBLE: u8 = 0xFE;
 pub const END: u8 = 0xFD;
@@ -103,6 +103,73 @@ pub fn ptt_frame(radio: u8, on: bool) -> Vec<u8> {
 /// transmitting; the rig answers with a 0..255 reading (see [`swr_from_reading`]).
 pub fn read_swr_frame(radio: u8) -> Vec<u8> {
     frame(radio, 0x15, &[0x12])
+}
+
+/// Set the squelch threshold (Icom cmd `0x14` sub `0x03`), 0 = fully open.
+///
+/// The gating has to happen in the rig. Ours works on the power in the receive
+/// passband, which a rig like this never sends us — by the time its audio
+/// arrives it has been demodulated, levelled by the AGC and, in FM, is either
+/// speech or full noise at much the same amplitude. The rig squelches ahead of
+/// all that, and it is also the only place where the decision is instant: what
+/// it holds back never goes on the wire at all.
+pub fn set_squelch_frame(radio: u8, level: u8) -> Vec<u8> {
+    frame(radio, 0x14, &[0x03, level / 100, encode_level_low(level)])
+}
+
+/// The low two digits of a 0..255 level as one BCD byte.
+fn encode_level_low(level: u8) -> u8 {
+    let rest = level % 100;
+    ((rest / 10) << 4) | (rest % 10)
+}
+
+/// Map sdroxide's squelch threshold (dB, [`SQUELCH_OPEN_DB`] = open, 0 = shut)
+/// onto the rig's own 0..255 scale.
+///
+/// The two scales measure different things — ours is a level in the passband,
+/// the rig's is a position on its own squelch control — so the map is simply
+/// linear across the whole travel. That keeps the slider's ends meaning what
+/// they say and every position in between reachable.
+pub fn squelch_level_from_db(db: f32) -> u8 {
+    let frac = (db - SQUELCH_OPEN_DB) / -SQUELCH_OPEN_DB;
+    (frac.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Read the S-meter (Icom cmd `0x15` sub `0x02`). The rig answers with a 0..255
+/// reading (see [`dbm_from_smeter`]).
+///
+/// This is the only receive-level figure such a rig can give: it sends
+/// demodulated, AGC-flattened audio, so measuring the audio would show the
+/// AGC's work rather than the signal.
+pub fn read_smeter_frame(radio: u8) -> Vec<u8> {
+    frame(radio, 0x15, &[0x02])
+}
+
+/// Map an Icom S-meter reading (`0..255`) to dBm at the antenna.
+///
+/// Icom calibrates the scale at three points — 0 = S0, 120 = S9, 241 = S9+60 —
+/// and it is linear in dB between them, with a kink at S9 because the units
+/// below are 6 dB apart while the ones above are labelled directly in dB. Taking
+/// S9 as -73 dBm (the IARU definition on HF) makes S0 -127 dBm.
+pub fn dbm_from_smeter(reading: u32) -> f32 {
+    let r = reading.min(255) as f32;
+    if r <= 120.0 {
+        // 120 counts spanning nine S-units of 6 dB each: 0.45 dB per count.
+        -127.0 + r * 0.45
+    } else {
+        // 121 counts spanning the 60 dB above S9.
+        -73.0 + (r - 120.0) * (60.0 / 121.0)
+    }
+}
+
+/// Parse an S-meter reply payload (Icom cmd `0x15`): the sub-command byte
+/// followed by the BCD reading. Returns dBm, or `None` if the reply is a
+/// different meter or malformed.
+pub fn parse_smeter_reply(data: &[u8]) -> Option<f32> {
+    if data.first() != Some(&0x02) {
+        return None;
+    }
+    Some(dbm_from_smeter(decode_meter(&data[1..])?))
 }
 
 /// Decode Icom's 2-byte BCD meter reading (`0000..0255`) to a plain integer.
@@ -246,6 +313,44 @@ mod tests {
         assert_eq!(swr([0x00, 0x0f]), None);
         // The wrong meter sub-command is ignored (we only read SWR / 0x12).
         assert_eq!(parse_swr_reply(&[0x11, 0x00, 0x50]), None);
+    }
+
+    #[test]
+    fn s_meter_readings_land_on_the_calibration_points() {
+        // The three points Icom calibrates: S0, S9, S9+60.
+        assert_eq!(dbm_from_smeter(0), -127.0);
+        assert_eq!(dbm_from_smeter(120), -73.0);
+        assert!((dbm_from_smeter(241) - (-13.0)).abs() < 0.1, "{}", dbm_from_smeter(241));
+        // S1..S8 sit 6 dB apart below S9.
+        assert!((dbm_from_smeter(107) - (-79.0)).abs() < 0.5, "S8 landed wrong");
+
+        // The reply carries the reading as two BCD bytes after the sub-command.
+        let smeter = |d: [u8; 2]| parse_smeter_reply(&[0x02, d[0], d[1]]);
+        assert_eq!(smeter([0x01, 0x20]), Some(-73.0)); // reading 120 = S9
+        assert_eq!(smeter([0x00, 0x00]), Some(-127.0));
+        // Another meter on the same command is not ours to read.
+        assert_eq!(parse_smeter_reply(&[0x12, 0x00, 0x50]), None);
+        // And an SWR parse must not swallow an S-meter reply.
+        assert_eq!(parse_swr_reply(&[0x02, 0x01, 0x20]), None);
+    }
+
+    #[test]
+    fn squelch_travels_on_the_rigs_own_scale() {
+        // The slider's ends have to reach the rig's ends, or "fully open" and
+        // "fully shut" would be unreachable.
+        assert_eq!(squelch_level_from_db(SQUELCH_OPEN_DB), 0);
+        assert_eq!(squelch_level_from_db(0.0), 255);
+        assert_eq!(squelch_level_from_db(SQUELCH_OPEN_DB / 2.0), 128);
+        // Past either end it stays on the scale.
+        assert_eq!(squelch_level_from_db(-400.0), 0);
+        assert_eq!(squelch_level_from_db(40.0), 255);
+
+        // The level goes out as BCD, like every other Icom level.
+        let f = set_squelch_frame(0xA4, 255);
+        assert_eq!(&f[4..8], &[0x14, 0x03, 0x02, 0x55]);
+        assert_eq!(set_squelch_frame(0xA4, 120)[6..8], [0x01, 0x20]);
+        assert_eq!(set_squelch_frame(0xA4, 0)[6..8], [0x00, 0x00]);
+        assert_eq!(set_squelch_frame(0xA4, 9)[6..8], [0x00, 0x09]);
     }
 
     #[test]

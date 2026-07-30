@@ -31,6 +31,9 @@ pub struct AudioCatSource {
     /// Warning captured at open time (RX device unavailable / mono-for-IQ),
     /// surfaced to the UI. `None` when RX came up cleanly.
     status: Option<String>,
+    /// Newest S-meter reading the rig sent, in dBm. Demod audio arrives
+    /// AGC-levelled, so this is the only receive level worth showing.
+    last_signal_dbm: Option<f32>,
     /// Latest SWR the rig reported while keyed (via CI-V meter reads), held so
     /// the engine's 100 ms meter poll sees the most recent value between the
     /// rig's ~5 Hz updates. Cleared on unkey.
@@ -120,6 +123,7 @@ impl AudioCatSource {
             label,
             status,
             last_telem: None,
+            last_signal_dbm: None,
         })
     }
 }
@@ -185,16 +189,35 @@ impl IqSource for AudioCatSource {
     }
 
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
-        self.cat
-            .poll()
-            .into_iter()
-            .filter_map(|u| match u {
-                sdroxide_cat::CatUpdate::Freq(hz) => Some(ControlUpdate::Freq(hz)),
-                sdroxide_cat::CatUpdate::Mode(m) => Some(ControlUpdate::Mode(m)),
+        let mut out = Vec::new();
+        for u in self.cat.poll() {
+            match u {
+                sdroxide_cat::CatUpdate::Freq(hz) => out.push(ControlUpdate::Freq(hz)),
+                sdroxide_cat::CatUpdate::Mode(m) => out.push(ControlUpdate::Mode(m)),
+                // Nothing in the rig's state moved, so the meter reading is
+                // kept here for the engine's meter pass rather than passed on
+                // as a control change.
+                sdroxide_cat::CatUpdate::Signal(dbm) => self.last_signal_dbm = Some(dbm),
                 // SWR arrives on the separate telemetry channel, not here.
-                sdroxide_cat::CatUpdate::Swr(_) => None,
-            })
-            .collect()
+                sdroxide_cat::CatUpdate::Swr(_) => {}
+            }
+        }
+        out
+    }
+
+    /// The rig does the gating — but only when it is the rig's demodulator we
+    /// are listening to. On an IQ feed the engine has the passband itself and
+    /// gates there, and closing the rig's squelch as well would mute the very
+    /// signal we are demodulating.
+    fn set_squelch_db(&mut self, db: f32) -> Result<()> {
+        if matches!(self.format, SoundFormat::DemodAudio) {
+            self.cat.set_squelch(sdroxide_cat::civ::squelch_level_from_db(db));
+        }
+        Ok(())
+    }
+
+    fn rx_signal_dbm(&mut self) -> Option<f32> {
+        self.last_signal_dbm
     }
 
     fn set_control_mode(&mut self, mode: Mode) -> Result<()> {

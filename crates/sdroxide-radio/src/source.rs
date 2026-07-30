@@ -12,11 +12,27 @@ use sdroxide_types::Mode;
 pub enum ControlUpdate {
     Freq(f64),
     Mode(Mode),
+    /// What the radio's built-in antenna tuner is doing.
+    Atu(sdroxide_types::AtuState),
     /// TX drive the rig reports, as a 0..1 fraction (see
     /// [`IqSource::commands_tx_power`]).
     TxDrive(f32),
     /// TUNE drive the rig reports, as a 0..1 fraction.
     TuneDrive(f32),
+}
+
+/// A finished spectrum the device drew itself.
+///
+/// Radios that send no IQ can still have a wideband display: an Icom draws its
+/// own scope and hands the sweep over, and that is the only way to see more
+/// than the audio passband. The engine prefers this over its own FFT whenever a
+/// source supplies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceSweep {
+    pub center_hz: f64,
+    pub span_hz: f64,
+    /// One value per point, in dB relative to full scale.
+    pub bins_db: Vec<f32>,
 }
 
 /// Anything that produces a stream of complex baseband samples: a live
@@ -96,6 +112,27 @@ pub trait IqSource: Send {
     fn tx_telemetry(&mut self) -> Option<sdroxide_types::TxTelemetry> {
         None
     }
+    /// Hand the squelch threshold (dB) to a rig that gates its own audio.
+    ///
+    /// Our squelch works on the power in the receive passband, which a rig
+    /// sending demodulated audio never gives us — and in FM, speech and open
+    /// noise arrive at much the same level anyway. Such a rig squelches ahead
+    /// of its own demodulator, where the decision can still be made. Sources
+    /// with real IQ leave this alone and are gated here.
+    fn set_squelch_db(&mut self, _db: f32) -> Result<()> {
+        Ok(())
+    }
+    /// The receive level the radio's own S-meter shows, in dBm.
+    ///
+    /// A rig that sends demodulated audio gives us nothing to measure: its AGC
+    /// has already flattened the very differences an S-meter exists to show, so
+    /// a level taken from that audio would read the AGC, not the band. Such a
+    /// source reports the reading its own meter is built on instead, and the
+    /// engine shows that. `None` — the default — leaves the engine measuring
+    /// the signal itself, which is right wherever we have the IQ.
+    fn rx_signal_dbm(&mut self) -> Option<f32> {
+        None
+    }
     /// Offset (Hz) of the operator's VFO from the IQ centre, so a rig that keeps
     /// its own VFO within a wideband IQ stream (TCI) can track the dial while we
     /// tune with a software DDC. No-op for sources whose VFO already equals the
@@ -110,6 +147,14 @@ pub trait IqSource: Send {
         None
     }
 
+    /// The newest spectrum the device drew for itself, if it draws one. A
+    /// source that returns `Some` takes over the panadapter: the engine stops
+    /// FFT-ing its own input and shows this instead, at the centre and span the
+    /// device reports. Default: the engine computes the spectrum.
+    fn device_spectrum(&mut self) -> Option<DeviceSweep> {
+        None
+    }
+
     /// Drain any out-of-band changes the rig reported (dial/mode moved on the
     /// radio). Default: none.
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
@@ -117,6 +162,18 @@ pub trait IqSource: Send {
     }
     /// Command the rig's operating mode (CAT). Default: no-op.
     fn set_control_mode(&mut self, _mode: Mode) -> Result<()> {
+        Ok(())
+    }
+
+    /// Run a tune cycle on the radio's built-in antenna tuner (transmits — the
+    /// engine gates this like PTT). Only radios advertising `caps.has_atu`
+    /// implement it; default: no such tuner.
+    fn atu_tune(&mut self) -> Result<()> {
+        Err(crate::RadioError::Msg("this radio has no built-in antenna tuner".into()))
+    }
+
+    /// Take the built-in tuner out of circuit. Default: no-op.
+    fn atu_bypass(&mut self) -> Result<()> {
         Ok(())
     }
     /// Write real TX audio to the rig's sound card (used instead of `tx_write`

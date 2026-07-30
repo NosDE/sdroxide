@@ -70,6 +70,12 @@ pub enum Command {
     // Hardware
     SetGain { dir: Direction, element: String, db: f64 },
     SetAntenna { dir: Direction, name: String },
+    /// Run a tune cycle on the radio's built-in antenna tuner. This transmits,
+    /// so the engine applies the same rails as PTT. Progress and outcome arrive
+    /// as [`crate::AtuState`] in the state snapshot.
+    StartAtu,
+    /// Take the built-in tuner out of circuit.
+    BypassAtu,
 
     // Memories
     StoreMemory { name: String },

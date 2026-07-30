@@ -18,11 +18,22 @@ pub enum Backend {
     Hpsdr,
     /// TCI (Transceiver Control Interface) over WebSocket — ExpertSDR3, Thetis, …
     Tci,
+    /// FlexRadio SmartSDR (FLEX-6000 / FLEX-8000) over its TCP API + VITA-49.
+    Flex,
+    /// Icom over LAN/WLAN (IC-705, IC-7610, IC-9700) — CI-V and audio over UDP.
+    Icom,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 5] =
-        [Backend::Auto, Backend::Soapy, Backend::Cat, Backend::Hpsdr, Backend::Tci];
+    pub const ALL: [Backend; 7] = [
+        Backend::Auto,
+        Backend::Soapy,
+        Backend::Cat,
+        Backend::Hpsdr,
+        Backend::Tci,
+        Backend::Flex,
+        Backend::Icom,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Backend::Auto => "Auto-detect (SoapySDR / CAT)",
@@ -30,6 +41,8 @@ impl Backend {
             Backend::Cat => "CAT / Audio",
             Backend::Hpsdr => "HPSDR (network)",
             Backend::Tci => "TCI (network)",
+            Backend::Flex => "FlexRadio (network)",
+            Backend::Icom => "Icom (network)",
         }
     }
 }
@@ -362,6 +375,138 @@ impl TciConfig {
     pub const IQ_RATES: [f64; 3] = [48_000.0, 96_000.0, 192_000.0];
 }
 
+/// FlexRadio (SmartSDR) backend configuration. Receive is a wideband DAX IQ
+/// stream (sdroxide demodulates); transmit is DAX audio the radio modulates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlexConfig {
+    /// Radio IP typed by the operator; empty means "use the discovered pick".
+    pub manual_ip: Option<String>,
+    /// IP chosen from the discovery list, remembered between sessions.
+    pub selected_ip: Option<String>,
+    /// DAX IQ stream sample rate in Hz (24k / 48k / 96k / 192k).
+    pub iq_sample_rate_hz: f64,
+    /// DAX IQ channel to claim (1..4). Pick a different one if another program
+    /// already uses this channel on the same radio.
+    pub daxiq_channel: u32,
+    /// Antenna port for the slice we create (`ANT1`, `ANT2`, `RX_A`, …). Empty
+    /// leaves the radio's own default.
+    pub antenna: String,
+    /// Station name shown in the radio's client list.
+    pub station: String,
+    /// Client id the radio assigned on the first connection, sent back on every
+    /// later one. A GUI client's slices and panadapters are kept per client id,
+    /// so reusing it means the radio hands our objects back instead of stranding
+    /// them — otherwise every restart consumes another slice. Not shown in the
+    /// UI; the radio owns the value, we only remember it.
+    pub client_id: Option<String>,
+}
+
+impl Default for FlexConfig {
+    fn default() -> Self {
+        FlexConfig {
+            manual_ip: None,
+            selected_ip: None,
+            iq_sample_rate_hz: 192_000.0,
+            daxiq_channel: 1,
+            antenna: String::new(),
+            station: "sdroxide".into(),
+            client_id: None,
+        }
+    }
+}
+
+impl FlexConfig {
+    /// DAX IQ sample rates offered in the UI.
+    pub const IQ_RATES: [f64; 4] = [24_000.0, 48_000.0, 96_000.0, 192_000.0];
+    /// DAX IQ channels a radio provides.
+    pub const CHANNELS: [u32; 4] = [1, 2, 3, 4];
+
+    /// Resolve the IP to connect to: manual override, else the persisted pick.
+    /// `None` means "discover and use the first radio found".
+    pub fn target_ip(&self) -> Option<&str> {
+        self.manual_ip
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(self.selected_ip.as_deref())
+    }
+}
+
+/// One FlexRadio found by a discovery listen. Wasm-safe so it can cross the
+/// `RadioController` trait to the settings UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlexDevice {
+    pub ip: String,
+    /// Model as the radio reports it, e.g. "FLEX-8600", "FLEX-6400M".
+    pub model: String,
+    pub serial: String,
+    /// SmartSDR version running on the radio.
+    pub version: String,
+    /// Operator-assigned nickname.
+    pub name: String,
+    pub callsign: String,
+    /// Whether a GUI client (SmartSDR, another sdroxide) already has the radio.
+    pub in_use: bool,
+}
+
+impl FlexDevice {
+    /// One-line label for the selection UI.
+    pub fn label(&self) -> String {
+        let mut s = format!("{}  {}", self.model, self.ip);
+        if !self.name.is_empty() {
+            s = format!("{}  \"{}\"", s, self.name);
+        }
+        if self.in_use {
+            s.push_str("  [in use]");
+        }
+        s
+    }
+}
+
+/// Icom network backend (IC-705 / IC-7610 / IC-9700 over LAN or WLAN). Control
+/// is CI-V over UDP; audio is the radio's own stream — no cable, no sound card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IcomConfig {
+    /// Radio address, e.g. `192.168.1.40`.
+    pub ip: String,
+    /// Network-control user configured on the radio.
+    pub username: String,
+    /// Its password. Icom's protocol only obfuscates this on the wire, so it is
+    /// no more secret in transit than it is here.
+    pub password: String,
+    /// The radio's own model name; it checks the name against itself.
+    pub model: String,
+    /// CI-V transceiver address (0xA4 on an IC-705, 0x98 on an IC-7610).
+    pub civ_address: u8,
+    /// Displayed panadapter bandwidth for the audio-band view (Hz), used only
+    /// while the radio's own scope is not running.
+    pub audio_bw_hz: f64,
+    /// Scope span to ask the radio for, as the ± value in Hz. The radio's own
+    /// SPAN button overrides it; every sweep says what it covers.
+    pub scope_span_hz: f64,
+}
+
+impl Default for IcomConfig {
+    fn default() -> Self {
+        IcomConfig {
+            ip: String::new(),
+            username: String::new(),
+            password: String::new(),
+            model: "IC-705".into(),
+            civ_address: 0xA4,
+            audio_bw_hz: 6000.0,
+            scope_span_hz: 25_000.0,
+        }
+    }
+}
+
+impl IcomConfig {
+    /// Models offered in the UI, with their usual CI-V address.
+    pub const MODELS: [(&'static str, u8); 4] =
+        [("IC-705", 0xA4), ("IC-7610", 0x98), ("IC-9700", 0xA2), ("IC-7850", 0x8E)];
+}
+
 /// Persisted backend configuration (`radio.json`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -374,4 +519,6 @@ pub struct RadioConfig {
     pub cat: CatConfig,
     pub hpsdr: HpsdrConfig,
     pub tci: TciConfig,
+    pub flex: FlexConfig,
+    pub icom: IcomConfig,
 }

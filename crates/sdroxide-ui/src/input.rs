@@ -1138,8 +1138,10 @@ mod tests {
     fn band_stepping_skips_general_coverage() {
         assert_eq!(step_band(Band::M20, true), Some(Band::M17));
         assert_eq!(step_band(Band::M20, false), Some(Band::M30));
-        // Wraps within the ham bands only.
-        assert_eq!(step_band(Band::M2, true), Some(Band::M160));
+        assert_eq!(step_band(Band::M2, true), Some(Band::Cm70));
+        // Wraps within the ham bands only — round the top end, past GEN.
+        assert_eq!(step_band(Band::Cm23, true), Some(Band::M160));
+        assert_eq!(step_band(Band::M160, false), Some(Band::Cm23));
         assert_eq!(step_band(Band::Gen, true), None);
     }
 

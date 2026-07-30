@@ -1,0 +1,17 @@
+[package]
+name = "sdroxide-icom"
+version.workspace = true
+edition.workspace = true
+
+# Native-only Icom network client (IC-705 / IC-7610 / IC-9700 over LAN or WLAN):
+# the three UDP streams an RS-BA1 server speaks. Pure Rust, no vendor library.
+# Must never be a dependency of any wasm-targeted crate.
+[dependencies]
+sdroxide-types.workspace = true
+# The CI-V frames are the same over a cable and over the network; only the
+# transport differs, so the framing is shared with the serial CAT backend.
+sdroxide-cat.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

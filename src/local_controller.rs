@@ -135,6 +135,14 @@ impl RadioController for LocalController {
         sdroxide_tci::test_connection(address, std::time::Duration::from_secs(3))
     }
 
+    fn discover_flex(&self) -> Vec<sdroxide_types::FlexDevice> {
+        sdroxide_flex::discover_default()
+    }
+
+    fn test_flex(&self, ip: &str) -> Result<String, String> {
+        sdroxide_flex::test_connection(ip, std::time::Duration::from_secs(3))
+    }
+
     fn radio_config(&self) -> Option<RadioConfig> {
         Some(sdroxide_config::load_radio_config())
     }

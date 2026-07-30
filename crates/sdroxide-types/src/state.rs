@@ -79,6 +79,48 @@ impl RxState {
     }
 }
 
+/// What a built-in antenna tuner is doing, as the radio reports it.
+///
+/// A tune cycle transmits, so this is status the operator must be able to see:
+/// whether the match was found, whether the tuner concluded that straight
+/// through is better (bypass), or whether it gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AtuState {
+    /// No tune has been run since the radio came up (or on this band).
+    #[default]
+    NotStarted,
+    /// A tune cycle is running — the radio is transmitting.
+    Tuning,
+    /// A match was found and the tuner is in circuit.
+    Success,
+    /// The tuner concluded the antenna is better off without it.
+    Bypass,
+    /// Bypass because the operator asked for it, not because a tune said so.
+    ManualBypass,
+    /// The tune failed; running it again is the usual answer.
+    Failed,
+}
+
+impl AtuState {
+    /// Short text for the readout next to the ATU button.
+    pub fn label(self) -> &'static str {
+        match self {
+            AtuState::NotStarted => "—",
+            AtuState::Tuning => "Tuning…",
+            AtuState::Success => "Success",
+            AtuState::Bypass => "Bypass",
+            AtuState::ManualBypass => "Bypass",
+            AtuState::Failed => "Failed",
+        }
+    }
+
+    /// Whether the tuner is in circuit with a match it found. The ATU button
+    /// shows this as engaged, and pressing it then means "go to bypass".
+    pub fn is_engaged(self) -> bool {
+        self == AtuState::Success
+    }
+}
+
 /// Transmit-side settings and status.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct TxState {
@@ -114,6 +156,10 @@ pub struct RadioState {
     pub xit: OffsetState,
 
     pub tx: TxState,
+    /// State of a built-in antenna tuner. Meaningful only on a radio that has
+    /// one (`DeviceCaps::has_atu`).
+    #[serde(default)]
+    pub atu: AtuState,
     pub band: Band,
     /// Impulse noise blanker on the raw IQ stream.
     pub noise_blanker: bool,
@@ -159,6 +205,7 @@ impl Default for RadioState {
                 mic_gain: 0.5,
                 ..TxState::default()
             },
+            atu: AtuState::NotStarted,
             band: Band::M20,
             noise_blanker: false,
             skimmer: crate::SkimmerSettings::default(),

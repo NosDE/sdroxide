@@ -15,11 +15,13 @@ pub enum Band {
     M10,
     M6,
     M2,
+    Cm70,
+    Cm23,
     Gen,
 }
 
 impl Band {
-    pub const ALL: [Band; 13] = [
+    pub const ALL: [Band; 15] = [
         Band::M160,
         Band::M80,
         Band::M60,
@@ -32,6 +34,8 @@ impl Band {
         Band::M10,
         Band::M6,
         Band::M2,
+        Band::Cm70,
+        Band::Cm23,
         Band::Gen,
     ];
 
@@ -49,6 +53,8 @@ impl Band {
             Band::M10 => "10M",
             Band::M6 => "6M",
             Band::M2 => "2M",
+            Band::Cm70 => "70CM",
+            Band::Cm23 => "23CM",
             Band::Gen => "GEN",
         }
     }
@@ -69,6 +75,8 @@ impl Band {
             Band::M10 => Some((28_000_000.0, 29_700_000.0)),
             Band::M6 => Some((50_000_000.0, 52_000_000.0)),
             Band::M2 => Some((144_000_000.0, 146_000_000.0)),
+            Band::Cm70 => Some((430_000_000.0, 440_000_000.0)),
+            Band::Cm23 => Some((1_240_000_000.0, 1_300_000_000.0)),
             Band::Gen => None,
         }
     }
@@ -97,6 +105,10 @@ impl Band {
             Band::M10 => (28_400_000.0, Mode::Usb),
             Band::M6 => (50_150_000.0, Mode::Usb),
             Band::M2 => (145_500_000.0, Mode::Nfm),
+            Band::Cm70 => (433_500_000.0, Mode::Nfm),
+            // The SSB/CW calling frequency: on 23 cm that is where the
+            // activity is, FM simplex being nearly deserted.
+            Band::Cm23 => (1_296_200_000.0, Mode::Usb),
             Band::Gen => (7_200_000.0, Mode::Am),
         }
     }

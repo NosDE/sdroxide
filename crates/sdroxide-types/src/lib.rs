@@ -70,8 +70,9 @@ pub use netcfg::{
     PskConfig,
 };
 pub use radio::{
-    Backend, CatConfig, CatFamily, DigiMode, HpsdrConfig, HpsdrDevice, LineState, ModeControl,
-    Parity, PttMethod, RadioConfig, SerialConfig, SoundFormat, StopBits, TciConfig,
+    Backend, CatConfig, CatFamily, DigiMode, FlexConfig, FlexDevice, HpsdrConfig, HpsdrDevice,
+    IcomConfig, LineState, ModeControl, Parity, PttMethod, RadioConfig, SerialConfig, SoundFormat,
+    StopBits, TciConfig,
 };
 pub use rigctld::RigctldConfig;
 pub use wsjtx::WsjtxConfig;
@@ -79,7 +80,9 @@ pub use skimmer::{SkimmerKind, SkimmerSettings, SkimmerSpot};
 pub use spectrum::{SpectrumConfig, SpectrumFrame};
 pub use spot::{Spot, SpotKind};
 pub use sstv::{SstvMode, SstvStatus};
-pub use state::{OffsetState, RadioState, RxId, RxState, SQUELCH_OPEN_DB, TxState, Vfo};
+pub use state::{
+    AtuState, OffsetState, RadioState, RxId, RxState, SQUELCH_OPEN_DB, TxState, Vfo,
+};
 pub use tciserver::TciServerConfig;
 pub use ui::{Speed, UiSettings};
 pub use voice::{VOICE_MAX_LEN_S, VOICE_SLOTS, VoiceSlotInfo, VoiceStatus, slot_label};
