@@ -133,6 +133,13 @@ pub(in crate::app) fn settings_ui_tab(
         );
         ui.end_row();
 
+        ui.label("Clock");
+        crate::chrome::checkbox(ui, &mut cfg.panadapter_clock, "UTC + local on the panadapter")
+            .on_hover_text(
+                "A wall clock at the top-right of the panadapter, in UTC and your own time.",
+            );
+        ui.end_row();
+
         ui.label("Spectrum background");
         ui.horizontal(|ui| {
             crate::chrome::checkbox(ui, &mut cfg.spectrum_gradient, "Gradient");

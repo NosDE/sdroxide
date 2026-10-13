@@ -250,19 +250,20 @@ fn worker(
     stop: &AtomicBool,
     error: &std::sync::Mutex<Option<String>>,
 ) {
-    let (out, mut ring) = match start_output(device.as_deref(), 48_000) {
-        Ok(v) => v,
-        Err(e) => {
-            *error.lock().unwrap() = Some(format!("no audio output: {e}"));
-            // Drain so a send does not block forever.
-            while let Ok(job) = rx.recv() {
-                if matches!(job, Job::Quit) {
-                    break;
+    let (out, mut ring) =
+        match start_output(device.as_deref(), 48_000, sdroxide_types::AudioRouting::Both) {
+            Ok(v) => v,
+            Err(e) => {
+                *error.lock().unwrap() = Some(format!("no audio output: {e}"));
+                // Drain so a send does not block forever.
+                while let Ok(job) = rx.recv() {
+                    if matches!(job, Job::Quit) {
+                        break;
+                    }
                 }
+                return;
             }
-            return;
-        }
-    };
+        };
     let rate = out.sample_rate;
     let capacity = rate as usize * 2;
     let lead = (rate * LEAD_S) as usize;

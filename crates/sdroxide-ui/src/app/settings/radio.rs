@@ -2914,7 +2914,9 @@ pub(in crate::app) fn settings_icomnet_tab(
              12 kHz IF: the radio sends its DRM intermediate frequency instead and \
              sdroxide demodulates, which brings its own filters, noise reduction and \
              decoders to bear over about ±12 kHz. Either way the wide waterfall is the \
-             radio's own scope — no Icom outputs I/Q.",
+             radio's own scope — no Icom outputs I/Q. An IF preference temporarily uses AF \
+             for wider modes such as WFM, then restores IF for compatible modes. \
+             An AF preference stays AF. HD Radio is unavailable on this connection.",
         );
         ComboBox::from_id_salt("icomnet_rx_source")
             .selected_text(net.rx_source.label())
@@ -7555,8 +7557,15 @@ pub(in crate::app) fn settings_lime_tab(
         ui.label("Sample rate");
         ui.horizontal(|ui| {
             let text = format!("{:.3} Msps", cfg.lime.sample_rate_hz / 1e6);
+            // The Mini's USB link underruns at 1 Msps on transmit (issue #609),
+            // so it gets a lower-rate list; every other board gets the full one.
+            let rates = devices
+                .iter()
+                .find(|d| d.matches(&cfg.lime.device))
+                .map(|d| LimeConfig::rates_for(&d.name))
+                .unwrap_or(&LimeConfig::SAMPLE_RATES);
             egui::ComboBox::from_id_salt("lime-rate").selected_text(text).show_styled(ui, |ui| {
-                for r in LimeConfig::SAMPLE_RATES {
+                for &r in rates {
                     let label = match LimeConfig::rate_note(r) {
                         Some(note) => format!("{:.3} Msps — {note}", r / 1e6),
                         None => format!("{:.3} Msps", r / 1e6),

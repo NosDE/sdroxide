@@ -215,6 +215,9 @@ pub struct Settings {
     pub swr_limit: f32,
     /// Preferred audio output device name; `None` = system default.
     pub audio_output: Option<String>,
+    /// Which speaker channel(s) the received audio reaches (#654). `Both` is
+    /// the default and the old behaviour.
+    pub audio_routing: sdroxide_types::AudioRouting,
     /// Preferred audio input (microphone) device name; `None` = system default.
     pub audio_input: Option<String>,
     /// The published version the operator dismissed the update banner for.
@@ -279,6 +282,7 @@ impl Default for Settings {
             swr_guard: true,
             swr_limit: 2.5,
             audio_output: None,
+            audio_routing: sdroxide_types::AudioRouting::default(),
             audio_input: None,
             dismissed_update: String::new(),
             region: sdroxide_types::Region::default(),
@@ -483,6 +487,18 @@ pub fn save_band_plan(plan: &sdroxide_types::BandPlan) -> Result<(), ConfigError
     write_atomic(&config_dir()?, BAND_PLAN_FILE, &plan.to_json_document())
 }
 
+/// The operator's own HFDL channels (`hfdl_channels.json`), in kHz — the busy
+/// assigned frequencies that are not in the published plan, kept as one-click
+/// chips beside it. Per machine rather than per station: a channel a listener
+/// found busy is theirs, not everybody else's.
+pub fn load_hfdl_channels() -> Vec<u32> {
+    load_json_list("hfdl_channels.json")
+}
+
+pub fn save_hfdl_channels(khz: &[u32]) -> Result<(), ConfigError> {
+    save_json("hfdl_channels.json", &khz)
+}
+
 /// Load just the remote-access credentials.
 ///
 /// Read fresh rather than cached: the server calls this once per connection, so
@@ -601,7 +617,7 @@ pub fn config_dir() -> Result<PathBuf, ConfigError> {
 ///
 /// Only the files that describe *a radio* are scoped: `radio.json`,
 /// `session.json`, `scanner.json`, `modeprofiles.json`, `tciserver.json`, `rigctld.json`,
-/// `wsjtx.json`. Everything the operator shares across radios — memories,
+/// `wsjtx.json`, `wspr.json`. Everything the operator shares across radios — memories,
 /// band stacks, the logbook, `config.toml` — stays on the root free functions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Store {
@@ -772,6 +788,54 @@ impl Store {
         profiles: &sdroxide_types::ModeProfiles,
     ) -> Result<(), ConfigError> {
         self.save("modeprofiles.json", profiles)
+    }
+
+    /// The operator's digital-mode config as this radio runs it: the shared
+    /// `digi.json` with this radio's own WSPR beacon settings laid over it
+    /// (issue #615).
+    ///
+    /// A radio that has never saved its own gets the shared file's — radio 0,
+    /// whose settings those are on an installation that predates the split —
+    /// except that any other radio starts with its beacon off. Transmitting
+    /// because a radio was added is not something the operator asked for.
+    pub fn load_digi_config(&self) -> sdroxide_types::DigiConfig {
+        let mut cfg = load_digi_config();
+        match self.load_wspr_config() {
+            Some(w) => w.apply_to(&mut cfg),
+            None if self.radio_id() != 0 => cfg.wspr_tx_percent = 0,
+            None => {}
+        }
+        cfg
+    }
+
+    /// Save `cfg` as this radio's: its WSPR beacon settings to its own
+    /// `wspr.json`, the rest to the shared `digi.json`.
+    ///
+    /// Radio 0 also leaves its WSPR settings in `digi.json`, where an older
+    /// build reads them. Any other radio writes the shared file with the WSPR
+    /// settings it already holds, so radio 0 — which may still be reading them
+    /// from there — is not handed another radio's beacon.
+    pub fn save_digi_config(&self, cfg: &sdroxide_types::DigiConfig) -> Result<(), ConfigError> {
+        let own = sdroxide_types::WsprRadio::of(cfg);
+        if self.radio_id() == 0 {
+            save_digi_config(cfg)?;
+        } else {
+            let mut shared = cfg.clone();
+            sdroxide_types::WsprRadio::of(&load_digi_config()).apply_to(&mut shared);
+            save_digi_config(&shared)?;
+        }
+        self.save("wspr.json", &own)
+    }
+
+    /// This radio's WSPR beacon settings, or `None` where it has never saved
+    /// any. An unreadable file is quarantined and reads as the defaults —
+    /// beacon off — rather than as absent.
+    pub fn load_wspr_config(&self) -> Option<sdroxide_types::WsprRadio> {
+        let dir = self.dir().ok()?;
+        match read_config_text(&dir, "wspr.json") {
+            FileText::Missing => None,
+            _ => Some(self.load("wspr.json")),
+        }
     }
 
     pub fn load_scanner_config(&self) -> sdroxide_types::ScannerConfig {
@@ -1293,6 +1357,13 @@ pub struct Session {
     /// assertion, the same rule the two memories above follow.
     #[serde(default)]
     pub vfo_antennas: Option<[(Option<String>, Option<String>); 2]>,
+    /// The receive gain stages last set on each band (#605), restored as the
+    /// dial crosses into it — an RTL-SDR wants little gain on HF and a lot on
+    /// 2 m. Keyed by a band's stable name, general coverage split by range;
+    /// only bands the operator has set a gain on appear, and absent in a
+    /// session written before this existed.
+    #[serde(default)]
+    pub band_gains: BandGains,
 }
 
 /// Which antenna socket was last chosen on each band — see
@@ -1300,6 +1371,11 @@ pub struct Session {
 /// direction has no port to choose.
 pub type BandAntennas =
     std::collections::HashMap<sdroxide_types::Band, (Option<String>, Option<String>)>;
+
+/// Receive gain stages, `(element, dB)`, per band — see
+/// [`Session::band_gains`]. Keyed by name rather than by `Band`, because
+/// general coverage is split into ranges that are not bands.
+pub type BandGains = std::collections::BTreeMap<String, Vec<(String, f64)>>;
 
 impl Default for Session {
     fn default() -> Self {
@@ -1345,6 +1421,7 @@ impl Default for Session {
             // chosen on it — nothing moves a relay before the operator has
             // said what belongs where.
             vfo_antennas: None,
+            band_gains: BandGains::new(),
         }
     }
 }
@@ -2332,6 +2409,10 @@ mod tests {
                 (Some("ANT1".into()), None),
                 (Some("ANT2".into()), Some("ANT2".into())),
             ]),
+            band_gains: BandGains::from([
+                ("M40".to_string(), vec![("LNA".to_string(), 10.0)]),
+                ("GEN_VHF".to_string(), vec![("LNA".to_string(), 40.0)]),
+            ]),
         };
         let back: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -3188,6 +3269,13 @@ mod tests {
         // And it says so again next time, because the file is still wrong.
         assert!(load_band_plan().is_default());
         assert_eq!(take_load_alerts().len(), 1);
+
+        // The operator's own HFDL channels: a save writes the file and a load
+        // reads it back, and a missing one is simply empty (not an error).
+        assert!(load_hfdl_channels().is_empty(), "no file, no saved channels");
+        save_hfdl_channels(&[5_451, 8_843, 11_184]).unwrap();
+        assert!(root.join("hfdl_channels.json").exists());
+        assert_eq!(load_hfdl_channels(), vec![5_451, 8_843, 11_184]);
 
         unsafe { std::env::remove_var("SDROXIDE_CONFIG_DIR") };
     }

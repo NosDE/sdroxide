@@ -175,6 +175,9 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// `SdroxideApp::rx_site_edit`.
     rx_site: &'a mut Option<sdroxide_types::RxSite>,
     audio_pick: &'a mut Option<(bool, Option<String>)>,
+    /// Which speaker channel(s) the received audio reaches, applied after the
+    /// window closure (#654).
+    routing_pick: &'a mut Option<sdroxide_types::AudioRouting>,
     hpsdr_discover: &'a mut bool,
     /// The name being typed in the Profiles tab's save box. Owned on the app:
     /// the dialog lives across taps of the tab bar, and a half-typed name is
@@ -1027,6 +1030,7 @@ impl SdroxideApp {
         // Edits collected here and applied after the window closure, which
         // borrows `&self` and so can't touch `&mut self.ctrl`.
         let mut audio_pick: Option<(bool, Option<String>)> = None;
+        let mut routing_pick: Option<sdroxide_types::AudioRouting> = None;
         let mut profile_name = std::mem::take(&mut self.profile_name_edit);
         let mut digi_reseed = false;
         let mut speech_edit = self.speech.settings().clone();
@@ -1200,6 +1204,7 @@ impl SdroxideApp {
                             ranges: &mut ranges,
                             rx_site: &mut rx_site,
                             audio_pick: &mut audio_pick,
+                            routing_pick: &mut routing_pick,
                             hpsdr_discover: &mut hpsdr_discover,
                             profile_name: &mut profile_name,
                             digi_reseed: &mut digi_reseed,
@@ -1409,6 +1414,10 @@ impl SdroxideApp {
         }
         if let Some((output, name)) = audio_pick {
             self.ctrl.set_audio_device(output, name);
+            self.audio_devices_queried = false;
+        }
+        if let Some(routing) = routing_pick {
+            self.ctrl.set_audio_routing(routing);
             self.audio_devices_queried = false;
         }
         // Every device question below is asked after the window closure, which
@@ -1935,7 +1944,7 @@ impl SdroxideApp {
                 // running two rigs at once runs two interfaces at once, and one
                 // pair of pickers on a shared page could only describe one of
                 // them (issue #474).
-                self.settings_user_audio(ui, io.audio_pick);
+                self.settings_user_audio(ui, io.audio_pick, io.routing_pick);
 
                 if let Some(access) = io.access_edit.as_deref_mut() {
                     ui.add_space(10.0);
@@ -2235,6 +2244,83 @@ impl SdroxideApp {
                                  only honest answer. Reporting from your own square would put \
                                  somebody else's reception on the wrong continent.",
                             );
+                        }
+                    });
+                    ui.end_row();
+
+                    // Which speaker channels this radio plays to (#654): one ear
+                    // only puts two radios on one headset, a sub receiver mixed
+                    // into the same ear. Live: an ear is chosen by listening.
+                    ui.label(RichText::new("Audio to").strong());
+                    let was = cfg.audio_route;
+                    enum_combo(
+                        ui,
+                        "audio-route",
+                        &mut cfg.audio_route,
+                        &sdroxide_types::AudioRoute::ALL,
+                        sdroxide_types::AudioRoute::label,
+                    );
+                    if cfg.audio_route != was {
+                        cmds.push(Command::SetRadioConfig {
+                            cfg: Box::new(cfg.clone()),
+                            reopen: false,
+                        });
+                    }
+                    ui.end_row();
+
+                    // #605: an RTL-SDR wants little gain on HF and a lot on 2 m.
+                    ui.label(RichText::new("Gain per band").strong());
+                    let mut per_band = !cfg.same_gain_all_bands;
+                    if crate::chrome::checkbox(ui, &mut per_band, "Remember receive gain per band")
+                        .on_hover_text(
+                            "Each band keeps the receive gain you last set on it, and gets it \
+                             back when the dial returns — a band button, a drag across a band \
+                             edge or the radio's own knob. General coverage is split into HF, \
+                             VHF, UHF and above. A band you have not set a gain on keeps \
+                             whatever is in force. Off: one gain everywhere.",
+                        )
+                        .changed()
+                    {
+                        cfg.same_gain_all_bands = !per_band;
+                        cmds.push(Command::SetRadioConfig {
+                            cfg: Box::new(cfg.clone()),
+                            reopen: false,
+                        });
+                    }
+                    ui.end_row();
+
+                    // Live, like the receive audio trim: it is set by watching
+                    // the S-meter while dragging (#642).
+                    ui.label(RichText::new("S-meter calibration").strong());
+                    ui.horizontal(|ui| {
+                        let was = cfg.s_meter_cal_db;
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.s_meter_cal_db)
+                                .speed(0.5)
+                                .range(-150.0..=50.0)
+                                .fixed_decimals(1)
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text(
+                            "Added to this radio's S-meter reading. An SDR's meter starts out \
+                             reading dBFS — level against the converter's full scale — so a \
+                             receiver with plenty of gain can show S9 with no antenna \
+                             connected. Set this to the difference between what the meter \
+                             shows and a level you know: a signal generator, or a quiet band \
+                             you trust to sit around S2–S3. Applies at once.\n\nOn top of \
+                             cal_offset_db in config.toml, which is one figure for the whole \
+                             station.",
+                        );
+                        if cfg.s_meter_cal_db != 0.0 && ui.button("0 dB").clicked() {
+                            cfg.s_meter_cal_db = 0.0;
+                        }
+                        // Saving the file alone reaches the engine only at the
+                        // next reopen; this is meant to be set while watching.
+                        if cfg.s_meter_cal_db != was {
+                            cmds.push(Command::SetRadioConfig {
+                                cfg: Box::new(cfg.clone()),
+                                reopen: false,
+                            });
                         }
                     });
                     ui.end_row();
@@ -3209,6 +3295,16 @@ impl SdroxideApp {
                     UploadTarget::Eqsl => {
                         net_row(ui, "eQSL user", &mut io.net_edit.eqsl.user, 140.0);
                         net_secret(ui, "eQSL pass", &mut io.net_edit.eqsl.password, 140.0);
+                        net_row(ui, "eQSL QTH", &mut io.net_edit.eqsl_qth_nickname, 140.0);
+                        ui.label(
+                            RichText::new(
+                                "The QTH Nickname of the eQSL profile to upload to and \
+                                 download from — needed only when the account owns more \
+                                 than one; leave it blank otherwise.",
+                            )
+                            .size(10.5)
+                            .color(crate::theme::gray(140)),
+                        );
                     }
                     UploadTarget::HamQth => {
                         // The *same* two fields as the lookup section above, not
@@ -3563,9 +3659,9 @@ impl SdroxideApp {
                     .suffix(" Hz"),
             )
             .on_hover_text(
-                "How far above this radio's dial the receiver sits, in hertz. 0 for a receiver \
-                 on the same antenna; the intermediate frequency for an I.F. tap — 9000000 for \
-                 a 9 MHz I.F., 70455000 for a 70.455 MHz one.\n\nThis is not the Converter field \
+                "How far above this radio's dial the receiver sits, in hertz — 0 for a \
+                 receiver on the same antenna. For an I.F. tap, the intermediate frequency the \
+                 receiver is parked on: 8215000 for a K3's KXV3B, 9000000 for a 9 MHz I.F.\n\nThis is not the Converter field \
                  above, which retunes the radio, and not the CAT tab's I/Q centre offset, which \
                  is about this radio's own sound card. Nothing typed here is ever sent to \
                  either radio.\n\nTakes effect on Apply.",

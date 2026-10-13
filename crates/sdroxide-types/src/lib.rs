@@ -9,6 +9,7 @@ mod ais;
 mod alert;
 mod aprs;
 mod atchat;
+mod audio;
 mod awards;
 mod band;
 mod band_segments;
@@ -98,6 +99,7 @@ pub use aprs::{
     AprsSymbolKind, AprsTraffic, AprsWeather,
 };
 pub use atchat::{AtChatChatLine, AtChatFile, AtChatRosterEntry, AtChatStatus, AtChatTransfer};
+pub use audio::AudioRouting;
 pub use awards::{
     Awards, Coverage, EntitySlot, Highlight, LogIndex, Novelty, Status as AwardStatus, US_STATES,
     compute_awards, counts, coverage_counts, entity_coverage, entity_name,
@@ -125,16 +127,16 @@ pub use controller::{AudioDevices, PeerRadio, RadioController, RadioEvent};
 pub use digi::{
     ACARS_MESSAGE_MAX, AcarsMessage, AcarsStatus, CONTEST_SERIAL_MAX, ClockHealth, ContestMode,
     CwMacro, CwStatus, Decode, DecodeSort, DigiConfig, DigiStatus, DxpedMode, FOX_MAX_SLOTS,
-    FOX_ZONE_MAX_HZ, FoxCaller, FsqHeard, FsqMsg, HOUND_ZONE_MAX_HZ, HellVariant,
+    FOX_ZONE_MAX_HZ, FoxCaller, FsqHeard, FsqMsg, Ft8Depth, HOUND_ZONE_MAX_HZ, HellVariant,
     NAVTEX_MESSAGE_MAX, NAVTEX_TONE_HZ, NavtexMessage, NavtexStatus, PACKET_HEARD_MAX,
     PACKET_TERM_LINE_MAX, PACKET_TERM_MAX, PacketBaud, PacketHeard, PacketLink, PacketLinkOwner,
     PacketStatus, PacketTermKind, PacketTermLine, QsoLive, QsoRecord, QsoStep, QueuedCall,
     RTTY_CENTER_HZ, RadeStatus, SstvStyle, TX_AUDIO_LEVEL_MIN, TX_AUDIO_LEVEL_MIN_DB, ThorMode,
-    TranscriptLine, adif_band, adif_records, adif_to_qso_log, adif_to_qso_log_counting_swl,
-    clock_health, cq_is_for_us, digi_decode_to_adif_record, digi_decodes_to_adif,
-    digi_decodes_to_csv, eu_vhf_rs, fmt_report, next_contest_serial, qso_log_to_adif,
-    qso_log_to_text, qso_to_adif_record, tx_level_db, tx_level_from_db, utc_ymd_hms, worked_before,
-    ymd_hms_to_unix,
+    TranscriptLine, WsprRadio, adif_band, adif_records, adif_to_qso_log,
+    adif_to_qso_log_counting_swl, clock_health, cq_is_for_us, digi_decode_to_adif_record,
+    digi_decodes_to_adif, digi_decodes_to_csv, eu_vhf_rs, fmt_report, next_contest_serial,
+    qso_log_to_adif, qso_log_to_text, qso_to_adif_record, tx_level_db, tx_level_from_db,
+    utc_ymd_hms, worked_before, ymd_hms_to_unix,
 };
 pub use drm::{
     DrmChannel, DrmCodec, DrmConstellation, DrmRobustness, DrmService, DrmStatus, DrmSync, DrmTime,
@@ -211,8 +213,8 @@ pub use publicsdr::{PublicSdrDirectory, PublicSdrEntry, PublicSdrNetwork};
 pub use q65::Q65Mode;
 pub use qo100::{QO100_BEACON_HZ, Qo100Settings, Qo100Status};
 pub use radio::{
-    AirspyConfig, AirspyDevice, AirspyGain, AirspyHfConfig, AirspyHfDevice, AirspyHfModel, Backend,
-    BandDriveTrim, CAT_IQ_DC_BLOCK_MAX_HZ, CAT_IQ_RATES, CAT_SCOPE_MIN_BAUD,
+    AirspyConfig, AirspyDevice, AirspyGain, AirspyHfConfig, AirspyHfDevice, AirspyHfModel,
+    AudioRoute, Backend, BandDriveTrim, CAT_IQ_DC_BLOCK_MAX_HZ, CAT_IQ_RATES, CAT_SCOPE_MIN_BAUD,
     CONVERTER_OFFSET_MAX_HZ, CONVERTER_PRESETS, CatConfig, CatFamily, ConverterTx, CwKeying,
     DIV_FREEZE_ELEMENT, DIV_MODE_ELEMENT, DIV_RATE_ELEMENT, DIV_RESET_ELEMENT, DIV_TAPS_ELEMENT,
     DIVERSITY_MAX_TAPS, DigiMode, DiversityMode, ELAD_ATTENUATOR_DB, ELAD_CAT_BAUDS,
@@ -251,7 +253,7 @@ pub use rifp::{
     RifpSize, RifpStatus,
 };
 pub use rigctld::RigctldConfig;
-pub use rotator::RotatorConfig;
+pub use rotator::{RotatorConfig, RotatorProtocol};
 pub use satcfg::{
     CELESTRAK_GROUPS, CelestrakGroup, CustomTle, OrbitRings, Passband, SatConfig, SatFreqs,
     SatLink, TleSubStatus, TleSubscription, fmt_mhz as fmt_sat_mhz, parse_tle_block,
@@ -301,7 +303,7 @@ pub use winlink::{
     DEFAULT_CMS_ADDRESS, MAIL_PAGE_MAX, MailAttachment, MailDraft, MailEntry, MailFolder,
     MailListing, MailMessage, WinlinkConfig, WinlinkGateway, WinlinkLane, WinlinkStatus,
 };
-pub use wsjtx::{N1mmConfig, WsjtxConfig};
+pub use wsjtx::{CwTextConfig, N1mmConfig, WsjtxConfig};
 pub use wspr::{
     BURST_S as WSPR_BURST_S, DEFAULT_TX_HZ as WSPR_DEFAULT_TX_HZ, POWERS_DBM as WSPR_POWERS_DBM,
     POWERS_W as WSPR_POWERS_W, SLOT_S as WSPR_SLOT_S, TX_OFFSET_S as WSPR_TX_OFFSET_S,

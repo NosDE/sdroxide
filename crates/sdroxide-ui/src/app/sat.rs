@@ -31,6 +31,8 @@ use crate::theme::ThemedScroll;
 pub(in crate::app) enum SatTab {
     #[default]
     Satellites,
+    /// Every upcoming pass of every workable satellite, in time order (#623).
+    Passes,
     Qo100,
 }
 
@@ -52,7 +54,35 @@ pub(in crate::app) struct SatWinState {
     /// single slot would rebuild itself twice a frame.
     lock_curve: Option<PassCurve>,
     pick_curve: Option<PassCurve>,
+    passes: PassTable,
 }
+
+/// The PASSES page's table, filled a few satellites per frame so a long list
+/// never stalls the window and the browser build needs no thread.
+#[derive(Default)]
+struct PassTable {
+    /// What it was computed for: the list (by its build time), the QTH, the
+    /// window and the filters. Any change starts it over.
+    key: Option<(i64, (i64, i64), u32, i32, bool)>,
+    /// When it was started, which is also where the search window opens.
+    from_unix: i64,
+    /// The next satellite of the list to search.
+    next: usize,
+    rows: Vec<PassRow>,
+    span_h: u32,
+    min_el: f64,
+    all: bool,
+}
+
+struct PassRow {
+    norad_id: u64,
+    name: String,
+    pass: sdroxide_solar::satellites::Pass,
+}
+
+/// How long a pass table is trusted: elements and the clock barely move the
+/// passes within an hour, and the ones already over are dropped as they end.
+const PASS_TABLE_FRESH_S: i64 = 3600;
 
 /// The parsed satellite list, rebuilt when the station's satellite config
 /// changes or ages out (a TLE refresh rewrites the caches underneath it).
@@ -305,6 +335,18 @@ fn hhmm(unix: i64) -> String {
     format!("{h:02}:{mi:02}")
 }
 
+/// `13:08 UTC (14:08 local)` — a pass time in both zones. Pass times are UTC,
+/// and read as local they are wrong by the operator's offset (#635), so the
+/// local clock goes beside it wherever the two differ.
+fn utc_and_local(unix: i64) -> String {
+    let offset = crate::time::local_offset_at(unix);
+    if offset == 0 {
+        format!("{} UTC", hhmm(unix))
+    } else {
+        format!("{} UTC ({} local)", hhmm(unix), hhmm(unix + offset))
+    }
+}
+
 /// Paint the pass profile: elevation up the side, the clock and the compass
 /// along the bottom, and a marker down the arc at the satellite's present
 /// position.
@@ -526,10 +568,14 @@ fn pass_diagram(ui: &mut egui::Ui, curve: &PassCurve, now: i64, height: f32) {
 }
 
 /// The mode a link's published emission maps onto. Satellite SSB convention
-/// is USB on the downlink, whatever the band.
+/// is USB on the downlink, whatever the band. An SSTV downlink is FM on V/UHF,
+/// and tuning it as plain NFM would leave the picture undecoded (#622).
 fn mode_for_link(l: &sdroxide_types::SatLink) -> Mode {
     let m = l.mode.to_ascii_uppercase();
-    if m.contains("FM") || m.contains("APT") {
+    let sstv = m.contains("SSTV") || l.label.to_ascii_uppercase().contains("SSTV");
+    if sstv && m.contains("FM") {
+        Mode::SstvFm
+    } else if m.contains("FM") || m.contains("APT") {
         Mode::Nfm
     } else if m.contains("SSB") || m.contains("BPSK") || m.contains("GMSK") || m.contains("AX.25") {
         Mode::Usb
@@ -623,6 +669,7 @@ impl SdroxideApp {
         crate::chrome::tab_bar(ui, |ui, bar| {
             for (tab, label) in [
                 (SatTab::Satellites, live(locked, "SATELLITES")),
+                (SatTab::Passes, "PASSES".to_string()),
                 (SatTab::Qo100, live(hunting, "QO-100")),
             ] {
                 if bar.tab(ui, self.sat_tab == tab, label).clicked() {
@@ -636,6 +683,7 @@ impl SdroxideApp {
 
         match self.sat_tab {
             SatTab::Satellites => self.sat_page(ui, win, cmds),
+            SatTab::Passes => self.sat_passes_page(ui, win),
             // Its own scroll area: the beacon page is a 130 pt waterfall plus a
             // grid plus the telemetry frame, which is taller than this window
             // opens at, and the satellite page below sizes itself.
@@ -665,6 +713,145 @@ impl SdroxideApp {
             ui.add_space(4.0);
         }
         self.sat_picker(ui, win, cmds);
+    }
+
+    /// Every upcoming pass of every workable satellite over the next day or
+    /// two, soonest first (#623). A row selects the satellite on the
+    /// SATELLITES page, where its diagram, links and lock are.
+    fn sat_passes_page(&mut self, ui: &mut egui::Ui, win: &mut SatWinState) {
+        let dim = |s: &str| RichText::new(s).size(9.5).color(theme::CYAN_DIM());
+        let now = crate::time::now_unix();
+        let stale = win.list.as_ref().is_none_or(|l| {
+            !std::sync::Arc::ptr_eq(&l.cfg, &self.sat_cfg) || now - l.built_unix > MEMO_FRESH_S
+        });
+        if stale {
+            win.list = Some(build_list(&self.sat_cfg, now));
+        }
+        let Some((lat, lon)) = sdroxide_types::grid_to_latlon(&self.my_grid()) else {
+            ui.label(
+                RichText::new("Set your grid for passes (Settings ▸ General).")
+                    .color(theme::YELLOW()),
+            );
+            return;
+        };
+        let t = &mut win.passes;
+        if t.span_h == 0 {
+            t.span_h = 24;
+            t.min_el = 10.0;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(dim("NEXT"));
+            for h in [24u32, 48] {
+                if ui.selectable_label(t.span_h == h, format!("{h} h")).clicked() {
+                    t.span_h = h;
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(dim("PEAK ≥"));
+            ui.add(egui::DragValue::new(&mut t.min_el).range(0.0..=60.0).speed(1.0).suffix("°"));
+            ui.add_space(8.0);
+            crate::chrome::checkbox(ui, &mut t.all, "all satellites").on_hover_text(
+                "Off: only satellites with frequencies on file — the ones you can work — and \
+                 any you pasted in yourself. On: every satellite in the list, which can be \
+                 thousands with a subscription and takes a while to search.",
+            );
+        });
+        ui.add_space(4.0);
+
+        let list = win.list.as_ref().expect("built above");
+        let key = (
+            list.built_unix,
+            ((lat * 1e3) as i64, (lon * 1e3) as i64),
+            t.span_h,
+            t.min_el.round() as i32,
+            t.all,
+        );
+        if t.key != Some(key) || now - t.from_unix > PASS_TABLE_FRESH_S {
+            t.key = Some(key);
+            t.from_unix = now;
+            t.next = 0;
+            t.rows.clear();
+        }
+        // A few milliseconds of searching per frame, then the rest next frame.
+        let started = crate::time::now_unix_f64();
+        let pasted = self.sat_cfg.tle_text();
+        while t.next < list.entries.len() && crate::time::now_unix_f64() - started < 0.006 {
+            let e = &list.entries[t.next];
+            t.next += 1;
+            let Some(sat) = e.sat.as_ref() else { continue };
+            let workable = self.sat_cfg.freqs_for(e.norad_id).is_some()
+                || sdroxide_solar::satfreq::builtin_for(e.norad_id).is_some()
+                || e.tle.as_ref().is_some_and(|(l1, _)| pasted.contains(l1.as_str()));
+            if !t.all && !workable {
+                continue;
+            }
+            let span = f64::from(t.span_h) * 3600.0;
+            if let sdroxide_solar::PassSearch::Passes(p) =
+                sat.next_passes(lat, lon, t.from_unix as f64, span, 64)
+            {
+                for pass in p.into_iter().filter(|p| p.max_el >= t.min_el) {
+                    t.rows.push(PassRow { norad_id: e.norad_id, name: e.name.clone(), pass });
+                }
+            }
+        }
+        let searching = t.next < list.entries.len();
+        if searching {
+            ui.ctx().request_repaint();
+        }
+        t.rows.sort_by_key(|r| r.pass.rise_unix);
+
+        let shown: Vec<&PassRow> = t.rows.iter().filter(|r| r.pass.set_unix > now).collect();
+        if searching {
+            ui.label(dim(&format!("searching… {} of {}", t.next, list.entries.len())));
+        } else if shown.is_empty() {
+            ui.label(dim("No passes in this window. Lower the peak, or widen the window."));
+        }
+        let mut picked = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("sat-passes").num_columns(6).spacing([12.0, 2.0]).striped(true).show(
+                ui,
+                |ui| {
+                    for h in ["SATELLITE", "AOS", "", "LENGTH", "PEAK", "FROM → TO"] {
+                        ui.label(dim(h));
+                    }
+                    ui.end_row();
+                    for r in &shown {
+                        let p = &r.pass;
+                        let up = p.rise_unix <= now;
+                        let name = RichText::new(&r.name).size(11.0);
+                        let name = if up { name.color(theme::GREEN()).strong() } else { name };
+                        if ui.selectable_label(win.selected == Some(r.norad_id), name).clicked() {
+                            picked = Some(r.norad_id);
+                        }
+                        ui.label(RichText::new(utc_and_local(p.rise_unix)).size(10.0));
+                        let when = if up {
+                            RichText::new("● up now").color(theme::GREEN())
+                        } else {
+                            RichText::new(in_words(p.rise_unix - now))
+                        };
+                        ui.label(when.size(10.0));
+                        let len = p.set_unix - p.rise_unix;
+                        ui.label(RichText::new(format!("{}:{:02}", len / 60, len % 60)).size(10.0));
+                        let peak = RichText::new(format!("{:.0}°", p.max_el)).size(10.0);
+                        ui.label(if p.max_el >= 45.0 { peak.color(theme::GREEN()) } else { peak });
+                        ui.label(
+                            RichText::new(format!(
+                                "{} → {}",
+                                sdroxide_solar::satellites::compass(p.rise_az),
+                                sdroxide_solar::satellites::compass(p.set_az)
+                            ))
+                            .size(10.0),
+                        );
+                        ui.end_row();
+                    }
+                },
+            );
+        });
+        if let Some(id) = picked {
+            win.selected = Some(id);
+            win.link_idx = 0;
+            self.sat_tab = SatTab::Satellites;
+        }
     }
 
     /// The live pane: what the engine's lock is doing right now.
@@ -756,11 +943,8 @@ impl SdroxideApp {
                 if let Some(p) = &t.next_pass {
                     if (p.rise_unix..=p.set_unix).contains(&now) {
                         ui.label(dim(&format!(
-                            "Pass until {} UTC · max {:.0}°",
-                            sdroxide_solar::timefmt::ymd_hm(p.set_unix)
-                                .split(' ')
-                                .nth(1)
-                                .unwrap_or(""),
+                            "Pass until {} · max {:.0}°",
+                            utc_and_local(p.set_unix),
                             p.max_el
                         )));
                     }
@@ -768,8 +952,9 @@ impl SdroxideApp {
             }
             (Some(p), false) => {
                 ui.label(dim(&format!(
-                    "Next pass {} UTC ({}) · rises {:.0}° {} · max {:.0}°",
-                    sdroxide_solar::timefmt::ymd_hm(p.rise_unix),
+                    "Next pass {} {} ({}) · rises {:.0}° {} · max {:.0}°",
+                    sdroxide_solar::timefmt::ymd(p.rise_unix),
+                    utc_and_local(p.rise_unix),
                     in_words(p.rise_unix - now),
                     p.rise_az,
                     compass(p.rise_az),
@@ -1219,5 +1404,25 @@ impl SdroxideApp {
         cmds.push(Command::SetMode { rx: sdroxide_types::RxId::Main, mode: mode_for_link(link) });
         cmds.push(Command::SetSatLock(Some(Box::new(cfg.clone()))));
         self.sat_win.sent = Some(cfg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdroxide_types::{Passband, SatLink};
+
+    /// Issue #622: TUNE on the ISS SSTV downlink lands in SSTV-FM, where the
+    /// picture is decoded, rather than plain NFM.
+    #[test]
+    fn an_sstv_downlink_tunes_in_sstv_fm() {
+        let sstv = SatLink::down("SSTV 70 cm", "SSTV FM / PD120", Passband::at(437.550));
+        assert_eq!(mode_for_link(&sstv), Mode::SstvFm);
+        // An operator's own entry may say SSTV only in the label.
+        let own = SatLink::down("SSTV", "FM", Passband::at(145.800));
+        assert_eq!(mode_for_link(&own), Mode::SstvFm);
+        // Voice stays voice.
+        let voice = SatLink::down("FM voice", "FM", Passband::at(145.800));
+        assert_eq!(mode_for_link(&voice), Mode::Nfm);
     }
 }
