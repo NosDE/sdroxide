@@ -1552,8 +1552,8 @@ use sdroxide_types::{
 /// with the EQ itself gaining a high-pass, a second peak and a low-pass, and
 /// `TxState` gaining `voice_test` and `voice_test_len_s`. `Command::SetTxEq`
 /// became `Command::SetTxVoice` in the same position, carrying the whole
-/// chain; `Command::TxVoiceTestRecord` and `Command::TxVoiceTestPlay` are
-/// appended. `Meters` gains `voice` on its tail. Every state broadcast and
+/// chain; `Command::TxVoiceTestRecord`, `Command::TxVoiceTestPlay` and
+/// `Command::TxVoiceTestLive` are appended. `Meters` gains `voice` on its tail. Every state broadcast and
 /// every meter frame changes layout, so both ends have to agree.
 pub const PROTO_VERSION: u16 = 180;
 const VERSION_BYTE: u8 = 0x12;

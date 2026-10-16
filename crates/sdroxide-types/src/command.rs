@@ -1160,4 +1160,11 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     TxVoiceTestPlay(bool),
+    /// Put the live microphone through the voice chain without keying: for
+    /// the meters alone, or for the meters and the speakers. Stops a test
+    /// recording or playback; refused while transmitting, and stopped by the
+    /// next key-down, because the transmitter needs the microphone.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TxVoiceTestLive(crate::TxVoiceLive),
 }

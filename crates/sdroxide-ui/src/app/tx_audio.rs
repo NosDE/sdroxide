@@ -1,7 +1,7 @@
 //! The TX Audio window: the transmit voice chain's controls.
 //!
 //! ```text
-//! mic → [denoise] → Gate → EQ → De-esser → Compressor → Output
+//! mic → mic gain → input gain → [denoise] → Gate → EQ → De-esser → Compressor → Output
 //! ```
 //!
 //! The chain itself runs in the engine (see `sdroxide_dsp::VoiceChain`); this
@@ -14,6 +14,9 @@
 //! The test phrase (REC / PLAY) is recorded raw by the engine and played back
 //! through the chain as it is set *now*, so the operator can say the same
 //! sentence once and then tune against it without keying the transmitter.
+//! LIVE does the same with the microphone itself, to the speakers and the
+//! meters; METERS runs it for the meters alone, which is how levels are set —
+//! there is no monitoring delay to talk against and nothing to feed back.
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Slider, Stroke,
@@ -21,8 +24,8 @@ use eframe::egui::{
 };
 use sdroxide_types::{
     Command, TX_VOICE_TEST_MAX_S, TxCompState, TxDeEssState, TxEqBand, TxEqEdge, TxEqState,
-    TxGateState, TxOutputState, TxVoiceMeters, TxVoiceProfile, TxVoiceStage, TxVoiceState,
-    TxVoiceTest,
+    TxGateState, TxOutputState, TxVoiceLive, TxVoiceMeters, TxVoiceProfile, TxVoiceStage,
+    TxVoiceState, TxVoiceTest,
 };
 
 use crate::app::SdroxideApp;
@@ -110,6 +113,43 @@ impl Ballistics {
     }
 }
 
+/// How long Auto-set listens for.
+const AUTO_LEVEL_S: f64 = 6.0;
+/// Where Auto-set puts the loud end of the voice, dBFS: the level the
+/// presets' gate and compressor thresholds were set for, with room above it
+/// for the peaks a meter window does not catch.
+const AUTO_LEVEL_TARGET_DB: f32 = -10.0;
+/// A meter window quieter than this is a pause, not speech.
+const AUTO_LEVEL_SPEECH_DB: f32 = -50.0;
+/// The fewest speech windows Auto-set will trust.
+const AUTO_LEVEL_MIN_WINDOWS: usize = 10;
+
+/// An Auto-set measurement in progress: input peaks gathered while the
+/// operator talks, turned into an input gain when the time is up.
+struct AutoLevel {
+    started: f64,
+    peaks: Vec<f32>,
+    /// Whether it switched METERS on itself, and so switches it off after.
+    started_live: bool,
+}
+
+/// The input gain that brings the loud end of `peaks` — input meter readings
+/// taken at `current_db` — to [`AUTO_LEVEL_TARGET_DB`], and the level that
+/// loud end was at. The 90th percentile of the speech windows rather than the
+/// maximum, so one plosive does not set the level for every word after it.
+fn auto_level(peaks: &[f32], current_db: f32) -> Result<(f32, f32), &'static str> {
+    let mut speech: Vec<f32> =
+        peaks.iter().copied().filter(|p| p.is_finite() && *p > AUTO_LEVEL_SPEECH_DB).collect();
+    if speech.len() < AUTO_LEVEL_MIN_WINDOWS {
+        return Err("Heard too little speech — talk normally for the whole count and try again.");
+    }
+    speech.sort_by(f32::total_cmp);
+    let loud = speech[(speech.len() - 1) * 9 / 10];
+    let r = TxVoiceState::INPUT_GAIN_DB_RANGE;
+    let gain = ((current_db + AUTO_LEVEL_TARGET_DB - loud) * 2.0).round() / 2.0;
+    Ok((gain.clamp(*r.start(), *r.end()), loud))
+}
+
 /// The window's own state: which page is up, the profile library, and the
 /// meters' ballistics. Everything about the chain itself lives in the engine's
 /// [`TxVoiceState`].
@@ -122,6 +162,8 @@ pub(in crate::app) struct TxAudioUi {
     import_inbox: crate::download::LoadInbox,
     note: Option<String>,
     meters: Ballistics,
+    auto: Option<AutoLevel>,
+    level_note: Option<String>,
 }
 
 impl TxAudioUi {
@@ -135,6 +177,8 @@ impl TxAudioUi {
             import_inbox: Default::default(),
             note: None,
             meters: Ballistics::default(),
+            auto: None,
+            level_note: None,
         }
     }
 
@@ -162,6 +206,7 @@ impl SdroxideApp {
         let voice_mode = self.state.rx[0].mode.allows_voice_keyer();
         let now = ctx.input(|i| i.time);
         let fresh = self.meters.as_ref().and_then(|m| m.voice);
+        let mic_gain = self.state.tx.mic_gain;
         let ui_state = &mut self.tx_audio;
         ui_state.meters.update(now, fresh);
         pick_up_import(ui_state);
@@ -176,6 +221,7 @@ impl SdroxideApp {
             .show(ctx, |ui| {
                 crate::chrome::window_body_bg(ui);
                 header(ui, &mut v, test, test_len, transmitting, cmds);
+                level_row(ui, &mut v, ui_state, mic_gain, test, transmitting, now, fresh, cmds);
                 if !voice_mode {
                     ui.label(
                         RichText::new(
@@ -217,7 +263,10 @@ impl SdroxideApp {
             self.state.tx.voice = v;
             cmds.push(Command::SetTxVoice(v));
         }
-        if self.tx_audio.meters.moving() || test != TxVoiceTest::Idle {
+        if self.tx_audio.meters.moving()
+            || test != TxVoiceTest::Idle
+            || self.tx_audio.auto.is_some()
+        {
             crate::repaint::after_ms(ctx, 50);
         }
         if !open {
@@ -226,8 +275,12 @@ impl SdroxideApp {
             match test {
                 TxVoiceTest::Recording => cmds.push(Command::TxVoiceTestRecord(false)),
                 TxVoiceTest::Playing => cmds.push(Command::TxVoiceTestPlay(false)),
+                TxVoiceTest::Monitoring | TxVoiceTest::Metering => {
+                    cmds.push(Command::TxVoiceTestLive(TxVoiceLive::Off))
+                }
                 TxVoiceTest::Idle => {}
             }
+            self.tx_audio.auto = None;
         }
         self.tx_audio.open = open;
     }
@@ -318,7 +371,61 @@ fn header(
             _ => "no phrase yet".to_string(),
         };
         ui.label(RichText::new(what).weak().size(11.5));
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Live").weak());
+        let monitoring = test == TxVoiceTest::Monitoring;
+        let metering = test == TxVoiceTest::Metering;
+        let live = crate::chrome::chip_accent_enabled(
+            ui,
+            !transmitting || monitoring,
+            monitoring,
+            " 🎧 LIVE ",
+            None,
+            crate::theme::CYAN(),
+            crate::theme::INK_ON_CYAN(),
+        );
+        let live = live.on_hover_text(
+            "Hear your microphone through the chain as you talk, without keying the \
+             transmitter. Use headphones: through speakers it feeds back. You hear yourself \
+             a few tens of milliseconds late, which makes talking awkward — set levels on the \
+             meters, and judge the sound with REC / PLAY. Receive audio is replaced while it \
+             runs; pressing PTT stops it.",
+        );
+        if live.clicked() {
+            let want = if monitoring { TxVoiceLive::Off } else { TxVoiceLive::Audio };
+            cmds.push(Command::TxVoiceTestLive(want));
+        }
+        let meters = crate::chrome::chip_accent_enabled(
+            ui,
+            !transmitting || metering,
+            metering,
+            " METERS ",
+            None,
+            crate::theme::CYAN(),
+            crate::theme::INK_ON_CYAN(),
+        );
+        let meters = meters.on_hover_text(
+            "Run your microphone through the chain for the meters alone: nothing on the \
+             speakers, so no delay to talk against and nothing to feed back. The way to set \
+             mic and input gain, the gate threshold and how hard the compressor works. \
+             Receive audio carries on; pressing PTT stops it.",
+        );
+        if meters.clicked() {
+            let want = if metering { TxVoiceLive::Off } else { TxVoiceLive::Meters };
+            cmds.push(Command::TxVoiceTestLive(want));
+        }
     });
+    if test == TxVoiceTest::Monitoring {
+        ui.label(
+            RichText::new(
+                "Monitoring live — use headphones, or the speakers will feed back into the \
+                 microphone.",
+            )
+            .color(crate::theme::YELLOW())
+            .size(11.5),
+        );
+    }
     ui.label(
         RichText::new(
             "Voice modes only. TCI clients and the digital modes bypass the chain; when it \
@@ -327,6 +434,137 @@ fn header(
         .weak()
         .size(11.0),
     );
+}
+
+/// Mic gain, the profile's input gain, and Auto-set.
+#[allow(clippy::too_many_arguments)]
+fn level_row(
+    ui: &mut egui::Ui,
+    v: &mut TxVoiceState,
+    st: &mut TxAudioUi,
+    mic_gain: f32,
+    test: TxVoiceTest,
+    transmitting: bool,
+    now: f64,
+    fresh: Option<TxVoiceMeters>,
+    cmds: &mut Vec<Command>,
+) {
+    // Gather for a running Auto-set, and finish it when the time is up. A
+    // monitor that stopped under it (PTT, the chip clicked off) ends it — but
+    // not in the first moment, before the engine has answered the request.
+    if let Some(a) = st.auto.as_mut() {
+        if test.is_live()
+            && let Some(f) = fresh
+        {
+            a.peaks.push(f.input_db);
+        }
+        let lost = !test.is_live() && now - a.started > 1.0;
+        if lost || now - a.started >= AUTO_LEVEL_S {
+            let a = st.auto.take().unwrap();
+            if a.started_live && test.is_live() {
+                cmds.push(Command::TxVoiceTestLive(TxVoiceLive::Off));
+            }
+            st.level_note = Some(if lost {
+                "Auto-set stopped: the microphone was taken.".to_string()
+            } else {
+                match auto_level(&a.peaks, v.input_gain_db) {
+                    Ok((gain, loud)) => {
+                        v.input_gain_db = gain;
+                        let clip = if loud > -1.0 {
+                            " The microphone may be clipping before it gets here — turn its \
+                             own gain down if it sounds harsh."
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "Input gain set to {gain:+.1} dB (voice peaks were {loud:.0} dBFS).{clip}"
+                        )
+                    }
+                    Err(e) => e.to_string(),
+                }
+            });
+        }
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().slider_width = 130.0;
+        ui.label(RichText::new("Level").weak());
+        let mic_hover = "The Mic control — the same one as on the transmit bar, shared by every \
+                         profile. 0 dB at its middle, +6 dB at the top.";
+        ui.label("Mic").on_hover_text(mic_hover);
+        let mut mic = mic_gain;
+        let r = crate::chrome::slider_readout(
+            ui,
+            64.0,
+            Slider::new(&mut mic, 0.0..=1.0)
+                .custom_formatter(|x, _| mic_gain_text(x as f32))
+                .custom_parser(|t| {
+                    let db: f64 = t.trim().trim_end_matches("dB").trim().parse().ok()?;
+                    Some(10f64.powf(db / 20.0) / 2.0)
+                }),
+        )
+        .on_hover_text(mic_hover);
+        if r.changed() {
+            cmds.push(Command::SetMicGain(mic));
+        }
+        ui.add_space(8.0);
+        let input_hover = "Gain on top of Mic for this microphone, stored with the profile. \
+                           The presets' thresholds assume a voice peaking around \
+                           -10 dBFS on the IN meter; Auto-set puts it there. Stays in under \
+                           BYPASS, and applies to digital voice too: it is level, not \
+                           processing.";
+        ui.label("Input").on_hover_text(input_hover);
+        let measuring = st.auto.is_some();
+        ui.add_enabled_ui(!measuring, |ui| {
+            crate::chrome::slider_readout(
+                ui,
+                64.0,
+                Slider::new(&mut v.input_gain_db, TxVoiceState::INPUT_GAIN_DB_RANGE)
+                    .suffix(" dB")
+                    .max_decimals(1),
+            )
+            .on_hover_text(input_hover);
+        });
+        let label = match &st.auto {
+            Some(a) => {
+                format!("Listening… {:.0} s", (AUTO_LEVEL_S - (now - a.started)).max(0.0).ceil())
+            }
+            None => "Auto-set".to_string(),
+        };
+        let b = ui.add_enabled(!transmitting || measuring, egui::Button::new(label)).on_hover_text(
+            format!(
+                "Talk normally for {AUTO_LEVEL_S:.0} s — the way you would on the air — and \
+                 the input gain is set so your voice peaks around \
+                 {AUTO_LEVEL_TARGET_DB:.0} dBFS. Click again to cancel."
+            ),
+        );
+        if b.clicked() {
+            match st.auto.take() {
+                Some(a) => {
+                    if a.started_live && test.is_live() {
+                        cmds.push(Command::TxVoiceTestLive(TxVoiceLive::Off));
+                    }
+                    st.level_note = Some("Auto-set cancelled.".into());
+                }
+                None => {
+                    let started_live = !test.is_live();
+                    if started_live {
+                        cmds.push(Command::TxVoiceTestLive(TxVoiceLive::Meters));
+                    }
+                    st.auto = Some(AutoLevel { started: now, peaks: Vec::new(), started_live });
+                    st.level_note = Some("Talk now, as you would on the air…".into());
+                }
+            }
+        }
+        if let Some(n) = &st.level_note {
+            ui.label(RichText::new(n).weak().size(11.0));
+        }
+    });
+}
+
+/// The Mic control's 0..=1 as the gain it applies: 50 % is unity, the top +6 dB.
+fn mic_gain_text(x: f32) -> String {
+    if x <= 0.001 { "-∞ dB".to_string() } else { format!("{:+.1} dB", 20.0 * (2.0 * x).log10()) }
 }
 
 /// The left-hand column: the reorderable stages, then the fixed ones.
@@ -977,7 +1215,8 @@ fn meter_strip(ui: &mut egui::Ui, v: &TxVoiceState, m: TxVoiceMeters) {
             );
             ui.label(
                 RichText::new(
-                    "Meters move while you transmit a voice over or play the test phrase.",
+                    "Meters move while you transmit a voice over, play the test phrase, or \
+                     run LIVE or METERS.",
                 )
                 .weak()
                 .size(10.5),
@@ -988,127 +1227,277 @@ fn meter_strip(ui: &mut egui::Ui, v: &TxVoiceState, m: TxVoiceMeters) {
 
 // ── Profiles ───────────────────────────────────────────────────────────────
 
+/// One built-in starting point.
+struct Preset {
+    name: &'static str,
+    /// What it is for, for the button's hover.
+    about: &'static str,
+    voice: TxVoiceState,
+}
+
 /// Built-in starting points — tune from here, don't just load and transmit.
-fn starting_points() -> Vec<(&'static str, TxVoiceState)> {
+///
+/// Named for what the operator is doing rather than for a microphone: the
+/// microphone is what input gain is for, and every threshold here assumes a
+/// voice peaking around [`AUTO_LEVEL_TARGET_DB`] on the IN meter, which is
+/// where Auto-set puts it. Loading one keeps the operator's input gain.
+fn starting_points() -> Vec<Preset> {
     let base = TxVoiceState::default();
-    let dynamic_male = TxVoiceState {
-        gate: TxGateState {
-            enabled: true,
-            threshold_db: -40.0,
-            ratio: 2.5,
-            release_ms: 80.0,
-            floor_db: -15.0,
-            ..Default::default()
-        },
-        eq: TxEqState {
-            enabled: true,
-            hpf: TxEqEdge { enabled: true, freq_hz: 80.0, steep: false },
-            low: TxEqBand { freq_hz: 200.0, gain_db: -3.0, q: 0.7 },
-            mid: TxEqBand { freq_hz: 2000.0, gain_db: 3.0, q: 1.0 },
-            mid2: TxEqBand { freq_hz: 3500.0, gain_db: 1.0, q: 1.0 },
-            lpf: TxEqEdge { enabled: true, freq_hz: 3100.0, steep: false },
-            ..Default::default()
-        },
-        deess: TxDeEssState {
-            enabled: true,
-            freq_hz: 5000.0,
-            q: 2.0,
-            threshold_db: -25.0,
-            amount_db: -6.0,
-            ..Default::default()
-        },
+    let limiter = TxOutputState { limiter: true, ceiling_db: -1.0, trim_db: 0.0 };
+    let expander = |threshold_db: f32, floor_db: f32| TxGateState {
+        enabled: true,
+        threshold_db,
+        floor_db,
+        ratio: 2.0,
+        release_ms: 120.0,
+        ..Default::default()
+    };
+    let hpf = |freq_hz: f32, steep: bool| TxEqEdge { enabled: true, freq_hz, steep };
+    let band = |freq_hz: f32, gain_db: f32, q: f32| TxEqBand { freq_hz, gain_db, q };
+    let flat = TxEqState::default();
+
+    let natural = TxVoiceState {
+        denoise: true,
+        gate: expander(-50.0, -10.0),
+        eq: TxEqState { enabled: true, hpf: hpf(80.0, false), ..flat },
         comp: TxCompState {
             enabled: true,
-            threshold_db: -20.0,
-            ratio: 4.0,
-            attack_ms: 25.0,
-            release_ms: 150.0,
-            makeup_db: 5.0,
+            threshold_db: -18.0,
+            ratio: 2.0,
+            attack_ms: 20.0,
+            release_ms: 200.0,
+            knee_db: 8.0,
+            makeup_db: 3.0,
             ..Default::default()
         },
-        output: TxOutputState { limiter: true, ceiling_db: -1.0, trim_db: 0.0 },
+        output: limiter,
         ..base
     };
-    let condenser_female = TxVoiceState {
-        gate: TxGateState {
-            enabled: true,
-            threshold_db: -45.0,
-            ratio: 2.0,
-            release_ms: 60.0,
-            floor_db: -15.0,
-            ..Default::default()
-        },
+    let ssb = TxVoiceState {
+        gate: expander(-45.0, -15.0),
         eq: TxEqState {
             enabled: true,
-            hpf: TxEqEdge { enabled: true, freq_hz: 100.0, steep: false },
-            mid: TxEqBand { freq_hz: 400.0, gain_db: -2.0, q: 1.0 },
-            mid2: TxEqBand { freq_hz: 3000.0, gain_db: -2.0, q: 1.0 },
-            high: TxEqBand { freq_hz: 4000.0, gain_db: 2.0, q: 0.7 },
-            lpf: TxEqEdge { enabled: true, freq_hz: 3100.0, steep: false },
-            ..Default::default()
-        },
-        deess: TxDeEssState {
-            enabled: true,
-            freq_hz: 7000.0,
-            q: 2.5,
-            threshold_db: -22.0,
-            amount_db: -8.0,
-            ..Default::default()
+            hpf: hpf(100.0, false),
+            low: band(250.0, -2.0, 0.7),
+            mid: band(2000.0, 3.0, 1.0),
+            lpf: hpf(2900.0, false),
+            ..flat
         },
         comp: TxCompState {
             enabled: true,
             threshold_db: -20.0,
             ratio: 3.0,
-            attack_ms: 20.0,
-            release_ms: 120.0,
-            makeup_db: 4.0,
+            attack_ms: 15.0,
+            release_ms: 150.0,
+            makeup_db: 5.0,
             ..Default::default()
         },
-        output: TxOutputState { limiter: true, ceiling_db: -1.0, trim_db: 0.0 },
+        output: limiter,
+        ..base
+    };
+    // Everything the voice has below 300 Hz or above 2.7 kHz is power spent
+    // on what a weak-signal listener's filter throws away, so it goes, and
+    // what is left is pushed hard: drive into a fast compressor, the phase
+    // rotator to even out the peaks, the limiter to hold them.
+    let punch = TxVoiceState {
+        gate: TxGateState {
+            threshold_db: -40.0,
+            ratio: 3.0,
+            floor_db: -20.0,
+            ..expander(0.0, 0.0)
+        },
+        eq: TxEqState {
+            enabled: true,
+            hpf: hpf(300.0, true),
+            mid: band(800.0, -2.0, 1.0),
+            mid2: band(2300.0, 5.0, 1.2),
+            lpf: hpf(2700.0, true),
+            ..flat
+        },
+        comp: TxCompState {
+            enabled: true,
+            threshold_db: -26.0,
+            ratio: 6.0,
+            attack_ms: 5.0,
+            release_ms: 120.0,
+            makeup_db: 9.0,
+            drive_db: 4.0,
+            phase_stages: 4,
+            ..Default::default()
+        },
+        output: limiter,
         ..base
     };
     let contest = TxVoiceState {
+        denoise: true,
         gate: TxGateState {
-            enabled: true,
             threshold_db: -35.0,
+            hold_ms: 50.0,
             release_ms: 100.0,
-            ..Default::default()
+            ..expander(0.0, 0.0)
         }
         .as_gate(),
+        comp: TxCompState {
+            threshold_db: -26.0,
+            ratio: 8.0,
+            makeup_db: 10.0,
+            drive_db: 6.0,
+            ..punch.comp
+        },
+        ..punch
+    };
+    let essb = TxVoiceState {
+        gate: expander(-50.0, -12.0),
         eq: TxEqState {
             enabled: true,
-            hpf: TxEqEdge { enabled: true, freq_hz: 200.0, steep: true },
-            mid: TxEqBand { freq_hz: 1000.0, gain_db: -3.0, q: 1.0 },
-            mid2: TxEqBand { freq_hz: 2500.0, gain_db: 5.0, q: 1.0 },
-            lpf: TxEqEdge { enabled: true, freq_hz: 2900.0, steep: true },
-            ..Default::default()
+            hpf: hpf(50.0, false),
+            low: band(120.0, 2.0, 0.7),
+            mid: band(350.0, -2.0, 1.2),
+            mid2: band(3000.0, 2.0, 0.8),
+            high: band(4000.0, 2.0, 0.7),
+            lpf: hpf(4000.0, true),
         },
         deess: TxDeEssState {
             enabled: true,
-            freq_hz: 5000.0,
-            q: 2.0,
-            threshold_db: -20.0,
-            amount_db: -9.0,
+            freq_hz: 6500.0,
+            threshold_db: -24.0,
+            amount_db: -6.0,
             ..Default::default()
         },
         comp: TxCompState {
             enabled: true,
-            threshold_db: -24.0,
-            ratio: 8.0,
-            attack_ms: 10.0,
-            release_ms: 100.0,
-            makeup_db: 8.0,
-            drive_db: 6.0,
-            phase_stages: 4,
+            threshold_db: -18.0,
+            ratio: 2.5,
+            attack_ms: 20.0,
+            release_ms: 200.0,
+            makeup_db: 4.0,
             ..Default::default()
         },
-        output: TxOutputState { limiter: true, ceiling_db: -1.0, trim_db: 0.0 },
+        output: limiter,
+        ..base
+    };
+    // The steep 300 Hz high-pass keeps the voice off the 67–254 Hz the
+    // CTCSS tone lives in, where a repeater's decoder is listening; the
+    // limiter sits a little lower than elsewhere because on FM a peak is
+    // deviation, and over-deviation is splatter into the next channel.
+    let fm = TxVoiceState {
+        eq: TxEqState {
+            enabled: true,
+            hpf: hpf(300.0, true),
+            mid2: band(2500.0, 2.0, 1.0),
+            lpf: hpf(3000.0, true),
+            ..flat
+        },
+        comp: TxCompState {
+            enabled: true,
+            threshold_db: -20.0,
+            ratio: 3.0,
+            attack_ms: 10.0,
+            release_ms: 150.0,
+            makeup_db: 4.0,
+            ..Default::default()
+        },
+        output: TxOutputState { ceiling_db: -2.0, ..limiter },
+        ..base
+    };
+    let mobile = TxVoiceState {
+        denoise: true,
+        gate: TxGateState {
+            threshold_db: -35.0,
+            hold_ms: 50.0,
+            release_ms: 120.0,
+            ..expander(0.0, 0.0)
+        }
+        .as_gate(),
+        eq: TxEqState {
+            enabled: true,
+            hpf: hpf(150.0, true),
+            low: band(300.0, -2.0, 0.7),
+            mid2: band(2200.0, 3.0, 1.0),
+            lpf: hpf(3000.0, false),
+            ..flat
+        },
+        comp: TxCompState {
+            enabled: true,
+            threshold_db: -22.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 150.0,
+            makeup_db: 6.0,
+            ..Default::default()
+        },
+        output: limiter,
+        ..base
+    };
+    // A vocoder is trained on natural speech: clean it, keep the level even,
+    // and leave its tone alone. The one preset that turns digital voice on.
+    let digital = TxVoiceState {
+        denoise: true,
+        comp: TxCompState {
+            enabled: true,
+            threshold_db: -15.0,
+            ratio: 2.0,
+            attack_ms: 20.0,
+            release_ms: 250.0,
+            knee_db: 8.0,
+            makeup_db: 2.0,
+            ..Default::default()
+        },
+        output: limiter,
+        digital_voice: true,
         ..base
     };
     vec![
-        ("Dynamic mic, male voice", dynamic_male),
-        ("Condenser mic, female voice", condenser_female),
-        ("Contest / DX punch", contest),
+        Preset {
+            name: "Natural",
+            about: "Ragchews and local contacts: the denoiser, a gentle expander in the pauses, \
+                    light compression. Sounds like you, minus the room.",
+            voice: natural,
+        },
+        Preset {
+            name: "SSB everyday",
+            about: "Everyday SSB: 100 Hz – 2.9 kHz, a little presence around 2 kHz, \
+                    moderate compression.",
+            voice: ssb,
+        },
+        Preset {
+            name: "SSB punch / DX",
+            about: "Weak signals and pileups: a narrow 300 Hz – 2.7 kHz voice with a strong \
+                    presence lift, driven into a fast compressor with the phase rotator, for \
+                    the most talk power the transmitter has. Not hi-fi.",
+            voice: punch,
+        },
+        Preset {
+            name: "Contest",
+            about: "SSB punch for hours in a noisy station: the denoiser and a hard gate keep \
+                    fans and the next operator out of your pauses, and the compressor works \
+                    harder still.",
+            voice: contest,
+        },
+        Preset {
+            name: "ESSB / hi-fi",
+            about: "Wide SSB or AM: 50 Hz – 4 kHz with the low end kept, gentle compression \
+                    and a de-esser. Needs a transmit filter that wide — and a quiet band.",
+            voice: essb,
+        },
+        Preset {
+            name: "FM / repeater",
+            about: "FM: a steep 300 Hz high-pass keeps the voice clear of the CTCSS tone, the \
+                    top stops at 3 kHz for the channel, and the limiter holds deviation.",
+            voice: fm,
+        },
+        Preset {
+            name: "Mobile / noisy shack",
+            about: "Fans, engine, traffic: the denoiser, a steep high-pass at 150 Hz and a hard \
+                    gate, with enough compression to sit above what is left.",
+            voice: mobile,
+        },
+        Preset {
+            name: "Digital voice",
+            about: "FreeDV / RADE: the denoiser and gentle levelling only, no EQ — the vocoder \
+                    prefers natural speech. Turns DIGITAL VOICE on.",
+            voice: digital,
+        },
     ]
 }
 
@@ -1152,9 +1541,9 @@ fn profiles_page(ui: &mut egui::Ui, st: &mut TxAudioUi, v: &mut TxVoiceState) {
     page_title(
         ui,
         "Profiles",
-        "A profile is the whole chain: every stage's settings, which are on, and their \
-         order. Loading one replaces the chain; your microphone gain and drive stay as they \
-         are.",
+        "A profile is the whole chain: every stage's settings, which are on, their \
+         order, and the input gain for your microphone. Loading one replaces the chain; the \
+         Mic control and drive stay as they are.",
     );
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut st.profile_name).hint_text("Name").desired_width(180.0));
@@ -1174,6 +1563,7 @@ fn profiles_page(ui: &mut egui::Ui, st: &mut TxAudioUi, v: &mut TxVoiceState) {
     });
     ui.add_space(4.0);
     let mut load: Option<TxVoiceState> = None;
+    let mut preset: Option<TxVoiceState> = None;
     let mut delete: Option<usize> = None;
     if st.profiles.is_empty() {
         ui.label(
@@ -1213,20 +1603,31 @@ fn profiles_page(ui: &mut egui::Ui, st: &mut TxAudioUi, v: &mut TxVoiceState) {
     ui.label(RichText::new("Starting points").strong());
     ui.label(
         RichText::new(
-            "Tune from here rather than transmitting as loaded: record a phrase and listen \
-             after each change.",
+            "Set your level with Auto-set first — the presets' thresholds assume it — then \
+             tune from here rather than transmitting as loaded: record a phrase and listen \
+             after each change. A preset keeps your input gain.",
         )
         .weak()
         .size(11.0),
     );
     ui.horizontal_wrapped(|ui| {
-        for (name, s) in starting_points() {
-            if ui.button(name).clicked() {
-                load = Some(s);
-                st.note = Some(format!("Loaded the \"{name}\" starting point."));
+        for p in starting_points() {
+            if ui.button(p.name).on_hover_text(p.about).clicked() {
+                preset = Some(p.voice);
+                st.note = Some(format!("Loaded the \"{}\" starting point.", p.name));
             }
         }
     });
+    if let Some(s) = preset {
+        // The operator's input gain is their microphone's level, which a
+        // preset knows nothing about. Digital voice only ever goes on: the
+        // digital-voice preset asks for it, the rest leave it as it was.
+        *v = TxVoiceState {
+            input_gain_db: v.input_gain_db,
+            digital_voice: v.digital_voice || s.digital_voice,
+            ..s.clamped()
+        };
+    }
     if let Some(s) = load {
         // Keep the operator's own routing choices: a profile is about the
         // voice, not about whether digital voice goes through it.
@@ -1247,16 +1648,50 @@ mod tests {
 
     #[test]
     fn starting_points_are_valid_chains() {
-        for (name, s) in starting_points() {
-            assert_eq!(s, s.clamped(), "{name} has a value out of range");
-            assert!(s.active(), "{name} does nothing");
+        for p in starting_points() {
+            assert_eq!(p.voice, p.voice.clamped(), "{} has a value out of range", p.name);
+            assert!(p.voice.active(), "{} does nothing", p.name);
+            assert_eq!(p.voice.input_gain_db, 0.0, "{} would override the input gain", p.name);
         }
+    }
+
+    /// The FM preset exists to keep the voice off the CTCSS tones: its
+    /// high-pass has to be down well below them.
+    #[test]
+    fn the_fm_preset_clears_the_ctcss_tones() {
+        let fm = starting_points().into_iter().find(|p| p.name.starts_with("FM")).unwrap();
+        let r = fm.voice.eq.response_db(CHAIN_RATE, 254.0);
+        assert!(r < -6.0, "only {r:.1} dB down at the top CTCSS tone");
+        assert!(fm.voice.eq.response_db(CHAIN_RATE, 150.0) < -20.0);
+    }
+
+    #[test]
+    fn auto_level_targets_the_loud_end_of_speech() {
+        // Pauses, then speech peaking at -22 dBFS with one plosive at -3.
+        let mut peaks = vec![-70.0; 30];
+        peaks.extend(std::iter::repeat_n(-22.0, 40));
+        peaks.push(-3.0);
+        let (gain, loud) = auto_level(&peaks, 2.0).unwrap();
+        assert_eq!(loud, -22.0);
+        assert_eq!(gain, 14.0);
+        // Too loud already: brought down, but no further than the range.
+        let (gain, _) = auto_level(&[0.0; 20], -10.0).unwrap();
+        assert_eq!(gain, -12.0);
+        // Nobody talked.
+        assert!(auto_level(&[-70.0; 50], 0.0).is_err());
+    }
+
+    #[test]
+    fn mic_gain_reads_in_db() {
+        assert_eq!(mic_gain_text(0.5), "+0.0 dB");
+        assert_eq!(mic_gain_text(1.0), "+6.0 dB");
+        assert_eq!(mic_gain_text(0.0), "-∞ dB");
     }
 
     #[test]
     fn a_profile_round_trips_through_json() {
-        let (name, voice) = starting_points().remove(2);
-        let p = TxVoiceProfile { name: name.into(), voice };
+        let p = starting_points().remove(2);
+        let p = TxVoiceProfile { name: p.name.into(), voice: p.voice };
         let back: TxVoiceProfile =
             serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back, p);

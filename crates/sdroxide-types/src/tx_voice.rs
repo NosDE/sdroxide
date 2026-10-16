@@ -3,9 +3,14 @@
 //! modulates its own audio, the sound card / network stream that carries it).
 //!
 //! ```text
-//! mic → mic gain → [denoise] → Gate → EQ → De-esser → Compressor → Output
-//!                              └──── reorderable (`order`) ────┘   (limiter, trim)
+//! mic → mic gain → input gain → [denoise] → Gate → EQ → De-esser → Compressor → Output
+//!                                           └──── reorderable (`order`) ────┘   (limiter, trim)
 //! ```
+//!
+//! Input gain is level setting rather than processing: it brings a particular
+//! microphone up (or down) to the level the stages' thresholds are set for, so
+//! it travels with a profile, stays in under BYPASS, and applies to digital
+//! voice whether or not the rest of the chain does.
 //!
 //! Every stage is off by default and the chain as shipped is unity gain, so a
 //! first-time operator transmits exactly what they did before the chain
@@ -498,6 +503,12 @@ pub struct TxVoiceState {
     /// default: a vocoder is trained on natural speech and may well decode
     /// worse from a heavily processed voice, so this is the operator's call.
     pub digital_voice: bool,
+    /// Gain in dB between the mic-gain control and the first stage. The Mic
+    /// slider is a shared, MIDI-mappable control with only 6 dB of headroom;
+    /// this is what the profile for a given microphone needs on top of it so
+    /// the gate and compressor thresholds sit where they were set. Applied
+    /// with mic gain, outside [`Self::active`] — see the module docs.
+    pub input_gain_db: f32,
 }
 
 impl Default for TxVoiceState {
@@ -512,11 +523,20 @@ impl Default for TxVoiceState {
             comp: TxCompState::default(),
             output: TxOutputState::default(),
             digital_voice: false,
+            input_gain_db: 0.0,
         }
     }
 }
 
 impl TxVoiceState {
+    pub const INPUT_GAIN_DB_RANGE: RangeInclusive<f32> = -12.0..=24.0;
+
+    /// [`Self::input_gain_db`] as a linear factor, for multiplying into mic
+    /// gain.
+    pub fn input_gain(&self) -> f32 {
+        10f32.powf(self.input_gain_db / 20.0)
+    }
+
     /// Whether any stage would touch the audio. False means the chain is a
     /// straight wire and the engine can skip it.
     pub fn active(&self) -> bool {
@@ -563,6 +583,7 @@ impl TxVoiceState {
             comp: self.comp.clamped(),
             output: self.output.clamped(),
             digital_voice: self.digital_voice,
+            input_gain_db: fit(self.input_gain_db, &Self::INPUT_GAIN_DB_RANGE, 0.0),
         }
     }
 }
@@ -588,6 +609,29 @@ pub enum TxVoiceTest {
     Recording,
     /// Playing the phrase through the chain to the speakers.
     Playing,
+    /// The live microphone through the chain to the speakers, with the
+    /// meters running.
+    Monitoring,
+    /// The live microphone through the chain for the meters alone — no
+    /// audio, so no monitoring delay to talk against and nothing to feed back.
+    Metering,
+}
+
+impl TxVoiceTest {
+    /// Whether the live microphone is going through the test chain.
+    pub fn is_live(self) -> bool {
+        matches!(self, TxVoiceTest::Monitoring | TxVoiceTest::Metering)
+    }
+}
+
+/// What [`crate::Command::TxVoiceTestLive`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxVoiceLive {
+    Off,
+    /// Meters only.
+    Meters,
+    /// Meters, and the processed voice on the speakers.
+    Audio,
 }
 
 /// The longest test phrase kept, in seconds.
@@ -644,6 +688,27 @@ mod tests {
         let c = s.clamped();
         assert_eq!(c.comp.ratio, TxCompState::default().ratio);
         assert_eq!(c.gate.threshold_db, -80.0);
+    }
+
+    #[test]
+    fn input_gain_is_clamped_and_kept_out_of_active() {
+        let s = TxVoiceState { input_gain_db: 40.0, ..Default::default() }.clamped();
+        assert_eq!(s.input_gain_db, 24.0);
+        // Level setting, not processing: the chain stays a straight wire.
+        assert!(!s.active());
+        assert!(
+            (TxVoiceState { input_gain_db: 6.0, ..Default::default() }.input_gain() - 1.995).abs()
+                < 1e-3
+        );
+    }
+
+    /// A chain saved before input gain existed loads at unity.
+    #[test]
+    fn a_chain_without_input_gain_loads_at_unity() {
+        let mut v = serde_json::to_value(TxVoiceState::default()).unwrap();
+        v.as_object_mut().unwrap().remove("input_gain_db");
+        let s: TxVoiceState = serde_json::from_value(v).unwrap();
+        assert_eq!(s.input_gain_db, 0.0);
     }
 
     /// A `session.json` written before the voice chain held only the three

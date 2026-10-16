@@ -336,6 +336,25 @@ fn meters_report_once_per_window() {
     assert!(chain.take_meters().is_none());
 }
 
+/// The test chain meters an idle chain — the input meter is how a level is
+/// set before any stage is on — and still leaves the audio alone; the air
+/// chain reports nothing while idle.
+#[test]
+fn an_idle_chain_meters_only_when_asked() {
+    let mut chain = VoiceChain::new();
+    let src = tone(500.0, 0.25, 480);
+    let mut audio = src.clone();
+    chain.process(&mut audio);
+    assert!(chain.take_meters().is_none());
+    chain.set_meter_idle(true);
+    chain.process(&mut audio);
+    assert_eq!(audio, src);
+    let m = chain.take_meters().unwrap();
+    assert!((m.input_db - db(0.25)).abs() < 0.1);
+    assert_eq!(m.input_db, m.output_db);
+    assert_eq!(m.comp_gr_db, 0.0);
+}
+
 /// Turning a stage on mid-over starts it clean: a compressor last run minutes
 /// ago must not open on whatever gain reduction it was holding then.
 #[test]

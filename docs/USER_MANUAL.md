@@ -1399,7 +1399,7 @@ On a TX-capable rig the **Transmit** module appears:
 
 **Transmit audio** is the microphone processing chain: a noise gate, an
 equalizer, a de-esser, a compressor and an output limiter, all between **Mic**
-gain and the modulator. Open the **TX Audio** window by clicking the **Mic**
+gain (plus the chain's own **Input** gain) and the modulator. Open the **TX Audio** window by clicking the **Mic**
 label in the transmit box (it turns cyan while the chain is doing something),
 or from Settings → Radio → **Open TX Audio…**. Everything is off the first time,
 and with everything off the chain is a straight wire: the audio leaves exactly
@@ -1423,6 +1423,32 @@ its name to see its settings. **Output** is always last. Across the top:
   through the chain as it is set now, without transmitting. What is recorded is
   the raw microphone, so you can change a setting and play the same phrase
   again to hear what the change did.
+- **🎧 LIVE** puts your microphone through the chain as you talk and plays it
+  to you, without transmitting. **Use headphones**: through speakers it feeds
+  back into the microphone. You hear yourself a few tens of milliseconds late,
+  which makes talking awkward, so use LIVE for a quick check and REC / PLAY to
+  judge the sound. Receive audio is replaced while it runs.
+- **METERS** does the same for the meters only: nothing on the speakers, so no
+  delay to talk against and nothing to feed back. This is the way to set your
+  levels, the gate threshold and how hard the compressor works. Receive audio
+  carries on.
+
+  LIVE and METERS stop when you press PTT (the transmitter needs the
+  microphone), and are not available while transmitting.
+
+Under that is the **Level** row:
+
+- **Mic** is the same control as the Mic rail in the transmit box, shown here in
+  dB: 0 dB at the middle, +6 dB at the top. It is shared by every profile.
+- **Input** is extra gain for this microphone, from −12 to +24 dB, and it is
+  saved with the profile. Use it when Mic at the top is still not enough. It is
+  level setting, not processing, so BYPASS leaves it in, and it applies to
+  FreeDV/RADE even when DIGITAL VOICE is off.
+- **Auto-set** listens for six seconds while you talk as you would on the air,
+  then sets Input so your voice peaks around −10 dBFS on the IN meter. It
+  switches METERS on for the measurement if it is not already on. The presets'
+  gate and compressor thresholds assume that level, so run Auto-set before
+  loading one.
 
 The stages:
 
@@ -1454,13 +1480,29 @@ The stages:
   limiter looks ahead, so no peak ever gets past the ceiling.
 
 The meters show the level going in and coming out, and how much each stage is
-turning the audio down right now.
+turning the audio down right now. They move while you transmit, play the test
+phrase, or run LIVE or METERS.
 
-**Profiles** save the chain under a name and load it back. **Export** and
-**Import** carry a profile across as a JSON file. A profile does not change
-the DIGITAL VOICE switch. The three **Starting points** (dynamic mic and male
-voice, condenser mic and female voice, contest/DX punch) are only that: record
-a phrase and tune from them. Your saved profiles live in
+**Profiles** save the chain, including its Input gain, under a name and load it
+back. **Export** and **Import** carry a profile across as a JSON file. A profile
+does not change the DIGITAL VOICE switch.
+
+The **Starting points** are named for what you are doing, not for a
+microphone (Input gain takes care of the microphone). Loading one keeps your
+Input gain. They are only starting points: record a phrase and tune from them.
+
+| Preset | For | What it does |
+|---|---|---|
+| **Natural** | Ragchews, local contacts | Denoise, 80 Hz high-pass, gentle expander, light 2:1 compression, limiter |
+| **SSB everyday** | Normal SSB | 100 Hz – 2.9 kHz, a little presence at 2 kHz, 3:1 compression, limiter |
+| **SSB punch / DX** | Weak signals, pileups | Narrow 300 Hz – 2.7 kHz, strong presence lift, Drive into a fast 6:1 compressor with Phase, limiter. Most talk power, not hi-fi. |
+| **Contest** | Long sessions in a noisy station | SSB punch plus denoise, a hard gate and harder compression |
+| **ESSB / hi-fi** | Wide SSB, AM | 50 Hz – 4 kHz with the low end kept, de-esser, gentle compression. Needs a transmit filter that wide. |
+| **FM / repeater** | FM | Steep 300 Hz high-pass to keep the voice clear of the CTCSS tone (67–254 Hz), stops at 3 kHz for the channel, limiter at −2 dB to hold deviation |
+| **Mobile / noisy shack** | Fans, engine, traffic | Denoise, steep 150 Hz high-pass, hard gate, 4:1 compression |
+| **Digital voice** | FreeDV / RADE | Denoise and gentle levelling only, no EQ. Also turns DIGITAL VOICE on. |
+
+Your saved profiles live in
 `tx_audio_profiles.json` on the machine the window runs on. The chain as it is
 set now is part of the radio state, so it comes back after a restart and is
 saved in station profiles.

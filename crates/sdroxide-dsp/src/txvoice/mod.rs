@@ -42,6 +42,8 @@ pub struct VoiceChain {
     in_peak: f32,
     out_peak: f32,
     metered: bool,
+    /// Meter the audio even when no stage is on. See [`Self::set_meter_idle`].
+    meter_idle: bool,
 }
 
 impl VoiceChain {
@@ -57,6 +59,7 @@ impl VoiceChain {
             in_peak: 0.0,
             out_peak: 0.0,
             metered: false,
+            meter_idle: false,
         };
         let cfg = chain.cfg;
         chain.retune(&cfg);
@@ -123,13 +126,26 @@ impl VoiceChain {
         }
     }
 
+    /// Report levels from [`Self::take_meters`] even while the chain is a
+    /// straight wire. For the TX Audio window's test chain, whose input meter
+    /// is how an operator sets the microphone level before any stage is on;
+    /// the chain on the air path leaves it off and reports nothing when idle.
+    pub fn set_meter_idle(&mut self, on: bool) {
+        self.meter_idle = on;
+    }
+
     /// Run one block through the chain, in place.
     pub fn process(&mut self, audio: &mut [f32]) {
-        if !self.cfg.active() {
+        let active = self.cfg.active();
+        if !active && !self.meter_idle {
             return;
         }
         self.metered = true;
         self.in_peak = audio.iter().fold(self.in_peak, |m, s| m.max(s.abs()));
+        if !active {
+            self.out_peak = self.in_peak;
+            return;
+        }
         if self.cfg.denoise
             && let Some(d) = self.denoise.as_mut()
         {

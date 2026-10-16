@@ -284,7 +284,8 @@ pub use tciserver::TciServerConfig;
 pub use tone::{CTCSS_TONES, SubTone};
 pub use tx_voice::{
     TX_VOICE_TEST_MAX_S, TxCompState, TxDeEssState, TxEqBand, TxEqEdge, TxEqState, TxGateState,
-    TxOutputState, TxVoiceMeters, TxVoiceProfile, TxVoiceStage, TxVoiceState, TxVoiceTest,
+    TxOutputState, TxVoiceLive, TxVoiceMeters, TxVoiceProfile, TxVoiceStage, TxVoiceState,
+    TxVoiceTest,
 };
 pub use ui::{
     BandplanKind, ChromeStyle, FontSize, LayoutMode, SmeterStyle, Solar3dWindow, SpectrumDetail,
