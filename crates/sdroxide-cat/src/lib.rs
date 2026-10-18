@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use sdroxide_types::{
-    CatConfig, CatFamily, CwKeying, DigiMode, LineState, Mode, ModeControl, Parity, PttMethod,
-    SoundFormat, StopBits, TxTelemetry,
+    AgcMode, CatConfig, CatFamily, CwKeying, DigiMode, LineState, Mode, ModeControl, Parity,
+    PttMethod, SoundFormat, StopBits, TxTelemetry,
 };
 use tracing::{info, warn};
 
@@ -370,6 +370,19 @@ trait Protocol: Send {
         false
     }
 
+    /// Select the rig's own AGC. On demodulated audio this is the AGC the
+    /// operator hears: the sound card is fed after it, so the engine's own AGC
+    /// behind it has almost nothing left to level. A setting the family has no
+    /// command for — Icom has no plain OFF — returns nothing and leaves the rig
+    /// where it was.
+    fn set_agc(&mut self, _agc: AgcMode) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    /// Whether [`Protocol::set_agc`] reaches this family at all.
+    fn commands_agc(&self) -> bool {
+        false
+    }
+
     /// Set the transmitter's output power, as a `0..1` fraction of what the rig
     /// can do.
     ///
@@ -708,6 +721,8 @@ struct Civ {
     /// Whether the power-output meter is read during an over — see
     /// [`Civ::without_po_meter`].
     po_meter: bool,
+    /// Whether the AGC is commanded — see [`Civ::without_agc`].
+    agc: bool,
 }
 
 /// How long after a broadcast a disagreeing polled answer is put down to the
@@ -737,7 +752,17 @@ impl Civ {
             socket: None,
             rx_ant: None,
             po_meter: true,
+            agc: true,
         }
+    }
+
+    /// Leave the AGC alone. Icom's `16 12` presets are FAST, MID and SLOW in
+    /// that order; nothing says a Xiegu, which shares only the dialect, numbers
+    /// them the same — and a guess there selects a different AGC from the one
+    /// on the button.
+    fn without_agc(mut self) -> Civ {
+        self.agc = false;
+        self
     }
 
     /// Leave the power-output meter unread. A Xiegu G90 answers `15 11` with
@@ -865,10 +890,19 @@ impl Protocol for Civ {
         vec![civ::keyer_speed_frame(self.radio, wpm)]
     }
     fn set_filter(&mut self, mode: Mode, lo_hz: f32, hi_hz: f32) -> Vec<Vec<u8>> {
-        civ::set_filter_frame(self.radio, mode, lo_hz, hi_hz).into_iter().collect()
+        civ::set_filter_frame(self.radio, mode, self.seen_mode, lo_hz, hi_hz).into_iter().collect()
     }
     fn commands_filter(&self) -> bool {
         true
+    }
+    fn set_agc(&mut self, agc: AgcMode) -> Vec<Vec<u8>> {
+        if !self.agc {
+            return Vec::new();
+        }
+        civ::set_agc_frame(self.radio, agc).into_iter().collect()
+    }
+    fn commands_agc(&self) -> bool {
+        self.agc
     }
     fn set_power(&mut self, frac: f32) -> Vec<Vec<u8>> {
         vec![civ::set_power_frame(self.radio, frac)]
@@ -1214,7 +1248,9 @@ fn make_protocol(cfg: &CatConfig) -> Box<dyn Protocol> {
         // A Xiegu is not in the Icom model table, so it takes the two sockets
         // every radio with a selector has at least — which changes nothing,
         // since it NAKs the read.
-        CatFamily::Xiegu => Box::new(Civ::new(cfg.icom_radio_id, None, 2).without_po_meter()),
+        CatFamily::Xiegu => {
+            Box::new(Civ::new(cfg.icom_radio_id, None, 2).without_po_meter().without_agc())
+        }
         CatFamily::Icom => {
             let civ = Civ::new(
                 cfg.icom_radio_id,
@@ -1264,6 +1300,8 @@ enum CatCmd {
     /// The rig's own receive filter: the mode it applies to, and the audio-band
     /// edges in Hz.
     Filter(Mode, f32, f32),
+    /// The rig's own AGC.
+    Agc(AgcMode),
     /// Which antenna socket to receive on, by name.
     Antenna(String),
     /// Switch the rig's receiving antenna into the receive path, or out of it.
@@ -1308,6 +1346,7 @@ pub struct CatHandle {
     cw_chunk_len: usize,
     commands_power: bool,
     commands_filter: bool,
+    commands_agc: bool,
     commands_squelch: bool,
     antennas: &'static [&'static str],
     commands_rig_power: bool,
@@ -1401,6 +1440,18 @@ impl CatHandle {
             return;
         }
         let _ = self.cmd_tx.send(CatCmd::Filter(mode, lo_hz, hi_hz));
+    }
+    /// Select the rig's own AGC. Silently ignored on a family whose AGC
+    /// sdroxide cannot address.
+    pub fn set_agc(&self, agc: AgcMode) {
+        if !self.commands_agc {
+            return;
+        }
+        let _ = self.cmd_tx.send(CatCmd::Agc(agc));
+    }
+    /// Whether [`Self::set_agc`] reaches this rig.
+    pub fn commands_agc(&self) -> bool {
+        self.commands_agc
     }
     /// The antenna sockets this rig can put its receiver on, or empty where the
     /// family has no such command — and, on a family whose list has to be
@@ -1750,6 +1801,7 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
     // before it commands anything.
     let commands_power = make_protocol(&cfg).commands_power();
     let commands_filter = make_protocol(&cfg).commands_filter();
+    let commands_agc = make_protocol(&cfg).commands_agc();
     let commands_squelch = make_protocol(&cfg).commands_squelch();
     // And the same again for the antenna sockets: the caps this device
     // publishes are built before a single frame has gone out, so the list has
@@ -1810,6 +1862,7 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
         cw_chunk_len,
         commands_power,
         commands_filter,
+        commands_agc,
         commands_squelch,
         antennas,
         commands_rig_power,
@@ -3072,6 +3125,15 @@ fn serial_thread(
                     // pixel, and a rig served one frame at a time must not be
                     // handed hundreds of them.
                     Ok(CatCmd::Filter(m, lo, hi)) => pending_filter = Some((m, lo, hi)),
+                    // Not coalesced: a click, not a slider, and one frame.
+                    Ok(CatCmd::Agc(agc)) => {
+                        for f in protocol.set_agc(agc) {
+                            if write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io)
+                            {
+                                break 'io true;
+                            }
+                        }
+                    }
                     Ok(CatCmd::Power(frac)) => pending_power = Some(frac), // coalesce
                     // Coalesced like the power: this one is a slider too.
                     Ok(CatCmd::Squelch(frac)) => pending_squelch = Some(frac),
@@ -3946,6 +4008,43 @@ mod tests {
         assert!(!asks_po(CatFamily::Xiegu));
         assert!(asks_po(CatFamily::Icom));
         assert_eq!(family(CatFamily::Xiegu).tx_telemetry_requests().len(), 2, "SWR and ALC stay");
+    }
+
+    /// On demod audio the AGC button only means something at the rig. An Icom
+    /// takes it; a Xiegu, which shares the dialect but not Icom's numbering of
+    /// the presets, is left alone rather than put on some other AGC.
+    #[test]
+    fn an_icom_is_sent_the_agc_and_a_xiegu_is_not() {
+        let family = |f| make_protocol(&CatConfig { family: f, ..CatConfig::default() });
+        let mut icom = family(CatFamily::Icom);
+        assert!(icom.commands_agc());
+        let frames = icom.set_agc(AgcMode::Med);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].get(4..7), Some(&[0x16, 0x12, 0x02][..]));
+        assert!(icom.set_agc(AgcMode::Off).is_empty(), "Icom has no plain AGC OFF");
+
+        let mut xiegu = family(CatFamily::Xiegu);
+        assert!(!xiegu.commands_agc());
+        assert!(xiegu.set_agc(AgcMode::Fast).is_empty());
+    }
+
+    /// The filter index is read against the mode the radio reports, not the
+    /// panel's: a rig switched to its own RTTY at the front panel stops at
+    /// 2.7 kHz, and one commanded back to USB has the full 3.6 again.
+    #[test]
+    fn an_icom_in_its_own_rtty_is_held_to_its_filter_range() {
+        let mut icom = icom();
+        let index = |p: &mut Box<dyn Protocol>| p.set_filter(Mode::Usb, 0.0, 3600.0)[0][6];
+        assert_eq!(index(&mut icom), 0x40, "nothing reported yet: the full range");
+
+        // The rig answers a mode read with RTTY, filter 1 — a byte with no app
+        // mode, so the panel stays where it was.
+        let mut rtty = vec![0xFE, 0xFE, civ::CONTROLLER_ADDR, 0x94, 0x04, 0x04, 0x01, 0xFD];
+        assert!(icom.parse(&mut rtty).is_empty());
+        assert_eq!(index(&mut icom), 0x31);
+
+        icom.set_mode(Mode::Usb);
+        assert_eq!(index(&mut icom), 0x40);
     }
 
     /// Only the family whose radios document the behaviour asks for it.

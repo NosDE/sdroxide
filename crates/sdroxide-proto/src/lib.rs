@@ -1546,7 +1546,12 @@ use sdroxide_types::{
 /// ([`sdroxide_types::RotatorProtocol`], a unit enum) on its tail — rotctld or
 /// PSTRotator's UDP control (issue #638). It rides `Command::SetRotatorConfig`
 /// and `StationConfig::rotator` whole, so a v178 peer reads it out of step.
-pub const PROTO_VERSION: u16 = 179;
+///
+/// v180: [`sdroxide_types::DeviceCaps`] gains `agc_off_unavailable` (`bool`)
+/// on its tail — the AGC control drives a radio whose AGC has no Off, so the
+/// client stops offering it. `DeviceCaps` rides every capabilities message, so
+/// a v179 peer reads the extra byte out of step.
+pub const PROTO_VERSION: u16 = 180;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

@@ -2708,11 +2708,20 @@ impl SdroxideApp {
             // (Mode::audio_agc) and the chip would do nothing.
             if self.state.rx[0].mode.audio_agc() {
                 let agc = self.state.rx[0].agc;
+                // The radio's AGC, where it is the one heard and has no Off to
+                // be told: the chip walks its three presets and nothing else.
+                let offer_off = !self.caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
+                let hover = if offer_off {
+                    "AGC hang time — click to cycle: Off / Slow / Med / Fast"
+                } else {
+                    "The radio's own AGC — click to cycle: Slow / Med / Fast. \
+                     It cannot be switched off from here."
+                };
                 if crate::chrome::chip(ui, agc != AgcMode::Off, format!("AGC {}", agc.label()))
-                    .on_hover_text("AGC hang time — click to cycle: Off / Slow / Med / Fast")
+                    .on_hover_text(hover)
                     .clicked()
                 {
-                    cmds.push(Command::SetAgc { rx: RxId::Main, agc: agc.next() });
+                    cmds.push(Command::SetAgc { rx: RxId::Main, agc: agc.next_offered(offer_off) });
                 }
                 // With the AGC off the audio rides on this fixed gain instead.
                 // It has to be here: unlevelled, the demodulator's output is
