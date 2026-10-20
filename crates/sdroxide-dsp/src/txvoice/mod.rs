@@ -74,6 +74,8 @@ impl VoiceChain {
     /// Take on `cfg`. Cheap, but call it only when `cfg` has changed.
     pub fn configure(&mut self, cfg: &TxVoiceState) {
         let was = self.cfg;
+        // Retune first, so a stage reset seeds itself from the new settings.
+        self.retune(cfg);
         let started = |on: bool, was_on: bool| on && (!was_on || was.bypass);
         if started(cfg.gate.enabled, was.gate.enabled) {
             self.gate.reset();
@@ -95,7 +97,6 @@ impl VoiceChain {
         {
             d.reset();
         }
-        self.retune(cfg);
     }
 
     fn retune(&mut self, cfg: &TxVoiceState) {

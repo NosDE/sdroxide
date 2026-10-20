@@ -1651,6 +1651,7 @@ mod tests {
         for p in starting_points() {
             assert_eq!(p.voice, p.voice.clamped(), "{} has a value out of range", p.name);
             assert!(p.voice.active(), "{} does nothing", p.name);
+            assert!(p.voice.output.limiter, "{} has no limiter", p.name);
             assert_eq!(p.voice.input_gain_db, 0.0, "{} would override the input gain", p.name);
         }
     }

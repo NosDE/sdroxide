@@ -487,10 +487,6 @@ pub fn save_band_plan(plan: &sdroxide_types::BandPlan) -> Result<(), ConfigError
     write_atomic(&config_dir()?, BAND_PLAN_FILE, &plan.to_json_document())
 }
 
-/// The operator's own HFDL channels (`hfdl_channels.json`), in kHz — the busy
-/// assigned frequencies that are not in the published plan, kept as one-click
-/// chips beside it. Per machine rather than per station: a channel a listener
-/// found busy is theirs, not everybody else's.
 /// The TX Audio window's profile library (`tx_audio_profiles.json`). A
 /// client-side file: profiles are this operator's settings for their own
 /// microphone, kept on the machine they sit at.
@@ -504,6 +500,10 @@ pub fn save_tx_voice_profiles(
     save_json("tx_audio_profiles.json", &profiles)
 }
 
+/// The operator's own HFDL channels (`hfdl_channels.json`), in kHz — the busy
+/// assigned frequencies that are not in the published plan, kept as one-click
+/// chips beside it. Per machine rather than per station: a channel a listener
+/// found busy is theirs, not everybody else's.
 pub fn load_hfdl_channels() -> Vec<u32> {
     load_json_list("hfdl_channels.json")
 }
