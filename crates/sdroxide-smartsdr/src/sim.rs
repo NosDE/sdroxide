@@ -122,6 +122,12 @@ pub struct SimConfig {
     /// the wrong one — issue #687, a panadapter drawing 192 kHz of band across
     /// a 48 kHz axis.
     pub rate_change_delay: Duration,
+    /// A built-in antenna tuner: `info` says `atu_present=1`, `sub atu` reports
+    /// it, and `atu start` runs a tune that takes [`Self::atu_tune_time`] and
+    /// succeeds. Off by default, as on a FLEX-6600 without one.
+    pub atu: bool,
+    /// How long a simulated tune runs before it reports success.
+    pub atu_tune_time: Duration,
 }
 
 impl Default for SimConfig {
@@ -156,6 +162,8 @@ impl Default for SimConfig {
             foreign_pan_handle: 0xDEAD_BEEF,
             stream_to_default_port: false,
             rate_change_delay: Duration::ZERO,
+            atu: false,
+            atu_tune_time: Duration::from_millis(300),
         }
     }
 }
@@ -377,6 +385,11 @@ struct Session {
     /// A `daxiq_rate` change still on its way in: the rate, the command's
     /// sequence number, and when it lands. See [`SimConfig::rate_change_delay`].
     pending_rate: Option<(u32, u32, Instant)>,
+    /// The tuner's status word, as the radio spells it.
+    atu_status: &'static str,
+    atu_enabled: bool,
+    /// When a tune that is running finishes.
+    atu_done_at: Option<Instant>,
     tx_stream: Option<u32>,
     pan_center_hz: f64,
     pan_bw_hz: f64,
@@ -435,6 +448,9 @@ impl Session {
             iq_channel: 0,
             iq_rate: 48_000,
             pending_rate: None,
+            atu_status: "TUNE_NOT_STARTED",
+            atu_enabled: false,
+            atu_done_at: None,
             tx_stream: None,
             pan_center_hz: slice_hz,
             pan_bw_hz: 192_000.0,
@@ -497,6 +513,7 @@ impl Session {
 
             self.maybe_evict();
             self.land_pending_rate();
+            self.finish_atu_tune();
             self.pump_iq();
             self.pump_meters();
             self.drain_client_udp(&mut rx_buf);
@@ -515,6 +532,30 @@ impl Session {
         self.iq_rate = rate;
         self.reply(seq, 0, "");
         self.send_iq_stream_status();
+    }
+
+    /// Report a running tune as finished once its time is up.
+    fn finish_atu_tune(&mut self) {
+        let Some(at) = self.atu_done_at else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.atu_done_at = None;
+        self.atu_status = "TUNE_SUCCESSFUL";
+        self.atu_enabled = true;
+        self.send_atu_status();
+    }
+
+    fn send_atu_status(&mut self) {
+        if !self.cfg.atu {
+            return;
+        }
+        let line = format!(
+            "atu status={} atu_enabled={} memories_enabled=1 using_mem=0",
+            self.atu_status,
+            u8::from(self.atu_enabled)
+        );
+        self.status(&line);
     }
 
     fn send_line(&mut self, line: &str) {
@@ -619,9 +660,37 @@ impl Session {
                     Some("meter") => self.send_meter_defs(),
                     Some("radio") => self.send_radio_status(),
                     Some("client") => self.send_client_status(),
+                    Some("atu") => self.send_atu_status(),
                     _ => {}
                 }
                 self.reply(seq, 0, "");
+            }
+            // The one reply whose body is comma-separated, with quoted strings.
+            ("info", _) => {
+                let body = format!(
+                    "model=\"{}\",chassis_serial=\"{}\",name=\"{}\",callsign=\"{}\",\
+                     atu_present={},num_scu=1,software_ver={},",
+                    self.cfg.model,
+                    self.cfg.serial,
+                    self.cfg.nickname,
+                    self.cfg.callsign,
+                    u8::from(self.cfg.atu),
+                    self.cfg.version
+                );
+                self.reply(seq, 0, &body);
+            }
+            ("atu", Some("start")) if self.cfg.atu => {
+                self.reply(seq, 0, "");
+                self.atu_status = "TUNE_IN_PROGRESS";
+                self.atu_done_at = Some(Instant::now() + self.cfg.atu_tune_time);
+                self.send_atu_status();
+            }
+            ("atu", Some("bypass")) if self.cfg.atu => {
+                self.reply(seq, 0, "");
+                self.atu_done_at = None;
+                self.atu_status = "TUNE_BYPASS";
+                self.atu_enabled = false;
+                self.send_atu_status();
             }
             ("keepalive", _) | ("ping", _) => self.reply(seq, 0, ""),
             ("display", Some("panafall")) => match rest.get(1).copied() {

@@ -148,6 +148,9 @@ pub enum FlexUpdate {
     TxDrive(f32),
     /// TUNE power, as a 0..1 fraction of `tunepower`.
     TuneDrive(f32),
+    /// The radio's built-in antenna tuner reported its state — or, as `None`,
+    /// that it has none.
+    Atu(Option<sdroxide_types::AtuState>),
 }
 
 /// Control messages to the control thread.
@@ -159,6 +162,8 @@ enum Ctrl {
     TxOff,
     SetDrive(f64),
     SetTuneDrive(f64),
+    AtuStart,
+    AtuBypass,
     /// Fire-and-forget command, for anything the typed API doesn't cover.
     Raw(String),
     Shutdown,
@@ -173,6 +178,9 @@ pub struct RadioIdent {
     pub callsign: String,
     /// The client handle the radio assigned us.
     pub handle: u32,
+    /// Whether the radio says it has a built-in antenna tuner (`info`'s
+    /// `atu_present`), or `None` where it did not say.
+    pub atu_present: Option<bool>,
 }
 
 impl RadioIdent {
@@ -449,6 +457,16 @@ impl FlexHandle {
         for topic in ["slice", "tx", "meter", "radio", "daxiq", "dax", "atu"] {
             wire.send(&format!("sub {topic} all"))?;
         }
+        // Whether there is an antenna tuner to offer. Asked rather than inferred
+        // from the `atu` status the subscription above brings: that is what
+        // the tuner is doing, and not every radio that answers it has one to
+        // do anything with. Optional — a radio slow to answer is still a radio.
+        if let Some(r) = wire.try_request(&mut reader, &mut deferred, "info")?
+            && r.code == 0
+        {
+            ident.atu_present = p::info_atu_present(&r.body);
+        }
+
         // `pan` last, and read rather than fired: its status burst is what says
         // which panadapters the radio already has, and [`claim_panadapter`] has
         // to have seen it before it decides to ask for another. A radio sends
@@ -580,6 +598,8 @@ impl FlexHandle {
             cmd_at: None,
             rfpower: None,
             tunepower: None,
+            atu_present: ident.atu_present,
+            atu: None,
             alive: Arc::clone(&alive),
         };
 
@@ -662,6 +682,14 @@ impl FlexHandle {
     /// TUNE power as a 0..1 fraction.
     pub fn set_tune_drive(&self, frac: f64) {
         let _ = self.ctrl.send(Ctrl::SetTuneDrive(frac));
+    }
+    /// Start the radio's built-in antenna tuner.
+    pub fn atu_start(&self) {
+        let _ = self.ctrl.send(Ctrl::AtuStart);
+    }
+    /// Take the radio's built-in antenna tuner out of circuit.
+    pub fn atu_bypass(&self) {
+        let _ = self.ctrl.send(Ctrl::AtuBypass);
     }
     /// Send an arbitrary command. Nothing waits for its reply.
     pub fn send_raw(&self, command: impl Into<String>) {
@@ -1311,6 +1339,10 @@ struct ControlThread {
     cmd_at: Option<Instant>,
     rfpower: Option<u32>,
     tunepower: Option<u32>,
+    /// What `info` said about the tuner — see [`RadioIdent::atu_present`].
+    atu_present: Option<bool>,
+    /// The tuner state last passed on, so only a change is.
+    atu: Option<sdroxide_types::AtuState>,
     alive: Arc<AtomicBool>,
 }
 
@@ -1419,6 +1451,16 @@ impl ControlThread {
                 let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as u32;
                 self.tunepower = Some(pct);
                 let _ = self.wire.send(&format!("transmit set tunepower={pct}"));
+            }
+            // The radio keys its own carrier for the tune and reports how it
+            // went in an `atu` status; nothing more is ours to do.
+            Ctrl::AtuStart => {
+                let _ = self.wire.send("atu start");
+                self.trace.note("ATU tune requested");
+            }
+            Ctrl::AtuBypass => {
+                let _ = self.wire.send("atu bypass");
+                self.trace.note("ATU bypass requested");
             }
             Ctrl::Raw(cmd) => {
                 let _ = self.wire.send(&cmd);
@@ -1561,6 +1603,19 @@ impl ControlThread {
             }
             Some("meter") => {
                 self.meters.lock().unwrap_or_else(|e| e.into_inner()).absorb(kvs);
+            }
+            // The tuner, which a radio without one may still answer `sub atu`
+            // for: `info` decides whether there is one, and where it did not
+            // say, a status that arrives is the best evidence there is.
+            Some("atu") => {
+                if self.atu_present == Some(false) {
+                    return;
+                }
+                let Some(atu) = p::parse_atu(kvs) else { return };
+                if self.atu != Some(atu) {
+                    self.atu = Some(atu);
+                    let _ = self.updates.send(FlexUpdate::Atu(Some(atu)));
+                }
             }
             Some("stream") => {
                 let Some(id) = words.next().and_then(p::parse_hex_id) else { return };

@@ -135,6 +135,65 @@ fn the_rate_is_not_claimed_before_the_radio_sends_it() {
     assert_eq!(h.actual_rate_hz(), 192_000.0, "the rate change never showed up");
 }
 
+/// Collect tuner reports until `done` holds for one or patience runs out.
+fn atu_reports(
+    h: &FlexHandle,
+    done: impl Fn(&sdroxide_types::AtuState) -> bool,
+) -> Vec<sdroxide_types::AtuState> {
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline {
+        for u in h.poll_updates() {
+            if let FlexUpdate::Atu(Some(a)) = u {
+                seen.push(a);
+            }
+        }
+        if seen.last().is_some_and(&done) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+#[test]
+fn drives_the_radios_antenna_tuner() {
+    use sdroxide_types::AtuStatus;
+    let sim = SimRadio::start(SimConfig { atu: true, ..SimConfig::default() }).expect("start");
+    let h = connect(&sim, 48_000.0);
+
+    assert_eq!(h.ident.atu_present, Some(true), "`info` should say there is a tuner");
+    let first = atu_reports(&h, |_| true);
+    assert!(!first.is_empty(), "the subscription burst should report the tuner");
+
+    h.atu_start();
+    let tune = atu_reports(&h, |a| a.status == AtuStatus::Tuned);
+    assert!(sim.stats.saw_command("atu start"), "never asked the radio to tune");
+    assert!(
+        tune.iter().any(|a| a.status == AtuStatus::Tuning),
+        "a tune in progress should be reported: {tune:?}"
+    );
+    assert_eq!(tune.last().map(|a| (a.status, a.enabled)), Some((AtuStatus::Tuned, true)));
+
+    h.atu_bypass();
+    let bypass = atu_reports(&h, |a| a.status == AtuStatus::Bypass);
+    assert!(sim.stats.saw_command("atu bypass"));
+    assert_eq!(bypass.last().map(|a| (a.status, a.enabled)), Some((AtuStatus::Bypass, false)));
+}
+
+#[test]
+fn offers_no_tuner_on_a_radio_without_one() {
+    let sim = sim();
+    let h = connect(&sim, 48_000.0);
+
+    assert_eq!(h.ident.atu_present, Some(false));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !h.poll_updates().into_iter().any(|u| matches!(u, FlexUpdate::Atu(Some(_)))),
+        "a radio without a tuner must not grow one"
+    );
+}
+
 #[test]
 fn tuning_moves_the_radios_slice() {
     let sim = sim();

@@ -37,6 +37,8 @@
 
 use std::collections::BTreeMap;
 
+use sdroxide_types::{AtuState, AtuStatus};
+
 /// The TCP command port, and the UDP port discovery broadcasts arrive on. The
 /// radio uses the same number for both.
 pub const RADIO_PORT: u16 = 4992;
@@ -481,9 +483,68 @@ pub fn scale_meter(raw: i16, unit: &str) -> f32 {
     }
 }
 
+/// Whether the `info` reply says the radio has a built-in antenna tuner, or
+/// `None` where it does not say.
+///
+/// The reply is the protocol's one comma-separated body, with quoted strings:
+/// `model="FLEX-8400",…,atu_present=1,num_scu=1,…`.
+pub fn info_atu_present(body: &str) -> Option<bool> {
+    parse_kvs_with(body, ',').get("atu_present").map(|v| v.trim().trim_matches('"') != "0")
+}
+
+/// The tuner's state from an `atu` status object, or `None` if it carries no
+/// `status` — a partial update about something else, to be ignored rather
+/// than read as "idle".
+///
+/// `status=TUNE_SUCCESSFUL atu_enabled=1 memories_enabled=1 using_mem=1` is
+/// what a FLEX-8400 sends. The status names are FlexLib's; one this code has
+/// never seen reads as [`AtuStatus::Idle`], which claims nothing.
+pub fn parse_atu(kvs: &Kvs) -> Option<AtuState> {
+    let status = match kvs.get("status")?.as_str() {
+        "TUNE_IN_PROGRESS" => AtuStatus::Tuning,
+        "TUNE_SUCCESSFUL" | "TUNE_OK" => AtuStatus::Tuned,
+        "TUNE_BYPASS" | "TUNE_MANUAL_BYPASS" => AtuStatus::Bypass,
+        "TUNE_FAIL" | "TUNE_FAIL_BYPASS" => AtuStatus::Failed,
+        "TUNE_ABORTED" => AtuStatus::Aborted,
+        _ => AtuStatus::Idle,
+    };
+    let flag = |k: &str| kvs.get(k).is_some_and(|v| v.trim() != "0");
+    Some(AtuState { status, enabled: flag("atu_enabled"), using_memory: flag("using_mem") })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_whether_the_radio_has_a_tuner() {
+        let reply = r#"model="FLEX-8400",chassis_serial="1725",name="Marco",gps="Locked",atu_present=1,num_scu=1,software_ver=4.2.20.41343,"#;
+        assert_eq!(info_atu_present(reply), Some(true));
+        assert_eq!(info_atu_present(r#"model="FLEX-6400",atu_present=0,"#), Some(false));
+        assert_eq!(info_atu_present(r#"model="FLEX-6600",num_scu=2"#), None);
+    }
+
+    #[test]
+    fn reads_the_tuners_state() {
+        let Line::Status { kvs, .. } = parse_line(
+            "S0|atu status=TUNE_SUCCESSFUL atu_enabled=1 memories_enabled=1 using_mem=1",
+        ) else {
+            panic!("not a status");
+        };
+        assert_eq!(
+            parse_atu(&kvs),
+            Some(AtuState { status: AtuStatus::Tuned, enabled: true, using_memory: true })
+        );
+        let in_progress = parse_kvs("status=TUNE_IN_PROGRESS atu_enabled=1 using_mem=0");
+        assert_eq!(parse_atu(&in_progress).map(|a| a.status), Some(AtuStatus::Tuning));
+        let bypass = parse_kvs("status=TUNE_BYPASS atu_enabled=0");
+        assert_eq!(
+            parse_atu(&bypass),
+            Some(AtuState { status: AtuStatus::Bypass, enabled: false, using_memory: false })
+        );
+        // A partial update with no status says nothing about the tune.
+        assert_eq!(parse_atu(&parse_kvs("memories_enabled=0")), None);
+    }
 
     #[test]
     fn parses_the_five_line_tags() {
