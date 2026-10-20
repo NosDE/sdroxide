@@ -460,9 +460,21 @@ impl RemoteController {
             ServerMsg::RigctldStatus { running, addr, clients, error } => {
                 self.pending.push_back(RadioEvent::RigctldStatus { running, addr, clients, error })
             }
-            ServerMsg::TciServerStatus { running, addr, clients, error } => self
-                .pending
-                .push_back(RadioEvent::TciServerStatus { running, addr, clients, error }),
+            ServerMsg::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            } => self.pending.push_back(RadioEvent::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            }),
             ServerMsg::ImagePresets(p) => self.pending.push_back(RadioEvent::ImagePresets(p)),
             ServerMsg::ImageSlotSource { slot, version, png } => {
                 self.pending.push_back(RadioEvent::ImageSlotSource { slot, version, png })

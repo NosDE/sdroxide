@@ -148,6 +148,12 @@ pub enum RadioEvent {
         addr: String,
         clients: usize,
         error: Option<String>,
+        /// The outbound TCI client (see [`crate::TciServerConfig::client`])
+        /// has its socket up. False when that option is off.
+        client_connected: bool,
+        /// Why the outbound client is not connected. `None` while it is off,
+        /// still connecting, or up.
+        client_error: Option<String>,
     },
     /// Built-in rigctld server status: whether the listener is up, where it is
     /// bound, how many clients are connected, and any bind error. Emitted on
