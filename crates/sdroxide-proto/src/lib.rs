@@ -1564,7 +1564,15 @@ use sdroxide_types::{
 /// `PictureUpload` — the outcome of an upload or of a test, which a remote
 /// screen needs because the station, not the screen, is what connects.
 /// `StationConfig` rides whole, so a v181 peer fails to decode it.
-pub const PROTO_VERSION: u16 = 182;
+/// v183: the transmit voice chain. `TxState::eq` became `TxState::voice`
+/// ([`sdroxide_types::TxVoiceState`]: gate, EQ, de-esser, compressor, output),
+/// with the EQ itself gaining a high-pass, a second peak and a low-pass, and
+/// `TxState` gaining `voice_test` and `voice_test_len_s`. `Command::SetTxEq`
+/// became `Command::SetTxVoice` in the same position, carrying the whole
+/// chain; `Command::TxVoiceTestRecord`, `Command::TxVoiceTestPlay` and
+/// `Command::TxVoiceTestLive` are appended. `Meters` gains `voice` on its tail. Every state broadcast and
+/// every meter frame changes layout, so both ends have to agree.
+pub const PROTO_VERSION: u16 = 183;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
