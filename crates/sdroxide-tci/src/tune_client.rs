@@ -100,10 +100,10 @@ impl TciTuneClient {
 
 impl Drop for TciTuneClient {
     fn drop(&mut self) {
+        // Don't join: a worker inside `connect` can take seconds to notice,
+        // and this runs on the engine thread. It exits on its own.
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.thread.take();
     }
 }
 
@@ -211,13 +211,14 @@ fn send_line(socket: Option<&mut WebSocket<TcpStream>>, line: String) -> Result<
     ws.flush().map_err(|error| error.to_string())
 }
 
-/// Read whatever the server has queued. `false` means the socket is gone.
+/// Read whatever the server has queued, up to a bound so a chatty server
+/// cannot starve the send. `false` means the socket is gone.
 fn drain(
     socket: &mut Option<WebSocket<TcpStream>>,
     status_tx: &Sender<TciTuneStatus>,
     reported: &mut TciTuneStatus,
 ) -> bool {
-    loop {
+    for _ in 0..64 {
         // The read borrows the socket. Finish it before `close` takes the
         // `Option` back, or the two borrows overlap.
         let read = match socket.as_mut() {
@@ -255,6 +256,7 @@ fn drain(
             }
         }
     }
+    true
 }
 
 fn connect(address: &str) -> Result<WebSocket<TcpStream>, String> {
