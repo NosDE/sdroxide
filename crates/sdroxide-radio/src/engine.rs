@@ -7148,6 +7148,10 @@ impl Engine {
             return;
         }
         self.settle_rig_agc();
+        // FM's AGC is fixed on the radio; it would only answer NG.
+        if !self.state.rx[0].mode.audio_agc() {
+            return;
+        }
         self.source.set_control_agc(self.state.rx[0].agc);
     }
 
