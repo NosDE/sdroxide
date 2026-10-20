@@ -2121,10 +2121,10 @@ impl TxVoiceTester {
     /// Stop recording. A take under half a second is a mis-click and leaves
     /// the previous phrase in place.
     fn stop_record(&mut self) {
-        if let Some(buf) = self.recording.take() {
-            if buf.len() >= (TX_MONITOR_RATE / 2.0) as usize {
-                self.clip = buf;
-            }
+        if let Some(buf) = self.recording.take()
+            && buf.len() >= (TX_MONITOR_RATE / 2.0) as usize
+        {
+            self.clip = buf;
         }
     }
 

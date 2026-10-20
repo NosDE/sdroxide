@@ -4577,15 +4577,16 @@ impl SdroxideApp {
                     let lit = current == Some(code);
                     let resp = crate::chrome::chip(ui, lit, label)
                         .on_hover_text(super::duo_power::hover(code));
-                    if resp.clicked() && !lit {
-                        if let Some(cfg) = self.radio_cfg.as_mut() {
-                            cfg.cat.elad_tx_power = code;
-                            cmds.push(Command::SetRadioConfig {
-                                cfg: Box::new(cfg.clone()),
-                                reopen: false,
-                            });
-                            cmds.push(Command::SetRigPowerStep(code));
-                        }
+                    if resp.clicked()
+                        && !lit
+                        && let Some(cfg) = self.radio_cfg.as_mut()
+                    {
+                        cfg.cat.elad_tx_power = code;
+                        cmds.push(Command::SetRadioConfig {
+                            cfg: Box::new(cfg.clone()),
+                            reopen: false,
+                        });
+                        cmds.push(Command::SetRigPowerStep(code));
                     }
                 }
             });

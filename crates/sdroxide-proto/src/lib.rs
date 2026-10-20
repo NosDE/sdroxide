@@ -1596,6 +1596,7 @@ use sdroxide_types::{
 /// * [`sdroxide_types::Command`] gains `WavelogSync`, appended. Its answers,
 ///   `RadioEvent::WavelogBatch` and `RadioEvent::WavelogProbe`, stay on the
 ///   machine the engine runs on and have no `ServerMsg`.
+///
 /// v185: the Hardrock amplifier. `Command` gains `SetAmpConfig`, `Amp` and
 /// `SetRigPowerStep`, `ServerMsg` gains `AmpStatus`, `StationConfig` gains
 /// `amp` on its tail, and `AmpAlerts` carries `from_amp`, for the amplifier's
