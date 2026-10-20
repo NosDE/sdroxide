@@ -5281,7 +5281,9 @@ name = "sdroxide-net"
 version = "1.6.10"
 dependencies = [
  "crossbeam-channel",
+ "ring",
  "roxmltree",
+ "rustls",
  "sdroxide-types",
  "serde",
  "serde_json",
