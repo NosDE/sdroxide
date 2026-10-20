@@ -593,15 +593,6 @@ impl Protocol for Elad {
     }
 }
 
-/// The SWR out of a `WR` answer body, or `None` when the rig flagged the
-/// reading as one not to be trusted.
-///
-/// Body layout, after the two command letters: P1 the high-SWR trip flag, P2 a
-/// space or `!`, then the ratio as `nn.nn`. The `!` is set in receive, at 0 dBm
-/// out, and below the 500 mW the rig needs to compute a ratio at all — every one
-/// of which is a moment when there is no SWR to show, rather than one where it
-/// happens to be 1:1. Reporting a plausible number there would put a flat needle
-/// under a transmitter that never came up.
 /// `FP` / `RP`: a flag, then six digits of milliwatts, returned as watts.
 ///
 /// The flag is a space for a valid reading and `!` for one the rig says not
@@ -616,6 +607,15 @@ fn parse_milliwatts(body: &str) -> Option<f32> {
     Some(mw as f32 / 1000.0)
 }
 
+/// The SWR out of a `WR` answer body, or `None` when the rig flagged the
+/// reading as one not to be trusted.
+///
+/// Body layout, after the two command letters: P1 the high-SWR trip flag, P2 a
+/// space or `!`, then the ratio as `nn.nn`. The `!` is set in receive, at 0 dBm
+/// out, and below the 500 mW the rig needs to compute a ratio at all — every one
+/// of which is a moment when there is no SWR to show, rather than one where it
+/// happens to be 1:1. Reporting a plausible number there would put a flat needle
+/// under a transmitter that never came up.
 fn parse_swr(body: &str) -> Option<f32> {
     let mut chars = body.chars();
     let _trip = chars.next()?;

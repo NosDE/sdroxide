@@ -342,6 +342,9 @@ fn run<P: std::io::Read + std::io::Write>(
     let mut next_temp = Instant::now();
     // A C/F toggle not yet seen on the amplifier, and how long to keep looking.
     let mut scale_wanted: Option<(bool, Instant)> = None;
+    // A band change waiting for the amplifier to be off the air: it switches
+    // the filter relays, which must not move under power (as in `act`).
+    let mut freq_wanted: Option<u64> = None;
     // The temperature as `HRTP` last gave it, in the scale it gave, and when.
     let mut screen_temp: Option<(f32, Instant)> = None;
     let mut was_tuning = false;
@@ -388,10 +391,15 @@ fn run<P: std::io::Read + std::io::Write>(
                     scale_wanted = Some((c, Instant::now() + SCALE_SETTLE));
                 }
             }
-            Ok(Msg::Frequency(hz)) => {
-                let _ = amp.set_frequency(hz);
-            }
+            Ok(Msg::Frequency(hz)) => freq_wanted = Some(hz),
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(hz) = freq_wanted
+            && let Ok(s) = amp.status()
+            && !(s.lights().is_some_and(|l| l.tx) || s.forward_w >= 1.0 || s.drive_w >= 0.1)
+        {
+            let _ = amp.set_frequency(hz);
+            freq_wanted = None;
         }
 
         let settling = scale_wanted.filter(|&(_, until)| Instant::now() < until);

@@ -145,8 +145,8 @@ pub struct EladSource {
     tx_resampler: Option<sdroxide_dsp::MonoResampler>,
     tx_scratch: Vec<f32>,
     /// Amplitude applied to the TX audio: the Drive level, or the TUNE level
-    /// while tuning. The rig's power register is pinned at MAX when the CAT
-    /// port opens (`sdroxide_cat::elad`), so this is the power control.
+    /// while tuning. The rig's power register is set from the power buttons
+    /// (MAX unless the operator picks less), so this is the fine control.
     tx_audio_gain: f32,
 
     /// Mirrors of the front-end switches, so `current_gains` can answer without
@@ -876,11 +876,21 @@ impl IqSource for EladSource {
     fn set_tx_freq_hz(&mut self, _hz: f64) {}
 
     fn set_tx_drive(&mut self, frac: f64) {
-        if let Control::Serial(cat) = &self.control {
-            if cat.power_by_audio() {
-                self.tx_audio_gain = cat.audio_gain_for(frac as f32);
+        match &self.control {
+            Control::Serial(cat) => {
+                if cat.power_by_audio() {
+                    self.tx_audio_gain = cat.audio_gain_for(frac as f32);
+                }
+                cat.set_power(frac as f32);
             }
-            cat.set_power(frac as f32);
+            // The gateway pins menu 34 at MAX as it opens, so the audio level
+            // is the only power control left here too.
+            Control::Gateway => {
+                self.tx_audio_gain = sdroxide_cat::audio_gain_for_power(
+                    frac.clamp(0.0, 1.0) as f32 * sdroxide_cat::elad::DUO_AUDIO_POWER_CEILING,
+                );
+            }
+            _ => {}
         }
     }
 

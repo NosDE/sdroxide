@@ -4509,13 +4509,6 @@ impl SdroxideApp {
         }
     }
 
-    /// Whether the TX box carries the 1W / 3W / 5W / MAX buttons: an ELAD
-    /// FDM-DUO that can transmit with a Rig control (CAT) port set — over the
-    /// ELAD backend with its serial port, or as a CAT rig of the ELAD family —
-    /// and no other radio (AJ3G, 18 Oct 2026: "that setting should only appear
-    /// for ELAD Users", and "only when ELAD TX is enabled in CAT/Rig Control").
-    /// An FDM-S2 has no transmitter, so `tx_channels` is 0 and it never sees
-    /// them.
     /// Read the radio's settings if nothing has yet, where the connected radio
     /// could be an FDM-DUO: [`Self::duo_presets_apply`] needs them, and they
     /// are otherwise read only when Settings or the DIV box first asks. Without
@@ -4538,6 +4531,13 @@ impl SdroxideApp {
         }
     }
 
+    /// Whether the TX box carries the 1W / 3W / 5W / MAX buttons: an ELAD
+    /// FDM-DUO that can transmit with a Rig control (CAT) port set — over the
+    /// ELAD backend with its serial port, or as a CAT rig of the ELAD family —
+    /// and no other radio (AJ3G, 18 Oct 2026: "that setting should only appear
+    /// for ELAD Users", and "only when ELAD TX is enabled in CAT/Rig Control").
+    /// An FDM-S2 has no transmitter, so `tx_channels` is 0 and it never sees
+    /// them.
     pub(in crate::app) fn duo_presets_apply(&self) -> bool {
         let Some(c) = self.caps.as_ref() else { return false };
         if c.tx_channels == 0 {
@@ -6109,12 +6109,12 @@ pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WID
 /// draw site.
 const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
 
-/// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
-/// labels, so the chips match and the level blocks beside them start on the
-/// same column.
 /// The caption under the FDM-DUO's power presets (AJ3G, 18 Oct 2026).
 const DUO_PRESETS_CAPTION: &str = "ELAD FDM-DUO TX PWR";
 
+/// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
+/// labels, so the chips match and the level blocks beside them start on the
+/// same column.
 fn tx_key_chip_size(ui: &egui::Ui) -> egui::Vec2 {
     let w = crate::chrome::chip_width(ui, " PTT ", Some(15.0)).max(crate::chrome::chip_width(
         ui,

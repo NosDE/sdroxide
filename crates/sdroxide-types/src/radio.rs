@@ -1284,13 +1284,13 @@ fn default_rigctld_addr() -> String {
     "127.0.0.1:4532".to_string()
 }
 
-/// Where an flrig serves XML-RPC unless told otherwise — its own default port,
-/// on this machine.
 /// Menu 34 at MAX — see [`CatConfig::elad_tx_power`].
 pub fn default_elad_tx_power() -> u8 {
     9
 }
 
+/// Where an flrig serves XML-RPC unless told otherwise — its own default port,
+/// on this machine.
 fn default_flrig_addr() -> String {
     "127.0.0.1:12345".to_string()
 }

@@ -3201,9 +3201,6 @@ fn serial_thread(
                     Ok(CatCmd::Power(frac)) => pending_power = Some(frac), // coalesce
                     // Coalesced like the power: this one is a slider too.
                     Ok(CatCmd::Squelch(frac)) => pending_squelch = Some(frac),
-                    // Not coalesced and not rate limited: an antenna is a click
-                    // on a two-entry list, not a slider being dragged, and it
-                    // is one frame either way.
                     // A click on a button, so neither coalesced nor rate
                     // limited, like the antenna below.
                     Ok(CatCmd::PowerStep(code)) => {
@@ -3221,6 +3218,9 @@ fn serial_thread(
                             break 'io true;
                         }
                     }
+                    // Not coalesced and not rate limited: an antenna is a click
+                    // on a two-entry list, not a slider being dragged, and it
+                    // is one frame either way.
                     Ok(CatCmd::Antenna(name)) => {
                         let frames = protocol.set_antenna(&name);
                         // A name the family does not have produces no frames,
