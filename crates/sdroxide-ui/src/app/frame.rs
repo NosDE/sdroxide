@@ -1589,11 +1589,32 @@ impl SdroxideApp {
                     self.spots_gen += 1;
                     self.adopted_spots_gen = None;
                 }
-                RadioEvent::TciServerStatus { running, addr, clients, error } => {
-                    self.tci_srv_status = Some(TciServerStatus { running, addr, clients, error });
+                RadioEvent::TciServerStatus {
+                    running,
+                    addr,
+                    clients,
+                    error,
+                    client_connected,
+                    client_error,
+                } => {
+                    self.tci_srv_status = Some(TciServerStatus {
+                        running,
+                        addr,
+                        clients,
+                        error,
+                        client_connected,
+                        client_error,
+                    });
                 }
                 RadioEvent::RigctldStatus { running, addr, clients, error } => {
-                    self.rigctld_status = Some(TciServerStatus { running, addr, clients, error });
+                    self.rigctld_status = Some(TciServerStatus {
+                        running,
+                        addr,
+                        clients,
+                        error,
+                        client_connected: false,
+                        client_error: None,
+                    });
                 }
                 RadioEvent::VoiceStatus(v) => self.voice = v,
                 RadioEvent::ImagePresets(p) => self.sstv.on_presets(p, &ctx),

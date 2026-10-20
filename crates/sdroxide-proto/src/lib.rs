@@ -1546,7 +1546,15 @@ use sdroxide_types::{
 /// ([`sdroxide_types::RotatorProtocol`], a unit enum) on its tail — rotctld or
 /// PSTRotator's UDP control (issue #638). It rides `Command::SetRotatorConfig`
 /// and `StationConfig::rotator` whole, so a v178 peer reads it out of step.
-pub const PROTO_VERSION: u16 = 179;
+///
+/// v180: the TCI client. [`sdroxide_types::TciServerConfig`] gains `client`
+/// and `client_address` on its tail — dial out and push this radio's VFO to
+/// another TCI server, control only. It rides `Command::SetTciServerConfig`
+/// and `StationConfig::tci_server` whole, so a v179 peer reads the extra
+/// bytes as the start of the next field. [`ServerMsg::TciServerStatus`] also
+/// gains `client_connected` and `client_error`, the same break for that one
+/// message.
+pub const PROTO_VERSION: u16 = 180;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1757,6 +1765,10 @@ pub enum ServerMsg {
         addr: String,
         clients: usize,
         error: Option<String>,
+        /// Outbound TCI client socket is up. See [`sdroxide_types::TciServerConfig::client`].
+        client_connected: bool,
+        /// Why that client is down. `None` when it is off, connecting, or up.
+        client_error: Option<String>,
     },
     /// Built-in rigctld server status, so the settings dialog on a remote
     /// client can show what the engine's listener is doing.

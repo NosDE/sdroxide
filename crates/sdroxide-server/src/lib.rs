@@ -1166,9 +1166,21 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::RigctldStatus { running, addr, clients, error } => {
                 Some(ServerMsg::RigctldStatus { running, addr, clients, error })
             }
-            RadioEvent::TciServerStatus { running, addr, clients, error } => {
-                Some(ServerMsg::TciServerStatus { running, addr, clients, error })
-            }
+            RadioEvent::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            } => Some(ServerMsg::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            }),
             RadioEvent::ImagePresets(p) => {
                 latest.images = Some(p.clone());
                 Some(ServerMsg::ImagePresets(p))

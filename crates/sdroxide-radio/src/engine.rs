@@ -36,6 +36,7 @@ use sdroxide_nrsc5::{HdDemod, Mode as HdMode};
 use sdroxide_qo100::Qo100Controller;
 use sdroxide_rigctld::{RigState, RigctldController};
 use sdroxide_skimmer::{SkimmerAction, SkimmerController};
+use sdroxide_tci::TciTuneClient;
 use sdroxide_tci::server::{ServerRequest, TciServerController, TciStateSnapshot};
 use sdroxide_types::{
     AgcMode, Band, BandStackEntry, Command, DeviceCaps, DigiConfig, Direction, ImageKind,
@@ -2882,6 +2883,15 @@ struct Engine {
     /// Last bind failure, kept so the settings dialog can show why the server
     /// isn't running.
     tci_srv_err: Option<String>,
+    /// Outbound TCI client. Pushes this radio's dial to another TCI server
+    /// (590Ctrl) so that rig tunes along. Control only: no audio, no IQ, and
+    /// it never keys. Present while TCI Client is switched on.
+    tci_tune: Option<TciTuneClient>,
+    /// Last hertz handed to the client. It keeps only the newest value, and
+    /// this skips handing it the same one on every tick.
+    tci_tune_hz: u64,
+    tci_tune_connected: bool,
+    tci_tune_err: Option<String>,
     /// Dedicated wideband decimation feeding the TCI IQ stream, at the rate the
     /// clients asked for. `None` while nobody is subscribed.
     tci_iq_ddc: Option<Ddc>,
@@ -4238,6 +4248,10 @@ fn engine_thread(
         tci_srv: None,
         tci_cfg: TciServerConfig::default(),
         tci_srv_err: None,
+        tci_tune: None,
+        tci_tune_hz: 0,
+        tci_tune_connected: false,
+        tci_tune_err: None,
         tci_iq_ddc: None,
         tci_iq_buf: Vec::new(),
         tci_iq_ilv: Vec::new(),
@@ -4593,6 +4607,7 @@ fn engine_thread(
         engine.poll_hfdl();
         engine.poll_scanner();
         engine.poll_tci_server();
+        engine.poll_tci_client();
         engine.poll_rigctld();
         engine.poll_band_change();
         engine.poll_gain_slot();
@@ -11701,6 +11716,93 @@ impl Engine {
             }
             (false, false) => self.emit_tci_status(),
         }
+        self.sync_tci_client();
+    }
+
+    /// Start, stop or retarget the outbound TCI client from `tci_cfg`.
+    ///
+    /// Independent of the server above: 590Ctrl is usually the process already
+    /// listening on 50001, and this is the side that dials it. A tune sends
+    /// `vfo:` only. When our own server is the one actually bound on that
+    /// address, connecting would push the dial at ourselves, so the client
+    /// stays down and the status line says why. A server that failed to bind
+    /// — because 590Ctrl already has the port — is not in the way.
+    fn sync_tci_client(&mut self) {
+        if !self.tci_cfg.client {
+            let was =
+                self.tci_tune.is_some() || self.tci_tune_connected || self.tci_tune_err.is_some();
+            self.tci_tune = None;
+            self.tci_tune_hz = 0;
+            self.tci_tune_connected = false;
+            self.tci_tune_err = None;
+            if was {
+                self.emit_tci_status();
+            }
+            return;
+        }
+        if self.tci_srv.is_some() && self.tci_cfg.client_reaches_this_server() {
+            self.tci_tune = None;
+            self.tci_tune_hz = 0;
+            self.tci_tune_connected = false;
+            self.tci_tune_err = Some(
+                "that address is this TCI server — point TCI Client at 590Ctrl, or move this \
+                 server off that port"
+                    .into(),
+            );
+            self.emit_tci_status();
+            return;
+        }
+        let addr = self.tci_cfg.client_address.trim().to_string();
+        if addr.is_empty() {
+            self.tci_tune = None;
+            self.tci_tune_hz = 0;
+            self.tci_tune_connected = false;
+            self.tci_tune_err = Some("TCI Client needs a host:port".into());
+            self.emit_tci_status();
+            return;
+        }
+        match self.tci_tune.as_ref() {
+            Some(client) if client.address() == addr => {}
+            Some(client) => {
+                client.set_address(addr);
+                self.tci_tune_hz = 0;
+                self.tci_tune_connected = false;
+                self.tci_tune_err = None;
+            }
+            None => {
+                self.tci_tune = Some(TciTuneClient::start(addr));
+                self.tci_tune_hz = 0;
+                self.tci_tune_connected = false;
+                self.tci_tune_err = None;
+            }
+        }
+        // The dial may already be somewhere. Send it without waiting for the
+        // next click; the worker holds it until the socket is up.
+        self.push_tci_client();
+        self.emit_tci_status();
+    }
+
+    /// Hand the client the active dial when it has moved by a hertz or more.
+    fn push_tci_client(&mut self) {
+        let Some(client) = self.tci_tune.as_ref() else { return };
+        let hz = self.state.active_freq_hz().round().max(0.0) as u64;
+        if hz == 0 || hz == self.tci_tune_hz {
+            return;
+        }
+        self.tci_tune_hz = hz;
+        client.tune(hz);
+    }
+
+    /// Surface a connect or a drop. The worker reports only when it changes.
+    fn poll_tci_client(&mut self) {
+        let Some(client) = self.tci_tune.as_ref() else { return };
+        let Some(status) = client.poll_status() else { return };
+        if status.connected == self.tci_tune_connected && status.error == self.tci_tune_err {
+            return;
+        }
+        self.tci_tune_connected = status.connected;
+        self.tci_tune_err = status.error;
+        self.emit_tci_status();
     }
 
     fn start_tci_server(&mut self) {
@@ -11760,6 +11862,8 @@ impl Engine {
             addr: self.tci_cfg.addr(),
             clients: self.tci_srv.as_ref().map(|s| s.clients()).unwrap_or(0),
             error: self.tci_srv_err.clone(),
+            client_connected: self.tci_tune_connected,
+            client_error: self.tci_tune_err.clone(),
         });
     }
 
@@ -15544,6 +15648,7 @@ impl Engine {
                 self.good_vfo_hz = dial;
             }
             self.update_display_center();
+            self.push_tci_client();
             return;
         }
         let mut main_offset = self.state.rx_freq_hz() - self.state.center_hz;
@@ -15606,6 +15711,7 @@ impl Engine {
         // is the only place that would notice. A handful of comparisons, and the
         // dead band means ordinary tuning changes nothing.
         self.sync_skim_window();
+        self.push_tci_client();
     }
 
     /// Where a key-down would transmit: the dial's transmit frequency, or

@@ -12407,6 +12407,11 @@ decode, and transmit audio to put on the air. It is **on by default**.
   radio, and the last command wins.
 - **Allow clients to transmit** — turn this off to let programs read and tune
   but never key the transmitter.
+- **TCI Client** — dial out to another TCI server and send this radio's VFO
+  whenever you tune. Control only: no audio, no IQ, and it does not key the
+  transmitter. Off by default. The address is `127.0.0.1:50001`, which is
+  where 590Ctrl listens. Leave the server above off, or on another port, when
+  590Ctrl is already using 50001.
 
 The green status line shows whether the server is listening, on which address,
 and **how many clients are connected right now**. Press **APPLY** to save and
@@ -14881,7 +14886,7 @@ and not the station's.
 | `qso_log.json` | JSON | The logbook (digital and manual QSOs, with contest/QSL fields). |
 | `net.json` | JSON | Network cockpit: DX cluster / POTA / SOTA / PSK / FreeDV Reporter / WSPRnet feed settings, and callsign-lookup / eQSL / QRZ / HamQTH / Club Log / LoTW credentials (stored in plaintext). |
 | `winlink/` | directory | The Winlink mailbox: `inbox/`, `outbox/`, `sent/` and `archive/`, one `.b2f` file per message holding it exactly as it rides the wire ([§11](#11-winlink-radio-email)). The account settings live in `net.json`, password included, in plaintext. |
-| `tciserver.json` | JSON | Built-in TCI server: enabled, bind address, port, advertised device name, whether clients may transmit, and the client limit. |
+| `tciserver.json` | JSON | Built-in TCI server: enabled, bind address, port, advertised device name, whether clients may transmit, and the client limit. Also the outbound TCI Client: whether it dials another TCI server (590Ctrl) and that server's `host:port`. The client sends the VFO only. |
 | `rigctld.json` | JSON | Built-in Hamlib rigctld server: enabled, bind address, port, reported rig name, whether clients may transmit, and the client limit. |
 | `wsjtx.json` | JSON | WSJT-X UDP broadcast: enabled, destination host and port, and the name clients see. |
 | `scanner.json` | JSON | The scanner: memories or a range, the range and channel step, the level that counts as busy, the dwell, how it resumes, and which memories to skip. |
