@@ -9,8 +9,8 @@ use sdroxide_dsp::{IqCorrect, MonoResampler, Nco};
 use sdroxide_radio::rtrb;
 use sdroxide_radio::{Complex32, ControlUpdate, DC_BLOCK_HZ, IqSource, Result};
 use sdroxide_types::{
-    CatConfig, CatFamily, Mode, SoundFormat, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ, TrUsdxAudio,
-    TxTelemetry,
+    AgcMode, CatConfig, CatFamily, Mode, SoundFormat, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ,
+    TrUsdxAudio, TxTelemetry,
 };
 
 use crate::dial::Dial;
@@ -1160,6 +1160,16 @@ impl IqSource for AudioCatSource {
     /// let through. The rig's own filter is the one that does the work.
     fn set_control_filter(&mut self, mode: Mode, lo_hz: f64, hi_hz: f64) {
         self.cat.set_filter(mode, lo_hz as f32, hi_hz as f32);
+    }
+
+    /// The AGC button, sent to the rig's — on demod audio the AGC the sound
+    /// card is fed after, and so the only one whose setting can be heard.
+    fn set_control_agc(&mut self, agc: AgcMode) {
+        self.cat.set_agc(agc);
+    }
+
+    fn commands_agc(&self) -> bool {
+        self.cat.commands_agc()
     }
 
     // ── Squelch ──────────────────────────────────────────────────────────────

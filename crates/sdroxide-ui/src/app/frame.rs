@@ -1862,6 +1862,7 @@ impl SdroxideApp {
         } = self;
         // Read before the borrow below, which takes `self` apart.
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        let agc_without_off = caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
         // How far a bound zoom-out may go: the full-band lane where the front
         // end has one, else its passband. Read here for the same reason
         // `rig_squelch` is — after this the borrow has taken `self` apart.
@@ -1882,6 +1883,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut speech_acts,
             rig_squelch,
+            agc_without_off,
             zoom_out,
         };
         input.poll_pointer_and_keys(ctx, state, &mut sink, cmds);
@@ -1945,6 +1947,7 @@ impl SdroxideApp {
             cmds.push(Command::CwKey(false));
         }
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        let agc_without_off = caps.as_ref().is_some_and(|c| c.agc_off_unavailable);
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -1955,6 +1958,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut Vec::new(),
             rig_squelch,
+            agc_without_off,
             // Releasing held keys never pans or zooms, so the passband will do.
             zoom_out: (state.center_hz, state.sample_rate),
         };

@@ -1554,7 +1554,11 @@ use sdroxide_types::{
 /// bytes as the start of the next field. [`ServerMsg::TciServerStatus`] also
 /// gains `client_connected` and `client_error`, the same break for that one
 /// message.
-pub const PROTO_VERSION: u16 = 180;
+/// v181: [`sdroxide_types::DeviceCaps`] gains `agc_off_unavailable` (`bool`)
+/// on its tail — the AGC control drives a radio whose AGC has no Off, so the
+/// client stops offering it. `DeviceCaps` rides every capabilities message, so
+/// a v180 peer reads the extra byte out of step.
+pub const PROTO_VERSION: u16 = 181;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

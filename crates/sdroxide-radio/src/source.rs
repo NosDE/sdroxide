@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::{Complex32, Result};
-use sdroxide_types::{Mode, Vfo};
+use sdroxide_types::{AgcMode, Mode, Vfo};
 
 /// Corner frequency of the front-end DC blocker. Low enough to be invisible at
 /// any device rate (10 ppm of a 2 Msps span), high enough to settle in ~8 ms.
@@ -689,6 +689,29 @@ pub trait IqSource: Send {
     /// Default: no-op — an SDR's filter is the engine's own, applied to IQ it
     /// has all of.
     fn set_control_filter(&mut self, _mode: Mode, _lo_hz: f64, _hi_hz: f64) {}
+
+    /// Command the rig's own AGC to the setting the operator picked here.
+    ///
+    /// The same case as [`Self::set_control_filter`]: on demodulated audio the
+    /// rig's AGC has already levelled what arrives, so the engine's AGC behind
+    /// it has almost nothing left to do and its button changes nothing that
+    /// can be heard. A family with no way to say a particular setting — Icom
+    /// has no plain AGC OFF — leaves the radio where it was.
+    ///
+    /// Default: no-op.
+    fn set_control_agc(&mut self, _agc: AgcMode) {}
+
+    /// Whether [`Self::set_control_agc`] reaches the radio at all.
+    ///
+    /// Every rig that answers true takes Slow, Med and Fast but has no way to
+    /// be told Off, so while the radio is the one demodulating the engine
+    /// stops offering Off (`DeviceCaps::agc_off_unavailable`) rather than
+    /// show a setting the audio never hears.
+    ///
+    /// Default: false.
+    fn commands_agc(&self) -> bool {
+        false
+    }
 
     /// The receive offset (RIT) this front end has to carry itself, in Hz —
     /// zero when RIT is off.
@@ -1613,6 +1636,14 @@ impl IqSource for ConvertedSource {
     /// move.
     fn set_control_filter(&mut self, mode: Mode, lo_hz: f64, hi_hz: f64) {
         self.inner.set_control_filter(mode, lo_hz, hi_hz);
+    }
+
+    fn set_control_agc(&mut self, agc: AgcMode) {
+        self.inner.set_control_agc(agc);
+    }
+
+    fn commands_agc(&self) -> bool {
+        self.inner.commands_agc()
     }
 
     /// Relative (an offset from the dial), so untouched.

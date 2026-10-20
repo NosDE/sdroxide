@@ -462,6 +462,16 @@ mode. What is in the box never changes; only where the two rows are cut does.
   inside a transmission — which is what a modem needs and what an AGC, attacking
   in two milliseconds, is the opposite of. So whatever you set here, FT8 sees
   the same signal.
+
+  On a radio that does its own demodulating — an Icom on a serial cable with
+  its audio on a sound card, or on its network port receiving **AF** — the
+  setting is sent to the *radio's* AGC, because the audio has already been
+  levelled there and nothing on this side could be heard to change. Icom's AGC
+  has `Fast`, `Mid` and `Slow` but no way to be switched off from a computer,
+  so there the control offers `Slow`, `Med` and `Fast` only. On an Icom's
+  **12 kHz IF** sdroxide does the demodulating, the AGC is its own, and `Off` is
+  back. A mode you had saved with the AGC off comes up on that mode's usual
+  setting instead, and is still off when you next use it where `Off` exists.
 - **Man** — the fixed audio gain the receiver runs on while the AGC is `Off`,
   shown only then. Unlevelled audio is whatever the band delivered, and a weak
   SSB signal can sit tens of dB below anything the volume control can reach, so
@@ -8278,7 +8288,9 @@ what does the selecting.
 > - **Icom** — the filter-width index, which follows a formula rather than a
 >   per-model table: 50–500 Hz in fifties then 600–3600 Hz in hundreds on a
 >   sideband, and 200 Hz–10 kHz in two-hundreds in AM. FM picks its filter with
->   the mode, so nothing is sent there.
+>   the mode, so nothing is sent there. sdroxide's own RTTY keeps the radio on
+>   USB, with the full range; a radio switched to *its* RTTY at the front panel
+>   only goes to 2.7 kHz, so a wider filter there is sent as 2.7 kHz.
 > - **Kenwood** — `FW` in Hz in CW; on a sideband the rig has no width at all
 >   but a pair of *cuts* (`SL`/`SH`), which is exactly what the panel's two
 >   filter edges are, so they map across directly. Index tables are carried for
@@ -8297,6 +8309,13 @@ what does the selecting.
 > Where a width is not an exact entry in the rig's table it is rounded **up**,
 > so the radio's filter is never quietly narrower than the one on screen — a
 > filter that is too narrow presents as a signal that simply is not there.
+
+> **Note (the AGC on a CAT rig):** for the same reason, the **AGC** control is
+> sent to the radio on an **Icom** — `Slow`, `Med` and `Fast` select its SLOW,
+> MID and FAST presets. Icom has no command that simply switches its AGC off,
+> so `Off` is not offered while the radio is the one demodulating. The other
+> families' AGC, and a **Xiegu**'s, are not commanded yet: there the control
+> only reaches sdroxide's own AGC, behind the radio's.
 
 > **Note (Yaesu):** the S-meter and the transmit SWR come from the radio's own
 > meters (`SM0` and `RM6`), because on a CAT rig there is nothing else to
@@ -9974,8 +9993,11 @@ radio puts in the audio stream (`SET > Connectors > LAN AF/IF Output > Output
 Select`), which decides who does the demodulating:
 
 - **AF — the radio demodulates.** The radio's filters, AGC and detector do the
-  work, and the panadapter is the radio's own scope — see above. This is the safe
-  default and works on every model at every sample rate.
+  work, and the panadapter is the radio's own scope — see above. The receive
+  panel's filter width and AGC are sent to the radio, since its filter and AGC
+  are the ones the audio has been through; the AGC then has no `Off`, which
+  Icom gives no way to set. This is the safe default and works on every model
+  at every sample rate.
 - **12 kHz IF — sdroxide demodulates.** The radio sends its DRM intermediate
   frequency instead of audio. sdroxide mixes it down to baseband and treats it
   as an ordinary receiver front end, so its own filters, noise reduction,

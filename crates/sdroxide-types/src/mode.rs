@@ -2044,6 +2044,15 @@ impl AgcMode {
         }
     }
 
+    /// [`Self::next`], passing over `Off` where it is not on offer — see
+    /// `DeviceCaps::agc_off_unavailable`.
+    pub fn next_offered(self, offer_off: bool) -> AgcMode {
+        match self.next() {
+            AgcMode::Off if !offer_off => AgcMode::Off.next(),
+            next => next,
+        }
+    }
+
     /// Hang time in milliseconds; `None` means AGC disabled.
     pub fn hang_ms(self) -> Option<f32> {
         match self {
@@ -2058,6 +2067,26 @@ impl AgcMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A radio whose AGC cannot be switched off is walked through its three
+    /// presets only; everywhere else the cycle is the full four.
+    #[test]
+    fn the_agc_cycle_passes_over_off_only_where_it_is_not_on_offer() {
+        let walk = |offer_off| {
+            let mut agc = AgcMode::Fast;
+            (0..4)
+                .map(|_| {
+                    agc = agc.next_offered(offer_off);
+                    agc
+                })
+                .collect::<Vec<_>>()
+        };
+        use AgcMode::*;
+        assert_eq!(walk(true), [Off, Slow, Med, Fast]);
+        assert_eq!(walk(false), [Slow, Med, Fast, Slow]);
+        // An Off already set still leaves for a real preset.
+        assert_eq!(Off.next_offered(false), Slow);
+    }
 
     /// A mode whose passband is a channel about the carrier must have nothing
     /// but symmetric presets, and a mode with an asymmetric preset must not

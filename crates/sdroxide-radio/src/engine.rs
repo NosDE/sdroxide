@@ -3662,6 +3662,8 @@ fn engine_thread(
     caps.commands_rig_power = source.commands_rig_power();
     caps.has_rx_antenna = source.rx_antenna().is_some();
     caps.wide_span_hz = source.wide_span_hz();
+    // `Engine::filters_at_the_rig`, before there is an engine to ask.
+    caps.agc_off_unavailable = (caps.audio_mode || caps.rx_audio_external) && source.commands_agc();
     let audio_mode = caps.audio_mode;
     let radio_fs = source.sample_rate();
     let audio_bw = source.display_bandwidth().unwrap_or(radio_fs / 2.0);
@@ -4338,6 +4340,10 @@ fn engine_thread(
     // the same path a reconnect uses, so both land on the same port.
     engine.restore_antennas();
     engine.restore_gains();
+    // A session saved with the AGC off, opened on a radio whose AGC cannot be.
+    if engine.settle_rig_agc() {
+        engine.push_control_agc();
+    }
     // The opening state goes out here rather than with the capabilities above,
     // so the first thing every UI sees is the port the radio is actually on.
     let _ = engine.event_tx.send(RadioEvent::State(engine.state.clone()));
@@ -6140,6 +6146,9 @@ impl Engine {
                         profile.apply_to(r);
                     }
                     (r.filter_lo, r.filter_hi) = m.default_filter();
+                    // Ahead of the rebuild below, which takes the AGC from it.
+                    self.settle_rig_agc();
+                    let r = &mut self.state.rx[0];
                     let snapshot = *r;
                     // Rebuild the demodulator for the new mode. Sideband is
                     // carried entirely in the sign of the filter edges, so
@@ -7129,6 +7138,45 @@ impl Engine {
         }
         let r = &self.state.rx[0];
         self.source.set_control_filter(r.mode, r.filter_lo as f64, r.filter_hi as f64);
+    }
+
+    /// Hand the main receiver's AGC to a radio that filters for us, on the same
+    /// terms as [`Self::push_control_filter`]: its audio has already been
+    /// through its own AGC, which is the one the operator's button has to reach.
+    fn push_control_agc(&mut self) {
+        if !self.filters_at_the_rig() {
+            return;
+        }
+        self.settle_rig_agc();
+        self.source.set_control_agc(self.state.rx[0].agc);
+    }
+
+    /// Whether the AGC control has lost its Off — see
+    /// `DeviceCaps::agc_off_unavailable`.
+    fn agc_off_unavailable(&self) -> bool {
+        self.filters_at_the_rig() && self.source.commands_agc()
+    }
+
+    /// Put the main receiver back on one of the radio's presets if it is set
+    /// to an Off the radio cannot honour, and say whether it moved.
+    ///
+    /// An Off can still arrive after the control stopped offering it: from a
+    /// session saved on an SDR, from the mode's saved settings, or from the
+    /// IF path an Icom has just left for AF. It goes to the mode's default
+    /// preset rather than to some guess at the radio's, and only on the
+    /// receiver: the mode's saved Off is left alone, so the same mode on an
+    /// SDR — or on the IF again — still comes back off.
+    fn settle_rig_agc(&mut self) -> bool {
+        if !self.caps.agc_off_unavailable || self.state.rx[0].agc != AgcMode::Off {
+            return false;
+        }
+        let mode = self.state.rx[0].mode;
+        let agc = mode.default_profile().agc.unwrap_or(AgcMode::Med);
+        self.state.rx[0].agc = agc;
+        if let Some(c) = self.chain_mut(RxId::Main) {
+            c.agc.set_mode(agc);
+        }
+        true
     }
 
     /// Whether the radio in front of us is the one doing the receiving, so its
@@ -8262,6 +8310,13 @@ impl Engine {
                     self.push_control_filter();
                 }
             }
+            // Off on a radio that cannot switch its AGC off: the control no
+            // longer offers it, but a rigctld client or a client built before
+            // it stopped can still ask. Refused rather than taken, which would
+            // show an Off the audio never hears.
+            SetAgc { rx: RxId::Main, agc: AgcMode::Off } if self.caps.agc_off_unavailable => {
+                self.emit_state();
+            }
             SetAgc { rx, agc } => {
                 self.state.rx[rx.index()].agc = agc;
                 // Switching off hands the audio to the fixed manual gain. Seed
@@ -8280,6 +8335,9 @@ impl Engine {
                     c.agc.set_mode(agc);
                 }
                 self.remember_mode_setting(rx, |p| p.agc = Some(agc));
+                if rx == RxId::Main {
+                    self.push_control_agc();
+                }
             }
             SetAgcMaxGain { rx, db } => {
                 self.state.rx[rx.index()].agc_max_gain_db = db;
@@ -8365,6 +8423,9 @@ impl Engine {
                         c.agc.set_mode(agc);
                         c.agc.set_max_gain_db(max_gain);
                         c.agc.set_manual_gain_db(manual);
+                    }
+                    if rx == RxId::Main {
+                        self.push_control_agc();
                     }
                 }
             }
@@ -13387,6 +13448,8 @@ impl Engine {
             // pairing whose audio comes from the *receiver* leaves the rig's
             // own filter alone.
             self.push_control_filter();
+            // And the AGC the new mode's settings brought with them.
+            self.push_control_agc();
             if self.audio_mode {
                 self.update_display_center();
             }
@@ -14780,6 +14843,8 @@ impl Engine {
             p.noise_reduction = Some(r.noise_reduction);
             p.binaural = Some(r.binaural);
         });
+        // `apply_entry` above sent the rig the AGC the mode had before this.
+        self.push_control_agc();
 
         // The hardware preferences travel with the profile: the antenna port
         // and the gain stages, applied through the same paths an antenna CLI
@@ -15098,6 +15163,7 @@ impl Engine {
         }
         self.audio_mode = audio_mode;
         self.caps.audio_mode = audio_mode;
+        self.caps.agc_off_unavailable = self.agc_off_unavailable();
         self.caps.label = self.source.describe();
         self.radio_fs = rate;
         self.audio_bw = self.source.display_bandwidth().unwrap_or(rate / 2.0);
@@ -15105,6 +15171,10 @@ impl Engine {
         self.stream_center_hz = self.source.center_hz();
         self.state.center_hz = self.stream_center_hz;
         self.rebuild_receive_path(decimation_for(self.want_decimation, rate, audio_mode));
+        // Onto AF with the AGC off: the radio's AGC is now the one heard.
+        if self.settle_rig_agc() {
+            self.push_control_agc();
+        }
         let _ = self.event_tx.send(RadioEvent::CapabilitiesUpdated(self.caps.clone()));
         Ok(())
     }
@@ -15401,6 +15471,7 @@ impl Engine {
         self.caps.has_rx_antenna = self.source.rx_antenna().is_some();
         self.caps.wide_span_hz = self.source.wide_span_hz();
         self.audio_mode = self.caps.audio_mode;
+        self.caps.agc_off_unavailable = self.agc_off_unavailable();
         self.radio_fs = self.source.sample_rate();
         self.audio_bw = self.source.display_bandwidth().unwrap_or(self.radio_fs / 2.0);
         // The decimation is the operator's, so it carries across the swap — but
