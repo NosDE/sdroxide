@@ -855,6 +855,10 @@ impl IqSource for PanadapterSource {
         self.ctrl.set_rig_power(on)
     }
 
+    fn set_power_step(&mut self, code: u8) {
+        self.ctrl.set_power_step(code)
+    }
+
     fn commands_rig_power(&self) -> bool {
         self.ctrl.commands_rig_power()
     }

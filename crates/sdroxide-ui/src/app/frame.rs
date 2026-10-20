@@ -239,6 +239,9 @@ impl eframe::App for SdroxideApp {
         }
 
         let mut cmds = Vec::new();
+        // An FDM-DUO's power buttons and the AMP panel need the radio's
+        // settings from the first frame, not from when Settings is opened.
+        self.load_radio_cfg_for_duo();
         // A channel list chosen in the memories window: parsed here and sent
         // to the engine, which owns the list and the numbering in it.
         self.poll_chirp_import(&mut cmds);
@@ -981,6 +984,7 @@ impl eframe::App for SdroxideApp {
         self.grid_tracker_window(&ctx);
         self.bands_window(&ctx);
         self.sat_window(&ctx, &mut cmds);
+        self.amp_window(&ctx, &mut cmds);
         self.morse_window(&ctx);
         self.help.ui(&ctx);
         // Last, so it lands on top of everything else that opened this frame.
@@ -1699,6 +1703,10 @@ impl SdroxideApp {
                         self.relay_edit = c.relay.clone();
                         self.relay_seeded = true;
                     }
+                    if !self.amp_seeded {
+                        self.amp_edit = c.amp.clone();
+                        self.amp_seeded = true;
+                    }
                     // Adopted on every announcement rather than seeded once:
                     // these are not dialog buffers the operator types into but
                     // the band plan the whole client draws with, and the
@@ -1728,6 +1736,7 @@ impl SdroxideApp {
                     self.rotator_status = Some((connected, az_deg, el_deg, error));
                 }
                 RadioEvent::RelayStatus(st) => self.relay_status = *st,
+                RadioEvent::AmpStatus(st) => self.amp_status = *st,
                 RadioEvent::ImageSaved(e) => match e.kind {
                     sdroxide_types::ImageKind::Sstv => self.sstv.on_saved(e, &ctx),
                     sdroxide_types::ImageKind::Wefax => self.wefax.on_saved(e, &ctx),

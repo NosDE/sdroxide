@@ -256,6 +256,9 @@ pub trait IqSource: Send {
     fn set_rig_power(&mut self, _on: bool) -> Result<()> {
         Ok(())
     }
+    /// Put the radio's own power setting on one of its numbered steps — the
+    /// ELAD FDM-DUO's menu 34, by its `TP` parameter. A no-op everywhere else.
+    fn set_power_step(&mut self, _code: u8) {}
     /// Whether [`Self::set_rig_power`] reaches this radio, for
     /// `DeviceCaps::commands_rig_power`.
     fn commands_rig_power(&self) -> bool {
@@ -1481,6 +1484,9 @@ impl IqSource for ConvertedSource {
     }
     fn set_rig_power(&mut self, on: bool) -> Result<()> {
         self.inner.set_rig_power(on)
+    }
+    fn set_power_step(&mut self, code: u8) {
+        self.inner.set_power_step(code)
     }
     fn commands_rig_power(&self) -> bool {
         self.inner.commands_rig_power()

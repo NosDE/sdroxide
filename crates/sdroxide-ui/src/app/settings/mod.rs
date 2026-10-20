@@ -30,6 +30,7 @@ pub(in crate::app) mod ui_tab;
 pub(in crate::app) mod wavelog;
 
 pub(in crate::app) mod alerts;
+pub(in crate::app) mod amp;
 
 use eframe::egui::{self, Color32, ComboBox, RichText};
 use sdroxide_types::{Command, LoginTarget, LookupProvider, NetworkConfig, UploadTarget};
@@ -88,6 +89,8 @@ pub(in crate::app) enum SettingsTab {
     /// sequencer's timings and a test button apiece — and this is the one page
     /// in here whose being hard to find could cost somebody a front end.
     TrSwitch,
+    /// The Hardrock amplifier: its port, model, and whether it follows the band.
+    Amp,
     /// Dial another station. Native only: a browser client is already attached
     /// to the server that served it and has nowhere to put a second one.
     #[cfg(not(target_arch = "wasm32"))]
@@ -294,6 +297,8 @@ pub(in crate::app) struct SettingsIo<'a> {
     relay_apply: &'a mut bool,
     /// Which contact the operator asked to hear, if any.
     relay_test: &'a mut Option<u8>,
+    amp_edit: &'a mut sdroxide_types::AmpConfig,
+    amp_apply: &'a mut bool,
     /// Control-input bindings, plus the row (if any) waiting to capture a
     /// keypress. Persisted on close, since a rebind has no APPLY step.
     input_edit: &'a mut sdroxide_types::InputSettings,
@@ -1081,6 +1086,8 @@ impl SdroxideApp {
         let mut relay_edit = self.relay_edit.clone();
         let mut relay_apply = false;
         let mut relay_test: Option<u8> = None;
+        let mut amp_edit = self.amp_edit.clone();
+        let mut amp_apply = false;
         let mut input_edit = self.input.cfg.clone();
         let mut key_capture = self.input.key_capture;
         let mut midi_learn = self.input.midi_learn;
@@ -1253,6 +1260,8 @@ impl SdroxideApp {
                             relay_edit: &mut relay_edit,
                             relay_apply: &mut relay_apply,
                             relay_test: &mut relay_test,
+                            amp_edit: &mut amp_edit,
+                            amp_apply: &mut amp_apply,
                             input_edit: &mut input_edit,
                             key_capture: &mut key_capture,
                             midi_learn: &mut midi_learn,
@@ -1363,6 +1372,11 @@ impl SdroxideApp {
         }
         if let Some(channel) = relay_test {
             cmds.push(Command::TestRelay { channel });
+        }
+        self.amp_edit = amp_edit;
+        if amp_apply {
+            // The engine persists amp.json when it (re)opens the port.
+            cmds.push(Command::SetAmpConfig(Box::new(self.amp_edit.clone())));
         }
         self.sat_ui = sat_ui;
         if self.sat_cfg_seeded && sat_edit != self.sat_cfg_edit {
@@ -1778,6 +1792,7 @@ impl SdroxideApp {
             (SettingsTab::Winlink, "Winlink"),
             (SettingsTab::Servers, "Servers"),
             (SettingsTab::TrSwitch, "T/R switch"),
+            (SettingsTab::Amp, "Amplifier"),
         ];
         // Next to Servers: the two are the same subject from opposite ends —
         // what this station offers others, and where this screen goes.
@@ -3423,6 +3438,16 @@ impl SdroxideApp {
                     &self.relay_devices,
                     io.relay_apply,
                     io.relay_test,
+                );
+            }
+            SettingsTab::Amp => {
+                amp::settings_amp_tab(
+                    ui,
+                    io.amp_edit,
+                    self.amp_seeded,
+                    &self.amp_status,
+                    &self.serial_ports,
+                    io.amp_apply,
                 );
             }
             #[cfg(not(target_arch = "wasm32"))]

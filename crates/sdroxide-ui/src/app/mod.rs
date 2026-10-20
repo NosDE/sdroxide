@@ -20,9 +20,11 @@
 //! `pub(in crate::app)`, which is as wide as anything here ever gets.
 
 pub(in crate::app) mod alerts;
+mod amp;
 pub(in crate::app) mod awards;
 pub(in crate::app) mod bands;
 pub(in crate::app) mod drm;
+mod duo_power;
 pub(in crate::app) mod frame;
 pub(in crate::app) mod grid_tracker;
 pub(in crate::app) mod hd;
@@ -1065,6 +1067,20 @@ pub struct SdroxideApp {
     /// The switching devices the engine's machine can see, from
     /// [`sdroxide_types::DeviceProbe::Relays`].
     relay_devices: Vec<sdroxide_types::RelayDevice>,
+    /// The Hardrock amplifier, mirrored from [`RadioEvent::AmpStatus`] and
+    /// replayed on connect like the T/R switch's.
+    amp_status: sdroxide_types::AmpStatus,
+    /// The Amplifier settings tab's working copy, seeded once like the relay's.
+    amp_edit: sdroxide_types::AmpConfig,
+    amp_seeded: bool,
+    /// The AMP window, and which reading its meter shows.
+    show_amp: bool,
+    /// The AMP window's last state has been read back from the settings.
+    amp_restored: bool,
+    /// When the AMP window's place or picks last changed and are still to be
+    /// written to the settings file.
+    amp_save_at: Option<f64>,
+    amp_meter: amp::AmpMeters,
     /// The station's IARU region, as the General tab's dropdown last showed it.
     ///
     /// Unlike the config buffers around it this is not seeded-once-then-owned
@@ -1708,6 +1724,13 @@ impl SdroxideApp {
             relay_status: Default::default(),
             relay_edit: Default::default(),
             relay_seeded: false,
+            amp_status: Default::default(),
+            amp_edit: Default::default(),
+            amp_seeded: false,
+            show_amp: false,
+            amp_restored: false,
+            amp_save_at: None,
+            amp_meter: Default::default(),
             relay_devices: Vec::new(),
             rot_cfg_seeded: false,
             // Whatever this process is already on: the binary applies the

@@ -3304,6 +3304,20 @@ struct Engine {
     /// connection transitions bypass the throttle, movement does not.
     rot_last_status: Option<sdroxide_rotator::RotStatus>,
     next_rot_emit: Instant,
+    /// The Hardrock amplifier's config as persisted (`amp.json`), announced in
+    /// the station bundle the way the rotator's is.
+    amp_cfg: sdroxide_types::AmpConfig,
+    /// The link to the amplifier, when enabled. Opened by the primary engine
+    /// only — one station, one amplifier.
+    amp: Option<sdroxide_hardrock::AmpLink>,
+    /// What was last told to the clients, and when the readings may next go
+    /// out — link changes bypass the throttle, meter movement does not.
+    amp_last_status: Option<sdroxide_types::AmpStatus>,
+    next_amp_emit: Instant,
+    /// The transmit band last sent to the amplifier, and whether it was
+    /// connected then — a reconnect is told the band again.
+    amp_band_told: Option<sdroxide_types::Band>,
+    amp_was_connected: bool,
     /// The external T/R switch's config as persisted (`relay.json`), announced
     /// in the station bundle the way the rotator's is.
     relay_cfg: sdroxide_types::RelayConfig,
@@ -4571,6 +4585,12 @@ fn engine_thread(
         picup: sdroxide_picup::PictureUploader::new(),
         picup_pending: None,
         picup_noticed: None,
+        amp_cfg: sdroxide_types::AmpConfig::default(),
+        amp: None,
+        amp_last_status: None,
+        next_amp_emit: Instant::now(),
+        amp_band_told: None,
+        amp_was_connected: false,
         relay_cfg: sdroxide_types::RelayConfig::default(),
         tr_switch: engine_cfg.tr_switch.clone(),
         relay_last_status: None,
@@ -4687,6 +4707,11 @@ fn engine_thread(
     engine.rot_cfg = sdroxide_config::load_rotator_config();
     if engine.primary {
         engine.sync_rotator();
+    }
+    // One station, one amplifier: only the primary engine opens its port.
+    engine.amp_cfg = sdroxide_config::load_amp_config();
+    if engine.primary {
+        engine.sync_amp();
     }
     engine.relay_cfg = sdroxide_config::load_relay_config();
     // Received pictures to an FTP server. Every engine uploads what it
@@ -4895,6 +4920,7 @@ fn engine_thread(
         engine.poll_tle_refresh();
         engine.poll_sat_track();
         engine.poll_rotator_status();
+        engine.poll_amp();
         engine.poll_tr_switch();
         // Attach (or re-attach) the configured radio on its own when the
         // front-end is only a stand-in — no trip through Settings.
@@ -5261,7 +5287,16 @@ fn engine_thread(
                     adc_peak_dbfs,
                     adc_clip,
                     adc_overload,
-                    tx: Some(TxMeters { fwd_w: tele.fwd_w, swr: tele.swr, alc, po: tele.po }),
+                    tx: Some({
+                        // The amplifier's own forward power and SWR, where the
+                        // radio measures neither — an FDM-DUO into a Hardrock
+                        // is the case this is for. The meter only: the SWR guard
+                        // above still reads what the radio reports, and the
+                        // amplifier trips on its own SWR by itself.
+                        let (fwd_w, swr, rfl_w) =
+                            engine.amp_tx_meter(tele.fwd_w, tele.swr, tele.rfl_w);
+                        TxMeters { fwd_w, swr, alc, po: tele.po, rfl_w }
+                    }),
                     stereo: false,
                     tone: None,
                     // Transmitting: the receiver is stood down and whatever the
@@ -9011,6 +9046,9 @@ impl Engine {
             // sdroxide believes about a radio that has just been switched off is
             // the link's business to notice, and the reconnect that follows is
             // what puts a radio switched back on into a known state.
+            // The radio's own power step (the FDM-DUO's menu 34). The source
+            // ignores it where the radio has none.
+            SetRigPowerStep(code) => self.source.set_power_step(code),
             SetRigPower(on) => {
                 if !self.caps.commands_rig_power {
                     return;
@@ -10196,6 +10234,25 @@ impl Engine {
                 // old one before opening the new.
                 self.sync_relay();
                 self.emit_station_config();
+                return;
+            }
+            SetAmpConfig(cfg) => {
+                if let Err(e) = sdroxide_config::save_amp_config(&cfg) {
+                    warn!("saving amplifier config: {e}");
+                }
+                self.amp_cfg = *cfg;
+                // Only the primary engine owns the port. A station with one
+                // radio — the usual case — has only a primary.
+                if self.primary {
+                    self.sync_amp();
+                }
+                self.emit_station_config();
+                return;
+            }
+            Amp(action) => {
+                if let Some(amp) = self.amp.as_ref() {
+                    amp.action(action);
+                }
                 return;
             }
             TestRelay { channel } => {
@@ -12531,6 +12588,7 @@ impl Engine {
                 sat: self.sat_cfg.clone(),
                 rotator: self.rot_cfg.clone(),
                 relay: self.relay_cfg.clone(),
+                amp: self.amp_cfg.clone(),
                 region: sdroxide_types::region(),
                 band_plan: sdroxide_types::band_plan().clone(),
                 digi_presets: sdroxide_types::digi_presets().to_vec(),
@@ -12869,6 +12927,88 @@ impl Engine {
             }
         }
         rot.park();
+    }
+
+    /// Rebuild the amplifier link after a config change. The old link is
+    /// dropped — closing its port — before the new one opens the same port.
+    fn sync_amp(&mut self) {
+        self.amp = None;
+        self.amp_last_status = None;
+        self.amp_band_told = None;
+        self.amp_was_connected = false;
+        if self.amp_cfg.enabled {
+            self.amp = Some(sdroxide_hardrock::AmpLink::start(self.amp_cfg.clone()));
+        }
+        // Say so straight away, so the panel does not keep showing readings
+        // from a link that no longer exists.
+        let st = sdroxide_types::AmpStatus {
+            configured: self.amp_cfg.enabled,
+            model: self.amp_cfg.model,
+            ..Default::default()
+        };
+        let _ = self.event_tx.send(RadioEvent::AmpStatus(Box::new(st)));
+    }
+
+    /// Forward power, SWR and reflected power for the TX meter. The radio's
+    /// own, except while the amplifier is in line (PTT): then what goes to the
+    /// antenna is the amplifier's output, so its power and SWR are shown, and
+    /// the radio's (its drive into the amplifier) is not. The amplifier gives
+    /// no reflected power of its own here, so that is left out. Before the
+    /// FDM-DUO's `FP` was read, the radio had no forward power to show and the
+    /// order did not matter; with it, the radio's 6 W would have hidden the
+    /// amplifier's 500 (AJ3G, 18 Oct 2026).
+    fn amp_tx_meter(
+        &self,
+        fwd_w: Option<f32>,
+        swr: Option<f32>,
+        rfl_w: Option<f32>,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        let amp = self
+            .amp_last_status
+            .as_ref()
+            .filter(|_| self.amp_cfg.feed_tx_meter)
+            .and_then(|s| s.readings)
+            .filter(|r| r.ptt);
+        let Some(r) = amp else { return (fwd_w, swr, rfl_w) };
+        (Some(r.fwd_w), (r.swr >= 1.0).then_some(r.swr).or(swr), None)
+    }
+
+    /// Relay the amplifier's readings to the clients, and keep its band on the
+    /// one the station would transmit on.
+    fn poll_amp(&mut self) {
+        let Some(amp) = self.amp.as_ref() else { return };
+        let st = amp.status();
+
+        if self.amp_cfg.follow_band {
+            let hz = self.tx_target_hz();
+            let band = sdroxide_types::Band::containing(hz);
+            let reconnected = st.connected && !self.amp_was_connected;
+            if st.connected && (reconnected || self.amp_band_told != Some(band)) {
+                // SAFETY INTERLOCK (docs/hardrock/safety-interlocks.md, #3):
+                // the band is never set mid-over. Changing band switches the
+                // amplifier's low-pass filter relays, and switching them under
+                // full power arcs the contacts and puts the output devices
+                // into an open or wrong filter. The band follows once the
+                // transmission ends.
+                if !self.on_air() && hz > 0.0 {
+                    amp.set_frequency(hz.round() as u64);
+                    self.amp_band_told = Some(band);
+                }
+            }
+        }
+        self.amp_was_connected = st.connected;
+
+        let now = Instant::now();
+        let transition = self
+            .amp_last_status
+            .as_ref()
+            .is_none_or(|p| p.connected != st.connected || p.error != st.error || p.atu != st.atu);
+        let moved = now >= self.next_amp_emit && self.amp_last_status.as_ref() != Some(&st);
+        if transition || moved {
+            self.next_amp_emit = now + Duration::from_millis(250);
+            self.amp_last_status = Some(st.clone());
+            let _ = self.event_tx.send(RadioEvent::AmpStatus(Box::new(st)));
+        }
     }
 
     /// Relay the rotctld client's health to the clients: connection changes

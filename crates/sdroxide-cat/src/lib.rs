@@ -179,6 +179,9 @@ pub enum CatUpdate {
     /// family whose meter answers in watts sends this — QRP Labs' `PC`, which
     /// on every other ASCII family here is the power *control* instead.
     FwdW(f32),
+    /// TX reflected power the rig has measured, in watts. Only a family that
+    /// reports it in a known unit sends this — the ELAD FDM-DUO's `RP`.
+    RflW(f32),
     /// RX S-meter reading in dBm, from the rig's own meter (routed to the
     /// signal channel, not the control channel).
     Signal(f32),
@@ -404,6 +407,26 @@ trait Protocol: Send {
     /// Whether [`Protocol::set_power`] reaches this family at all.
     fn commands_power(&self) -> bool {
         false
+    }
+    /// Whether the Drive and TUNE levels are applied by scaling the transmit
+    /// audio rather than by a power command. True for a family whose power
+    /// register is pinned at its maximum when the port opens (see
+    /// [`Protocol::clear_offsets`]); its [`Protocol::set_power`] sends nothing,
+    /// and the source scales the audio it hands the rig instead.
+    fn power_by_audio(&self) -> bool {
+        false
+    }
+    /// For a family with [`Self::power_by_audio`]: the share of full audio
+    /// level, as a power fraction, that Drive 100% sends. Below 1 where the rig
+    /// is already at its full output with less than full audio, so the Drive
+    /// slider spans the rig's range instead of the bottom of it.
+    fn audio_power_ceiling(&self) -> f32 {
+        1.0
+    }
+    /// Put the rig's own power setting on one of its numbered steps — the
+    /// FDM-DUO's menu 34 (`TP`). Nothing on a family without one.
+    fn set_power_step(&mut self, _code: u8) -> Vec<Vec<u8>> {
+        Vec::new()
     }
 
     /// Set the receiver's squelch threshold, as a `0..1` fraction of the rig's
@@ -1266,7 +1289,7 @@ fn make_protocol(cfg: &CatConfig) -> Box<dyn Protocol> {
         CatFamily::Yaesu => Box::new(yaesu::Yaesu::new()),
         CatFamily::Kenwood => Box::new(kenwood::Kenwood::new(cfg.kenwood_send)),
         CatFamily::Elecraft => Box::new(elecraft::Elecraft::new()),
-        CatFamily::Elad => Box::new(elad::Elad::new(cfg.elad_tx_input)),
+        CatFamily::Elad => Box::new(elad::Elad::new(cfg.elad_tx_input, cfg.elad_tx_power)),
         // The one family whose framing depends on the *sound* settings: a QMX's
         // USB codec carries either demodulated audio or raw I/Q, and which one
         // it must carry is asserted at the radio when the port opens.
@@ -1311,6 +1334,9 @@ enum CatCmd {
     AntennaRead,
     /// Switch the radio itself off, or back on again.
     RigPower(bool),
+    /// The rig's own power setting, one of its numbered steps — see
+    /// [`Protocol::set_power_step`].
+    PowerStep(u8),
     Stop,
 }
 
@@ -1345,6 +1371,8 @@ pub struct CatHandle {
     scope: std::sync::Arc<std::sync::Mutex<Option<ScopeFrame>>>,
     cw_chunk_len: usize,
     commands_power: bool,
+    power_by_audio: bool,
+    audio_power_ceiling: f32,
     commands_filter: bool,
     commands_agc: bool,
     commands_squelch: bool,
@@ -1419,6 +1447,18 @@ impl CatHandle {
     pub fn commands_power(&self) -> bool {
         self.commands_power
     }
+    /// Whether this rig's power is set by scaling the transmit audio — see
+    /// [`Protocol::power_by_audio`]; the gain to use is
+    /// [`audio_gain_for_power`].
+    pub fn power_by_audio(&self) -> bool {
+        self.power_by_audio
+    }
+    /// The transmit audio gain for a `0..1` Drive or TUNE level on a rig with
+    /// [`Self::power_by_audio`]: [`audio_gain_for_power`] within this family's
+    /// [`Protocol::audio_power_ceiling`].
+    pub fn audio_gain_for(&self, frac: f32) -> f32 {
+        audio_gain_for_power(frac.clamp(0.0, 1.0) * self.audio_power_ceiling)
+    }
     /// Set the receiver's squelch threshold, as a `0..1` fraction of the rig's
     /// own scale (`0` open, `1` closed). Silently ignored on a family with no
     /// such command.
@@ -1472,6 +1512,11 @@ impl CatHandle {
             return;
         }
         let _ = self.cmd_tx.send(CatCmd::RigPower(on));
+    }
+    /// Put the rig's own power setting on step `code` — the FDM-DUO's menu 34.
+    /// Ignored by a family that has no such setting.
+    pub fn set_power_step(&self, code: u8) {
+        let _ = self.cmd_tx.send(CatCmd::PowerStep(code));
     }
     /// Whether [`Self::set_rig_power`] reaches this rig.
     pub fn commands_rig_power(&self) -> bool {
@@ -1684,6 +1729,7 @@ pub fn query_once(cfg: &CatConfig) -> Option<(Option<f64>, Option<Mode>)> {
                 | CatUpdate::Alc(_)
                 | CatUpdate::Po(_)
                 | CatUpdate::FwdW(_)
+                | CatUpdate::RflW(_)
                 | CatUpdate::Signal(_)
                 | CatUpdate::Power(_)
                 | CatUpdate::Squelch(_)
@@ -1783,6 +1829,18 @@ pub fn effective_cw_keying(cfg: &CatConfig) -> CwKeying {
     }
 }
 
+/// The TX audio amplitude for a `0..1` power fraction on a rig whose power is
+/// set by the audio level ([`Protocol::power_by_audio`]).
+///
+/// The square root, because output power follows the square of the amplitude:
+/// this keeps the Drive and TUNE sliders reading as a fraction of power, the
+/// same as they do on a rig with a power command. 100% is unity — the audio
+/// goes out exactly as loud as it does without this — so the slider can only
+/// ever take level away, never add clipping.
+pub fn audio_gain_for_power(frac: f32) -> f32 {
+    frac.clamp(0.0, 1.0).sqrt()
+}
+
 /// Spawn the serial CAT thread from a persisted [`CatConfig`].
 pub fn spawn(cfg: CatConfig) -> CatHandle {
     let cfg = with_family_serial_limits(cfg);
@@ -1800,6 +1858,8 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
     // Same reason: the engine asks whether this rig's power can be commanded
     // before it commands anything.
     let commands_power = make_protocol(&cfg).commands_power();
+    let power_by_audio = make_protocol(&cfg).power_by_audio();
+    let audio_power_ceiling = make_protocol(&cfg).audio_power_ceiling();
     let commands_filter = make_protocol(&cfg).commands_filter();
     let commands_agc = make_protocol(&cfg).commands_agc();
     let commands_squelch = make_protocol(&cfg).commands_squelch();
@@ -1861,6 +1921,8 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
         scope,
         cw_chunk_len,
         commands_power,
+        power_by_audio,
+        audio_power_ceiling,
         commands_filter,
         commands_agc,
         commands_squelch,
@@ -2621,6 +2683,7 @@ fn serial_thread(
     let mut last_alc: Option<f32> = None;
     let mut last_po: Option<f32> = None;
     let mut last_fwd: Option<f32> = None;
+    let mut last_rfl: Option<f32> = None;
     // See `commanded_mode` for the app-mode → rig-mode policy. The dial comes
     // in because one mode's sideband follows the band — see there.
     let mode_cmd = |app_mode: Mode, dial: Option<f64>| -> Option<Mode> {
@@ -3068,6 +3131,7 @@ fn serial_thread(
                             last_alc = None;
                             last_po = None;
                             last_fwd = None;
+                            last_rfl = None;
                             // Clear the readings so the meters drop on unkey,
                             // here as well as at the receiver: a stale SWR held
                             // locally would be re-sent beside the next over's
@@ -3140,6 +3204,23 @@ fn serial_thread(
                     // Not coalesced and not rate limited: an antenna is a click
                     // on a two-entry list, not a slider being dragged, and it
                     // is one frame either way.
+                    // A click on a button, so neither coalesced nor rate
+                    // limited, like the antenna below.
+                    Ok(CatCmd::PowerStep(code)) => {
+                        let mut failed = false;
+                        for f in protocol.set_power_step(code) {
+                            failed |= write_frame(
+                                &mut *port,
+                                &mut *protocol,
+                                &f,
+                                &mut last_write,
+                                &mut io,
+                            );
+                        }
+                        if failed {
+                            break 'io true;
+                        }
+                    }
                     Ok(CatCmd::Antenna(name)) => {
                         let frames = protocol.set_antenna(&name);
                         // A name the family does not have produces no frames,
@@ -3607,22 +3688,22 @@ fn serial_thread(
                 // it reads `None` as "the rig has not said anything yet" and would sit at that
                 // forever, never tripping. Both are therefore held here and sent together, so every
                 // message carries the latest of each.
-                let send = |swr, alc, po, fwd_w| {
-                    let _ = telem_tx.send(TxTelemetry { fwd_w, swr, alc, po });
+                let send = |swr, alc, po, fwd_w, rfl_w| {
+                    let _ = telem_tx.send(TxTelemetry { fwd_w, swr, alc, po, rfl_w });
                 };
                 if let CatUpdate::Swr(v) = u {
                     last_swr = Some(v);
-                    send(last_swr, last_alc, last_po, last_fwd);
+                    send(last_swr, last_alc, last_po, last_fwd, last_rfl);
                     continue;
                 }
                 if let CatUpdate::Alc(v) = u {
                     last_alc = Some(v);
-                    send(last_swr, last_alc, last_po, last_fwd);
+                    send(last_swr, last_alc, last_po, last_fwd, last_rfl);
                     continue;
                 }
                 if let CatUpdate::Po(v) = u {
                     last_po = Some(v);
-                    send(last_swr, last_alc, last_po, last_fwd);
+                    send(last_swr, last_alc, last_po, last_fwd, last_rfl);
                     continue;
                 }
                 // Watts the rig measured, on the families whose meter answers
@@ -3631,7 +3712,12 @@ fn serial_thread(
                 // last message sent.
                 if let CatUpdate::FwdW(v) = u {
                     last_fwd = Some(v);
-                    send(last_swr, last_alc, last_po, last_fwd);
+                    send(last_swr, last_alc, last_po, last_fwd, last_rfl);
+                    continue;
+                }
+                if let CatUpdate::RflW(v) = u {
+                    last_rfl = Some(v);
+                    send(last_swr, last_alc, last_po, last_fwd, last_rfl);
                     continue;
                 }
                 if let CatUpdate::Signal(dbm) = u {
@@ -3752,6 +3838,7 @@ fn serial_thread(
                     | CatUpdate::Alc(_)
                     | CatUpdate::Po(_)
                     | CatUpdate::FwdW(_)
+                    | CatUpdate::RflW(_)
                     | CatUpdate::Signal(_)
                     | CatUpdate::Power(_)
                     | CatUpdate::Squelch(_)

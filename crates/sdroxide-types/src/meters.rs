@@ -26,6 +26,10 @@ pub struct TxMeters {
     /// The rig's own power-output meter as a `0.0..=1.0` fraction of full
     /// scale, if it has one. Deliberately not watts: see [`TxTelemetry::po`].
     pub po: Option<f32>,
+    /// Reflected power in watts, if the device measures it: see
+    /// [`TxTelemetry::rfl_w`].
+    #[serde(default)]
+    pub rfl_w: Option<f32>,
 }
 
 /// TX-side telemetry a rig reports out-of-band (CAT / TCI): forward power,
@@ -61,6 +65,10 @@ pub struct TxTelemetry {
     /// A device that genuinely measures forward power still fills `fwd_w`, and
     /// the two can be present together on a rig that reports both.
     pub po: Option<f32>,
+    /// Reflected power in watts, if the device measures it. The ELAD FDM-DUO
+    /// does (`RP`, in milliwatts); most rigs give only the SWR.
+    #[serde(default)]
+    pub rfl_w: Option<f32>,
 }
 
 /// What the adaptive-predistortion loop is doing, for the radios that run one

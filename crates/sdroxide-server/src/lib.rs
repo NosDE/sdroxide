@@ -229,6 +229,9 @@ pub(crate) struct Latest {
     /// answering, and "nothing has changed since you attached" must not read as
     /// "nothing is wrong".
     pub relay: Option<Box<sdroxide_types::RelayStatus>>,
+    /// The amplifier, replayed on connect for the relay's reason: a remote
+    /// operator has to know whether it is in line before they key.
+    pub amp: Option<Box<sdroxide_types::AmpStatus>>,
     /// What the RDS decoder has made of the station currently tuned. Replayed on
     /// connect for the same reason as `digi` and `voice`: which station is being
     /// listened to is a standing condition, and a client that attaches after the
@@ -1242,6 +1245,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::RelayStatus(st) => {
                 latest.relay = Some(st.clone());
                 Some(ServerMsg::RelayStatus(st))
+            }
+            RadioEvent::AmpStatus(st) => {
+                latest.amp = Some(st.clone());
+                Some(ServerMsg::AmpStatus(st))
             }
             // Handled above, and deliberately not forwarded: the skimmer
             // firehose is a hundred times the spot list's traffic, and the

@@ -413,6 +413,11 @@ pub enum RadioEvent {
     /// contacts in it are the station owner's business. Boxed and appended for
     /// the reasons the probe gives.
     WavelogBatch(Box<crate::WavelogBatch>),
+    /// The Hardrock amplifier's readings, tuner and link state, when they
+    /// change. Boxed for the usual reason.
+    ///
+    /// Appended last, for the usual reason.
+    AmpStatus(Box<crate::AmpStatus>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

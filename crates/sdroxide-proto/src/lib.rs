@@ -1596,7 +1596,11 @@ use sdroxide_types::{
 /// * [`sdroxide_types::Command`] gains `WavelogSync`, appended. Its answers,
 ///   `RadioEvent::WavelogBatch` and `RadioEvent::WavelogProbe`, stay on the
 ///   machine the engine runs on and have no `ServerMsg`.
-pub const PROTO_VERSION: u16 = 184;
+/// v185: the Hardrock amplifier. `Command` gains `SetAmpConfig`, `Amp` and
+/// `SetRigPowerStep`, `ServerMsg` gains `AmpStatus`, `StationConfig` gains
+/// `amp` on its tail, and `AmpAlerts` carries `from_amp`, for the amplifier's
+/// own lights — all appended, so a v184 peer reads them out of step.
+pub const PROTO_VERSION: u16 = 185;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -2067,6 +2071,11 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     PictureUpload(sdroxide_types::PictureUploadStatus),
+    /// `RadioEvent::AmpStatus`: the Hardrock amplifier's readings, tuner and
+    /// link state. Replayed on connect for the T/R switch's reason.
+    ///
+    /// Appended last, for the usual reason.
+    AmpStatus(Box<sdroxide_types::AmpStatus>),
 }
 
 /// One radio in a station's roster, as a client sees it.

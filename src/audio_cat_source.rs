@@ -57,6 +57,12 @@ pub struct AudioCatSource {
     out: Option<(sdroxide_audio::AudioOutput, rtrb::Producer<f32>)>,
     tx_resampler: Option<MonoResampler>,
     tx_scratch: Vec<f32>,
+    /// Amplitude applied to the TX audio on a rig whose power is set by the
+    /// audio level (`CatHandle::power_by_audio`): the Drive level, or the TUNE
+    /// level while tuning. 1.0 everywhere else.
+    tx_audio_gain: f32,
+    /// Scratch for the TX audio once [`Self::tx_audio_gain`] is applied.
+    tx_gain_scratch: Vec<f32>,
     /// Scratch for draining the in-band receive ring, on a rig at
     /// [`IqSource::streams_audio`] — the (tr)uSDX.
     stream_scratch: Vec<f32>,
@@ -339,6 +345,8 @@ impl AudioCatSource {
             out,
             tx_resampler,
             tx_scratch: Vec::new(),
+            tx_audio_gain: 1.0,
+            tx_gain_scratch: Vec::new(),
             stream_scratch: Vec::new(),
             cat,
             scope_full_scale,
@@ -402,6 +410,8 @@ impl AudioCatSource {
             out: None,
             tx_resampler: None,
             tx_scratch: Vec::new(),
+            tx_audio_gain: 1.0,
+            tx_gain_scratch: Vec::new(),
             stream_scratch: Vec::new(),
             cat,
             scope_full_scale: 160.0,
@@ -807,6 +817,40 @@ fn fill_iq(
     n
 }
 
+impl AudioCatSource {
+    /// [`IqSource::tx_write_audio`] once the power-by-audio gain is applied.
+    fn write_tx_audio_scaled(&mut self, audio: &[f32]) -> Result<()> {
+        if self.cat.streams_audio() {
+            // The control thread paces these out at the radio's own rate. If
+            // its ring is full the over is ahead of the radio, so wait for room
+            // rather than drop — dropping silence into a digital mode is worse
+            // than a stutter. Bounded so a thread that has died cannot hang the
+            // transmit loop forever.
+            let mut off = 0;
+            let mut spins = 0u32;
+            while off < audio.len() {
+                let n = self.cat.push_stream_audio(&audio[off..]);
+                if n == 0 {
+                    spins += 1;
+                    if spins > 500 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                off += n;
+                spins = 0;
+            }
+            return Ok(());
+        }
+        let Some((_, producer)) = self.out.as_mut() else {
+            return Ok(()); // no TX audio device — PTT still keyed the rig
+        };
+        write_tx_audio(producer, self.tx_resampler.as_mut(), &mut self.tx_scratch, audio);
+        Ok(())
+    }
+}
+
 impl IqSource for AudioCatSource {
     fn sample_rate(&self) -> f64 {
         self.in_rate
@@ -1075,6 +1119,7 @@ impl IqSource for AudioCatSource {
                 | sdroxide_cat::CatUpdate::Alc(_)
                 | sdroxide_cat::CatUpdate::Po(_)
                 | sdroxide_cat::CatUpdate::FwdW(_)
+                | sdroxide_cat::CatUpdate::RflW(_)
                 | sdroxide_cat::CatUpdate::Signal(_) => {}
             }
         }
@@ -1203,7 +1248,16 @@ impl IqSource for AudioCatSource {
     // The engine asserts the level that applies — drive, or the tune level
     // while tuning — before every key-down, so an over cannot go out at the
     // previous one.
+    /// The rig's own power step — the FDM-DUO's menu 34, from the power
+    /// buttons beside Drive. The family ignores it if it has none.
+    fn set_power_step(&mut self, code: u8) {
+        self.cat.set_power_step(code);
+    }
+
     fn set_tx_drive(&mut self, frac: f64) {
+        if self.cat.power_by_audio() {
+            self.tx_audio_gain = self.cat.audio_gain_for(frac as f32);
+        }
         self.cat.set_power(frac as f32);
     }
 
@@ -1324,34 +1378,16 @@ impl IqSource for AudioCatSource {
     }
 
     fn tx_write_audio(&mut self, audio: &[f32]) -> Result<()> {
-        if self.cat.streams_audio() {
-            // The control thread paces these out at the radio's own rate. If
-            // its ring is full the over is ahead of the radio, so wait for room
-            // rather than drop — dropping silence into a digital mode is worse
-            // than a stutter. Bounded so a thread that has died cannot hang the
-            // transmit loop forever.
-            let mut off = 0;
-            let mut spins = 0u32;
-            while off < audio.len() {
-                let n = self.cat.push_stream_audio(&audio[off..]);
-                if n == 0 {
-                    spins += 1;
-                    if spins > 500 {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    continue;
-                }
-                off += n;
-                spins = 0;
-            }
-            return Ok(());
+        let gain = self.tx_audio_gain;
+        if gain == 1.0 {
+            return self.write_tx_audio_scaled(audio);
         }
-        let Some((_, producer)) = self.out.as_mut() else {
-            return Ok(()); // no TX audio device — PTT still keyed the rig
-        };
-        write_tx_audio(producer, self.tx_resampler.as_mut(), &mut self.tx_scratch, audio);
-        Ok(())
+        let mut scaled = std::mem::take(&mut self.tx_gain_scratch);
+        scaled.clear();
+        scaled.extend(audio.iter().map(|s| s * gain));
+        let r = self.write_tx_audio_scaled(&scaled);
+        self.tx_gain_scratch = scaled;
+        r
     }
 
     fn tx_drain(&mut self) {

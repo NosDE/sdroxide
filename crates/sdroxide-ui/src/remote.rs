@@ -503,6 +503,7 @@ impl RemoteController {
                 .pending
                 .push_back(RadioEvent::RotatorStatus { connected, az_deg, el_deg, error }),
             ServerMsg::RelayStatus(st) => self.pending.push_back(RadioEvent::RelayStatus(st)),
+            ServerMsg::AmpStatus(st) => self.pending.push_back(RadioEvent::AmpStatus(st)),
             ServerMsg::RadioConfig(c) => {
                 // Adopted only when nothing of ours is waiting to go out. This
                 // message is usually the echo of our own write, but it can

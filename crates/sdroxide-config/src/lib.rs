@@ -1978,6 +1978,16 @@ pub fn save_relay_config(cfg: &sdroxide_types::RelayConfig) -> Result<(), Config
     save_json("relay.json", cfg)
 }
 
+/// The Hardrock amplifier. Owned by the engine for the T/R switch's reason: the
+/// amplifier is on a port of the machine the radio is attached to.
+pub fn load_amp_config() -> sdroxide_types::AmpConfig {
+    load_json("amp.json")
+}
+
+pub fn save_amp_config(cfg: &sdroxide_types::AmpConfig) -> Result<(), ConfigError> {
+    save_json("amp.json", cfg)
+}
+
 // ── Broadcast station schedules ──────────────────────────────────────────────
 //
 // Three layers, in the order they win:

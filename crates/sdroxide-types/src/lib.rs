@@ -7,6 +7,7 @@ mod access;
 mod adsb;
 mod ais;
 mod alert;
+mod amp;
 mod aprs;
 mod atchat;
 mod audio;
@@ -96,6 +97,10 @@ pub use ais::{
     aid_type_label, mmsi_is_identity, nav_status_label, ship_type_hazard, ship_type_label,
 };
 pub use alert::{AlertEvent, AlertEvents, AlertReply, AlertRule, AlertSettings, AlertSound};
+pub use amp::{
+    AMP_BAUD_RATES, AmpAction, AmpAlerts, AmpConfig, AmpGauge, AmpLevel, AmpLimits, AmpModel,
+    AmpReadings, AmpStatus, AtuNetwork, AtuReadout, AtuScale, amp_band_label,
+};
 pub use aprs::{
     APRS_MESSAGE_MAX, APRS_MSG_RETRIES, APRS_STATION_MAX, APRS_TRACK_MAX, APRS_TRAFFIC_MAX,
     AprsEntryKind, AprsMessage, AprsMsgState, AprsPosition, AprsStation, AprsStatus, AprsSymbol,
@@ -294,8 +299,8 @@ pub use tx_voice::{
     TxVoiceTest,
 };
 pub use ui::{
-    BandplanKind, ChromeStyle, FontSize, LayoutMode, SmeterStyle, Solar3dWindow, SpectrumDetail,
-    Speed, UiSettings, UiTheme,
+    AmpDocked, BandplanKind, ChromeStyle, FontSize, LayoutMode, SmeterStyle, Solar3dWindow,
+    SpectrumDetail, Speed, UiSettings, UiTheme,
 };
 pub use vdl2::{
     VDL2_ALL_CHANNELS, VDL2_CHANNEL_LABELS, VDL2_CHANNEL_SPACING_HZ, VDL2_CHANNELS_HZ, VDL2_CSC_HZ,

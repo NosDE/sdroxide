@@ -60,6 +60,7 @@ sdroxide-rotator = { path = "../sdroxide-rotator" }
 # while anything in this process is transmitting. Driven from the engine rather
 # than from a source, because it follows the whole station and not one front end.
 sdroxide-relay = { path = "../sdroxide-relay" }
+sdroxide-hardrock = { path = "../sdroxide-hardrock" }
 sdroxide-wsjtx = { path = "../sdroxide-wsjtx" }
 # Received pictures to an FTP/FTPS server, the QSSTV way. Native-only, like
 # everything else the engine talks to the network with.
