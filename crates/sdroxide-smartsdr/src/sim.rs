@@ -543,7 +543,12 @@ impl Session {
         self.atu_done_at = None;
         self.atu_status = "TUNE_SUCCESSFUL";
         self.atu_enabled = true;
+        self.status("interlock state=UNKEY_REQUESTED source=");
         self.send_atu_status();
+        // The copy a FLEX-8400 sends the client that asked for the tune, which
+        // leaves `atu_enabled` out.
+        self.status("atu status=TUNE_SUCCESSFUL memories_enabled=1 using_mem=0");
+        self.status("interlock state=READY source=");
     }
 
     fn send_atu_status(&mut self) {
@@ -683,7 +688,11 @@ impl Session {
                 self.reply(seq, 0, "");
                 self.atu_status = "TUNE_IN_PROGRESS";
                 self.atu_done_at = Some(Instant::now() + self.cfg.atu_tune_time);
+                // The radio keys itself for the tune, and says so on the
+                // interlock — the sequence a FLEX-8400 sent.
+                self.status("interlock state=PTT_REQUESTED source=SW");
                 self.send_atu_status();
+                self.status("interlock state=TRANSMITTING source=SW");
             }
             ("atu", Some("bypass")) if self.cfg.atu => {
                 self.reply(seq, 0, "");

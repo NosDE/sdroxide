@@ -492,24 +492,47 @@ pub fn info_atu_present(body: &str) -> Option<bool> {
     parse_kvs_with(body, ',').get("atu_present").map(|v| v.trim().trim_matches('"') != "0")
 }
 
-/// The tuner's state from an `atu` status object, or `None` if it carries no
-/// `status` — a partial update about something else, to be ignored rather
-/// than read as "idle".
+/// The tuner's state after an `atu` status object, applied over `prev`, or
+/// `None` if the object says nothing about the tuner.
 ///
-/// `status=TUNE_SUCCESSFUL atu_enabled=1 memories_enabled=1 using_mem=1` is
-/// what a FLEX-8400 sends. The status names are FlexLib's; one this code has
-/// never seen reads as [`AtuStatus::Idle`], which claims nothing.
-pub fn parse_atu(kvs: &Kvs) -> Option<AtuState> {
-    let status = match kvs.get("status")?.as_str() {
+/// An update carries only what it carries: a FLEX-8400 sends
+/// `status=TUNE_SUCCESSFUL atu_enabled=1 memories_enabled=1 using_mem=1` to
+/// every client and, to the one that asked for the tune, the same without
+/// `atu_enabled`. Reading an absent field as `0` turned a tuner that had just
+/// matched into one that looked bypassed, so a field that is not there keeps
+/// what it was. The status names are FlexLib's; one this code has never seen
+/// reads as [`AtuStatus::Idle`], which claims nothing.
+pub fn update_atu(prev: AtuState, kvs: &Kvs) -> Option<AtuState> {
+    let flag = |k: &str| kvs.get(k).map(|v| v.trim() != "0");
+    let status = kvs.get("status").map(|s| match s.as_str() {
         "TUNE_IN_PROGRESS" => AtuStatus::Tuning,
         "TUNE_SUCCESSFUL" | "TUNE_OK" => AtuStatus::Tuned,
         "TUNE_BYPASS" | "TUNE_MANUAL_BYPASS" => AtuStatus::Bypass,
         "TUNE_FAIL" | "TUNE_FAIL_BYPASS" => AtuStatus::Failed,
         "TUNE_ABORTED" => AtuStatus::Aborted,
         _ => AtuStatus::Idle,
-    };
-    let flag = |k: &str| kvs.get(k).is_some_and(|v| v.trim() != "0");
-    Some(AtuState { status, enabled: flag("atu_enabled"), using_memory: flag("using_mem") })
+    });
+    let (enabled, using_memory) = (flag("atu_enabled"), flag("using_mem"));
+    if status.is_none() && enabled.is_none() && using_memory.is_none() {
+        return None;
+    }
+    Some(AtuState {
+        status: status.unwrap_or(prev.status),
+        enabled: enabled.unwrap_or(prev.enabled),
+        using_memory: using_memory.unwrap_or(prev.using_memory),
+    })
+}
+
+/// Whether an `interlock` status says the radio is on the air, or `None` if it
+/// carries no `state` — the interlock's configuration, which arrives under the
+/// same object name.
+///
+/// `PTT_REQUESTED` counts: the radio has committed to keying and its relays are
+/// already moving, which is the click the receiver would otherwise play.
+/// `UNKEY_REQUESTED` does not, so an over of sdroxide's own — which ends in
+/// exactly that state — never reads as the radio going on the air by itself.
+pub fn interlock_on_air(kvs: &Kvs) -> Option<bool> {
+    kvs.get("state").map(|s| matches!(s.as_str(), "PTT_REQUESTED" | "TRANSMITTING"))
 }
 
 #[cfg(test)]
@@ -531,19 +554,34 @@ mod tests {
         ) else {
             panic!("not a status");
         };
-        assert_eq!(
-            parse_atu(&kvs),
-            Some(AtuState { status: AtuStatus::Tuned, enabled: true, using_memory: true })
-        );
+        let tuned = AtuState { status: AtuStatus::Tuned, enabled: true, using_memory: true };
+        assert_eq!(update_atu(AtuState::default(), &kvs), Some(tuned));
         let in_progress = parse_kvs("status=TUNE_IN_PROGRESS atu_enabled=1 using_mem=0");
-        assert_eq!(parse_atu(&in_progress).map(|a| a.status), Some(AtuStatus::Tuning));
+        assert_eq!(update_atu(tuned, &in_progress).map(|a| a.status), Some(AtuStatus::Tuning));
         let bypass = parse_kvs("status=TUNE_BYPASS atu_enabled=0");
         assert_eq!(
-            parse_atu(&bypass),
-            Some(AtuState { status: AtuStatus::Bypass, enabled: false, using_memory: false })
+            update_atu(tuned, &bypass),
+            Some(AtuState { status: AtuStatus::Bypass, enabled: false, using_memory: true })
         );
-        // A partial update with no status says nothing about the tune.
-        assert_eq!(parse_atu(&parse_kvs("memories_enabled=0")), None);
+        // The copy a FLEX-8400 sends the client that asked for the tune, with
+        // no `atu_enabled`: the tuner is still in circuit.
+        let to_us = parse_kvs("status=TUNE_SUCCESSFUL memories_enabled=1 using_mem=1");
+        assert_eq!(update_atu(tuned, &to_us), Some(tuned));
+        // Nothing about the tuner at all.
+        assert_eq!(update_atu(tuned, &parse_kvs("memories_enabled=0")), None);
+    }
+
+    #[test]
+    fn reads_whether_the_radio_is_on_the_air() {
+        let on = |s: &str| interlock_on_air(&parse_kvs(s));
+        // The sequence a FLEX-8400 sent through an ATU tune.
+        assert_eq!(on("tx_client_handle=0x3D499A76 state=PTT_REQUESTED source=SW"), Some(true));
+        assert_eq!(on("tx_client_handle=0x3D499A76 state=TRANSMITTING source=SW"), Some(true));
+        assert_eq!(on("tx_client_handle=0x3D499A76 state=UNKEY_REQUESTED source="), Some(false));
+        assert_eq!(on("tx_client_handle=0x00000000 state=READY source="), Some(false));
+        assert_eq!(on("state=RECEIVE tx_allowed=0"), Some(false));
+        // The interlock's configuration, under the same object name.
+        assert_eq!(on("acc_txreq_enable=0 rca_txreq_enable=0 tx_delay=0"), None);
     }
 
     #[test]

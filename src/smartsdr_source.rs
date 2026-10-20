@@ -293,6 +293,10 @@ impl IqSource for SmartSdrSource {
                 // Held rather than passed on: the engine asks for it through
                 // `atu`, the way it asks after a receiving antenna.
                 FlexUpdate::Atu(a) => self.atu = a,
+                // An ATU tune, or SmartSDR or the front panel keying the
+                // radio: the engine mutes the receiver and stays off the air
+                // for the length of it, as for any over the radio keys itself.
+                FlexUpdate::RigTx(on) => out.push(ControlUpdate::RigTx(on)),
             }
         }
         out

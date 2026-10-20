@@ -135,6 +135,30 @@ fn the_rate_is_not_claimed_before_the_radio_sends_it() {
     assert_eq!(h.actual_rate_hz(), 192_000.0, "the rate change never showed up");
 }
 
+/// [`atu_reports`], also collecting the radio's reports of keying itself.
+fn atu_reports_and(
+    h: &FlexHandle,
+    done: impl Fn(&sdroxide_types::AtuState) -> bool,
+    rig_tx: &mut Vec<bool>,
+) -> Vec<sdroxide_types::AtuState> {
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline {
+        for u in h.poll_updates() {
+            match u {
+                FlexUpdate::Atu(Some(a)) => seen.push(a),
+                FlexUpdate::RigTx(on) => rig_tx.push(on),
+                _ => {}
+            }
+        }
+        if seen.last().is_some_and(&done) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
 /// Collect tuner reports until `done` holds for one or patience runs out.
 fn atu_reports(
     h: &FlexHandle,
@@ -167,18 +191,46 @@ fn drives_the_radios_antenna_tuner() {
     assert!(!first.is_empty(), "the subscription burst should report the tuner");
 
     h.atu_start();
-    let tune = atu_reports(&h, |a| a.status == AtuStatus::Tuned);
+    let mut rig_tx = Vec::new();
+    let tune = atu_reports_and(&h, |a| a.status == AtuStatus::Tuned, &mut rig_tx);
     assert!(sim.stats.saw_command("atu start"), "never asked the radio to tune");
     assert!(
         tune.iter().any(|a| a.status == AtuStatus::Tuning),
         "a tune in progress should be reported: {tune:?}"
     );
-    assert_eq!(tune.last().map(|a| (a.status, a.enabled)), Some((AtuStatus::Tuned, true)));
+    // Still in circuit after the copy of the report that leaves `atu_enabled`
+    // out, which the simulator sends last, as the radio does.
+    std::thread::sleep(Duration::from_millis(100));
+    let after = atu_reports_and(&h, |_| true, &mut rig_tx);
+    let last = after.last().or(tune.last()).copied();
+    assert_eq!(last.map(|a| (a.status, a.enabled)), Some((AtuStatus::Tuned, true)));
+    // The radio keyed itself for the tune and said so: on the air, then off it.
+    assert_eq!(rig_tx, vec![true, false], "the tune's own over should be reported");
 
     h.atu_bypass();
     let bypass = atu_reports(&h, |a| a.status == AtuStatus::Bypass);
     assert!(sim.stats.saw_command("atu bypass"));
     assert_eq!(bypass.last().map(|a| (a.status, a.enabled)), Some((AtuStatus::Bypass, false)));
+}
+
+/// An over of sdroxide's own goes out on the same interlock, and must not come
+/// back as the radio keying itself: the engine would mute for it and refuse
+/// the next key-down as somebody else's.
+#[test]
+fn our_own_over_is_not_the_radio_keying_itself() {
+    let sim = sim();
+    let h = connect(&sim, 48_000.0);
+    h.tx_begin(14_074_000.0);
+    std::thread::sleep(Duration::from_millis(200));
+    h.tx_end();
+    std::thread::sleep(Duration::from_millis(300));
+    let rig_tx: Vec<bool> = h
+        .poll_updates()
+        .into_iter()
+        .filter_map(|u| if let FlexUpdate::RigTx(on) = u { Some(on) } else { None })
+        .collect();
+    assert!(sim.stats.saw_command("xmit 1") && sim.stats.saw_command("xmit 0"));
+    assert!(!rig_tx.contains(&true), "our own over read back as the radio's: {rig_tx:?}");
 }
 
 #[test]
