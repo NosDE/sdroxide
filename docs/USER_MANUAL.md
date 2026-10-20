@@ -12252,7 +12252,7 @@ stored in plaintext in `net.json`. How the features behave is
   instead of only on the **LOOKUP** button.
 - **Upload** — **Auto-upload each new QSO** is the master switch, and under it
   is **a tab per logging service**: **QRZ**, **eQSL**, **HamQTH**,
-  **Club Log** and **WRL**. Each tab holds everything about that one service — whether a new
+  **Club Log**, **WRL** and **Wavelog**. Each tab holds everything about that one service — whether a new
   QSO is pushed to it, its login, and the button that checks that login. So
   setting up a service means opening its tab and filling in what is on it,
   rather than picking your fields out of all four services' at once.
@@ -12281,6 +12281,32 @@ stored in plaintext in `net.json`. How the features behave is
     works. **Test WRL** says both whether the key is good and whether that
     default is set, which is the one thing you would otherwise find out a
     contact at a time.
+  - **Wavelog** — your own [Wavelog](https://www.wavelog.org/) server,
+    reached directly, so WaveLogGate is not needed. **Address** is the
+    front-page URL (`https://log.example.org` or
+    `http://192.168.1.10/wavelog`) and **API key** a key from Wavelog's API
+    page; uploading and radio status need a read/write key, downloading works
+    with a read-only one. **Test** checks the key and lists the station
+    locations. For a server with a self-signed certificate, Test shows its
+    SHA-256 fingerprint and **Trust this certificate**; from then on only that
+    exact certificate is accepted, until **Forget this certificate**.
+    - **Station location** — the **Default** location QSOs go to, and the one
+      for **This profile**, which overrides it. Wavelog refuses a QSO whose
+      callsign is not the location's, and the tab warns when they differ.
+    - **Upload** — with the tab's tickbox on, each QSO logged from then on is
+      sent as it is logged. If the server cannot be reached it is retried
+      every 5 minutes, across restarts. QSOs logged before the tickbox went on
+      are not sent by themselves: **Send N QSOs not yet in Wavelog…** sends
+      them after asking.
+    - **Download into this logbook** — at start and every N minutes, fetches
+      what the ticked locations gained since the last download and merges it
+      into the log, so FT8 and the spot lists know those stations are worked.
+      **Sync now** does it at once. **Full resync…** downloads the ticked
+      locations in full and lists what would be added, updated and removed
+      before **Apply**; only contacts that came from Wavelog are ever changed
+      or removed — QSOs logged here or imported from a file are never touched.
+    - **Live radio status** — sends frequency, mode and split to Wavelog's
+      live logging under **Radio name**, from the station's main radio only.
 
   A service's own tickbox only takes effect while the master **Auto-upload each
   new QSO** is on; with it off the tab says so, and the per-QSO **UP** button in

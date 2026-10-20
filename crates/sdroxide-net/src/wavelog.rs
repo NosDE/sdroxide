@@ -487,9 +487,10 @@ fn presented_certificate(cfg: &WavelogConfig) -> Option<String> {
 /// to `page` as it arrives.
 ///
 /// Wavelog returns records in ascending id order and says the highest id it
-/// sent, so asking again from there is the next page; a page shorter than
-/// asked for is the last. The records come back marked as in Wavelog and as
-/// having come from `station_id`. `full` is carried onto every batch.
+/// sent, so asking again from there is the next page. A short page is not
+/// taken as the last, since a server may cap the page lower; an empty one is.
+/// The records come back marked as in Wavelog and as having come from
+/// `station_id`. `full` is carried onto every batch.
 pub fn download(
     cfg: &WavelogConfig,
     station_id: u32,
@@ -510,7 +511,7 @@ pub fn download(
         }
         let last_id = last_id.max(from_id);
         page(WavelogBatch { station_id, from_id, last_id, records, full, ..Default::default() });
-        if exported < PAGE_QSOS || last_id <= from_id {
+        if exported == 0 || last_id <= from_id {
             return Ok(());
         }
         from_id = last_id;
@@ -1102,14 +1103,14 @@ mod loopback_tests {
         let cfg = cfg(server(false), "");
         let mut pages = Vec::new();
         download(&cfg, 4, 0, false, |b| pages.push(b)).unwrap();
-        // 2000 + 2000 + 500: the short page is the last.
+        // 2000 + 2000 + 500, then the empty page that ends it.
         assert_eq!(
             pages.iter().map(|b| b.records.len()).collect::<Vec<_>>(),
-            vec![2000, 2000, 500]
+            vec![2000, 2000, 500, 0]
         );
         assert_eq!(
             pages.iter().map(|b| (b.from_id, b.last_id)).collect::<Vec<_>>(),
-            vec![(0, 2000), (2000, 4000), (4000, 4500)]
+            vec![(0, 2000), (2000, 4000), (4000, 4500), (4500, 4500)]
         );
         let r = &pages[2].records[0];
         assert_eq!(
