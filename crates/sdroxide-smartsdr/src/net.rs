@@ -1631,8 +1631,8 @@ impl ControlThread {
             // the radio keying itself would refuse our own next key-down.
             Some("interlock") => {
                 let Some(on) = p::interlock_on_air(kvs) else { return };
-                let ours = self.keyed
-                    || self.unkeyed_at.is_some_and(|t| t.elapsed() < OWN_UNKEY_GRACE);
+                let ours =
+                    self.keyed || self.unkeyed_at.is_some_and(|t| t.elapsed() < OWN_UNKEY_GRACE);
                 let on = on && !ours;
                 if self.rig_on_air.swap(on, Ordering::Relaxed) != on {
                     self.trace.note(format!(
