@@ -1305,6 +1305,12 @@ impl MeterTable {
         }
         Some((d.name.as_str(), p::scale_meter(m.raw, &d.unit)))
     }
+
+    /// Whether the named meter reads in dBm — which a FLEX's forward power
+    /// does, and which has to become watts before anything calls it that.
+    fn is_dbm(&self, name: &str) -> bool {
+        self.defs.values().any(|d| d.name == name && d.unit.eq_ignore_ascii_case("dbm"))
+    }
 }
 
 // ─── Control thread ──────────────────────────────────────────────────────────
@@ -2030,7 +2036,10 @@ impl DataThread {
                         for m in &raw_meters {
                             match table.resolve(*m) {
                                 Some(("FWDPWR", v)) => {
-                                    fwd_w = Some(v);
+                                    // dBm on a FLEX: 50 is 100 W, not 50.
+                                    let w =
+                                        if table.is_dbm("FWDPWR") { p::dbm_to_watts(v) } else { v };
+                                    fwd_w = Some(w);
                                     changed = true;
                                 }
                                 // Below 1.0 is unphysical: a reading the radio

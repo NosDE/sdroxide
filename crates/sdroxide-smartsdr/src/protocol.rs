@@ -212,8 +212,15 @@ pub fn parse_line(raw: &str) -> Line {
             let handle = u32::from_str_radix(handle_s.trim(), 16).unwrap_or(0);
             let (object, kv_body) = split_object(rest);
             // Meter definitions are the `#`-separated exception; everything else
-            // is space-separated.
-            let sep = if kv_body.contains('#') && !kv_body.contains(' ') { '#' } else { ' ' };
+            // is space-separated. Decided by the object, not by whether the
+            // body has spaces in it: a real radio's meter descriptions do
+            // (`8.desc=RF Power Forward`), and split on those every meter came
+            // out nameless — no SWR and no forward power, ever.
+            let sep = if object == "meter" || (kv_body.contains('#') && !kv_body.contains(' ')) {
+                '#'
+            } else {
+                ' '
+            };
             Line::Status { handle, object, kvs: parse_kvs_with(kv_body, sep) }
         }
         'M' => {
@@ -483,6 +490,12 @@ pub fn scale_meter(raw: i16, unit: &str) -> f32 {
     }
 }
 
+/// Watts from dBm — the unit a FLEX reports its forward power meter in, as
+/// FlexLib converts it.
+pub fn dbm_to_watts(dbm: f32) -> f32 {
+    10f32.powf((dbm - 30.0) / 10.0)
+}
+
 /// Whether the `info` reply says the radio has a built-in antenna tuner, or
 /// `None` where it does not say.
 ///
@@ -538,6 +551,28 @@ pub fn interlock_on_air(kvs: &Kvs) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The meter definitions as a FLEX-8400 sends them, descriptions with
+    /// spaces and all.
+    #[test]
+    fn reads_meter_definitions_with_spaces_in_them() {
+        let Line::Status { object, kvs, .. } = parse_line(
+            "S0|meter 8.src=TX-#8.num=1#8.nam=FWDPWR#8.low=0.0#8.hi=53.0#8.desc=RF Power \
+             Forward#8.unit=dBm#8.fps=20#",
+        ) else {
+            panic!("not a status");
+        };
+        assert_eq!(object, "meter");
+        assert_eq!(kvs.get("8.nam").map(String::as_str), Some("FWDPWR"));
+        assert_eq!(kvs.get("8.unit").map(String::as_str), Some("dBm"));
+        assert_eq!(kvs.get("8.desc").map(String::as_str), Some("RF Power Forward"));
+    }
+
+    #[test]
+    fn converts_forward_power_to_watts() {
+        assert!((dbm_to_watts(50.0) - 100.0).abs() < 0.01);
+        assert!((dbm_to_watts(30.0) - 1.0).abs() < 0.001);
+    }
 
     #[test]
     fn reads_whether_the_radio_has_a_tuner() {

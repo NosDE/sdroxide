@@ -928,12 +928,12 @@ impl Session {
         ));
         self.status(&format!(
             "meter {METER_SWR}.src=TX-#{METER_SWR}.num=0#{METER_SWR}.nam=SWR#\
-             {METER_SWR}.low=1.0#{METER_SWR}.hi=10.0#{METER_SWR}.desc=SWR#\
+             {METER_SWR}.low=1.0#{METER_SWR}.hi=10.0#{METER_SWR}.desc=RF SWR#\
              {METER_SWR}.unit=SWR#{METER_SWR}.fps=20"
         ));
         self.status(&format!(
             "meter {METER_FWD}.src=TX-#{METER_FWD}.num=0#{METER_FWD}.nam=FWDPWR#\
-             {METER_FWD}.low=0.0#{METER_FWD}.hi=100.0#{METER_FWD}.desc=Forward power#\
+             {METER_FWD}.low=0.0#{METER_FWD}.hi=100.0#{METER_FWD}.desc=RF Power Forward#\
              {METER_FWD}.unit=dBm#{METER_FWD}.fps=20"
         ));
     }

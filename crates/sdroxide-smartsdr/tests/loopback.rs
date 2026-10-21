@@ -408,16 +408,22 @@ fn swr_telemetry_arrives_while_keyed() {
 
     // Meter ids are per-session, so this only works if the client learned them
     // from the `meter` definition status — the `#`-separated one.
+    // The definitions carry descriptions with spaces in them, as a real
+    // radio's do — which is what once left every meter nameless.
     let deadline = std::time::Instant::now() + PATIENCE;
-    let mut swr = None;
-    while std::time::Instant::now() < deadline && swr.is_none() {
+    let (mut swr, mut fwd_w) = (None, None);
+    while std::time::Instant::now() < deadline && (swr.is_none() || fwd_w.is_none()) {
         if let Some(t) = h.poll_telemetry() {
-            swr = t.swr;
+            swr = swr.or(t.swr);
+            fwd_w = fwd_w.or(t.fwd_w);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     let swr = swr.expect("no SWR reading arrived while transmitting");
     assert!((swr - 1.3).abs() < 0.05, "SWR {swr}, expected ≈1.3");
+    // Half drive: 47 dBm on the wire, which is 50 W and not 47.
+    let fwd_w = fwd_w.expect("no forward power arrived while transmitting");
+    assert!((fwd_w - 50.0).abs() < 2.0, "forward power {fwd_w} W, expected ≈50");
 
     h.tx_end();
 }
