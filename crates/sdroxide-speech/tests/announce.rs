@@ -49,6 +49,7 @@ fn meters(swr: Option<f32>, fwd: Option<f32>, keyed: bool) -> Meters {
         tone: None,
         passband_dbfs: f32::NEG_INFINITY,
         puresignal: None,
+        voice: None,
     }
 }
 
