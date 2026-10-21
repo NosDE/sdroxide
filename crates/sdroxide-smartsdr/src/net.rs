@@ -162,6 +162,11 @@ pub enum FlexUpdate {
 /// answers `xmit 0` a round trip later, and reports in between are stale.
 const OWN_UNKEY_GRACE: Duration = Duration::from_millis(500);
 
+/// Below this much forward power an SWR reading is the radio's idle `1.0`, or
+/// the first instant of an over before the bridge has anything to measure — a
+/// "perfect match" that is no measurement at all, so it is not passed on.
+const MIN_SWR_POWER_W: f32 = 0.5;
+
 /// Control messages to the control thread.
 enum Ctrl {
     SetCenter(f64),
@@ -554,6 +559,12 @@ impl FlexHandle {
         // Whether the radio is on the air under its own control, shared so the
         // data thread passes SWR on through an ATU tune as through our overs.
         let rig_on_air = Arc::new(AtomicBool::new(false));
+        // Whether an over of sdroxide's own is in progress, from key-down to
+        // unkey. Shared for the same reason: the data thread's own `keyed`
+        // follows the TX audio ring, which empties between every block the
+        // engine writes, and an SWR reading that lands in one of those gaps
+        // belongs to the over all the same.
+        let our_over = Arc::new(AtomicBool::new(false));
 
         // Two different ports on the same radio. Transmit audio goes to the
         // data plane, [`VITA_PORT`]; the registration datagram goes to the
@@ -565,6 +576,7 @@ impl FlexHandle {
 
         let data = DataThread {
             rig_on_air: Arc::clone(&rig_on_air),
+            our_over: Arc::clone(&our_over),
             udp,
             fallback,
             radio_udp,
@@ -614,6 +626,7 @@ impl FlexHandle {
             atu_present: ident.atu_present,
             atu: None,
             rig_on_air,
+            our_over,
             unkeyed_at: None,
             alive: Arc::clone(&alive),
         };
@@ -1367,6 +1380,8 @@ struct ControlThread {
     /// Whether the radio is on the air under its own control, as last passed
     /// on — see [`FlexUpdate::RigTx`].
     rig_on_air: Arc<AtomicBool>,
+    /// Whether an over of sdroxide's own is in progress — see where it is made.
+    our_over: Arc<AtomicBool>,
     /// When sdroxide last unkeyed — see [`OWN_UNKEY_GRACE`].
     unkeyed_at: Option<Instant>,
     alive: Arc<AtomicBool>,
@@ -1446,6 +1461,7 @@ impl ControlThread {
                 }
             }
             Ctrl::TxOn(tx_freq) => {
+                self.our_over.store(true, Ordering::Relaxed);
                 self.retune_slice(tx_freq - self.center);
                 if let Some(s) = self.slice {
                     // Nominate our slice as the transmitter's, or the radio
@@ -1465,6 +1481,7 @@ impl ControlThread {
                 // local transmission is silent.
                 let _ = self.wire.send("transmit set dax=0");
                 self.keyed = false;
+                self.our_over.store(false, Ordering::Relaxed);
                 self.unkeyed_at = Some(Instant::now());
                 self.retune_slice(self.rx_if);
                 self.trace.note("TX off");
@@ -1528,6 +1545,7 @@ impl ControlThread {
             let _ = self.wire.send("xmit 0");
             let _ = self.wire.send("transmit set dax=0");
         }
+        self.our_over.store(false, Ordering::Relaxed);
         let tx = self.tx_stream.load(Ordering::Relaxed);
         if tx != 0 {
             let _ = self.wire.send(&format!("stream remove {}", p::hex_id(tx)));
@@ -1803,6 +1821,8 @@ fn flex_to_mode(s: &str) -> Option<Mode> {
 struct DataThread {
     /// See [`ControlThread::rig_on_air`].
     rig_on_air: Arc<AtomicBool>,
+    /// See [`ControlThread::our_over`].
+    our_over: Arc<AtomicBool>,
     udp: UdpSocket,
     /// A second listening socket on [`VITA_PORT`], when it was free. See where
     /// it is bound for why it exists and why it is not shared.
@@ -1880,6 +1900,7 @@ impl DataThread {
         let mut raw_meters = Vec::with_capacity(64);
         let mut fwd_w = None;
         let mut swr = None;
+        let mut was_on_air = false;
 
         // The radio only starts streaming once it has seen traffic from our UDP
         // port on some paths (routed networks, and firmware where the TCP
@@ -2055,9 +2076,15 @@ impl DataThread {
                         // Through an over of ours, and through one the radio
                         // keyed itself: an ATU tune is exactly when the SWR is
                         // worth reading.
-                        if changed && (self.keyed || self.rig_on_air.load(Ordering::Relaxed)) {
-                            let _ =
-                                self.telem.send(TxTelemetry { fwd_w, swr, alc: None, po: None, rfl_w: None });
+                        if changed && self.on_air() {
+                            let swr = swr.filter(|_| fwd_w.is_some_and(|w| w >= MIN_SWR_POWER_W));
+                            let _ = self.telem.send(TxTelemetry {
+                                fwd_w,
+                                swr,
+                                alc: None,
+                                po: None,
+                                rfl_w: None,
+                            });
                         }
                     }
                 }
@@ -2110,18 +2137,31 @@ impl DataThread {
                     self.keyed = true;
                     self.tx_started = Some(Instant::now());
                     self.tx_frames = 0;
-                    fwd_w = None;
-                    swr = None;
                 }
                 self.pump_tx_audio();
             } else if self.keyed && pending == 0 {
                 self.keyed = false;
                 self.tx_started = None;
-                // Clear the meter on unkey rather than leaving the last SWR
-                // reading frozen on the display.
-                let _ = self.telem.send(TxTelemetry::default());
+            }
+
+            // The meter follows the over, not the audio ring. A fresh over
+            // starts from nothing rather than from the last one's reading; at
+            // its end the meter is cleared rather than left frozen on screen.
+            let on_air = self.on_air();
+            if on_air != was_on_air {
+                was_on_air = on_air;
+                fwd_w = None;
+                swr = None;
+                if !on_air {
+                    let _ = self.telem.send(TxTelemetry::default());
+                }
             }
         }
+    }
+
+    /// Whether the radio is on the air: an over of ours, or one it keyed itself.
+    fn on_air(&self) -> bool {
+        self.our_over.load(Ordering::Relaxed) || self.rig_on_air.load(Ordering::Relaxed)
     }
 
     /// Send however many TX packets real time has come due for.

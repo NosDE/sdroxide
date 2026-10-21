@@ -428,6 +428,44 @@ fn swr_telemetry_arrives_while_keyed() {
     h.tx_end();
 }
 
+/// The SWR belongs to the over, not to the audio queue. The engine hands TX
+/// audio over in blocks and the queue runs dry between them, so a reading that
+/// lands in one of those gaps is still a reading from the over — and with the
+/// meter following the queue, a FLEX-8400 reported 1.5:1 at 13 W for a whole
+/// over and not one reading reached the screen. Keyed with nothing queued at
+/// all, the over is still on the air.
+#[test]
+fn swr_follows_the_over_not_the_audio_queue() {
+    let sim = sim();
+    let mut h = connect(&sim, 48_000.0);
+    collect_iq(&mut h, 512);
+
+    h.set_drive(0.5);
+    h.tx_begin(14_074_000.0);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let mut swr = None;
+    while std::time::Instant::now() < deadline && swr.is_none() {
+        if let Some(t) = h.poll_telemetry() {
+            swr = swr.or(t.swr);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let swr = swr.expect("no SWR reading arrived while keyed with an empty audio queue");
+    assert!((swr - 1.3).abs() < 0.05, "SWR {swr}, expected ≈1.3");
+
+    // Unkeyed, the meter is cleared rather than left frozen on its last reading.
+    h.tx_end();
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let mut cleared = false;
+    while std::time::Instant::now() < deadline && !cleared {
+        if let Some(t) = h.poll_telemetry() {
+            cleared = t.swr.is_none() && t.fwd_w.is_none();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(cleared, "the meter should be cleared at the end of the over");
+}
+
 #[test]
 fn a_mode_change_reaches_the_radio_and_comes_back() {
     let sim = sim();
